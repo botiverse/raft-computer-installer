@@ -46,5 +46,19 @@ Computer exposes lifecycle and health controls. Credentials, agent configuration
 and workspaces must survive installation and repair; executable rollback does not
 undo application data migrations.
 
+## Release workflow
+
+A tag such as `v0.1.0-rc.1` runs `.github/workflows/release.yml`. CI pins Node
+24, installs the immutable K commit, bundles the installer, writes an installer
+manifest and provenance record, generates `SHA256SUMS`, runs the bootstrap
+acceptance test, and publishes a private prerelease. A deployment may mirror
+the release assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`; the bootstrap
+never trusts an unverified `cli.cjs`.
+
+The current release artifact is a Node 24 portable installer. Packaging a
+runtime-independent SEA is a separate platform build step; until that is
+published, machines must provide Node 24 (or set `RAFT_COMPUTER_INSTALLER_NODE`)
+and a release mirror.
+
 This project is intended to serve as a real product integration of K's external
 runner, alongside K's smaller [service example](https://github.com/botiverse/k-carrier/tree/archer/external-runner-17/examples/external-service).
