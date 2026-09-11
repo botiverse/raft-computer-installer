@@ -3,7 +3,7 @@ set -eu
 : "${RAFT_COMPUTER_VERSION:?set RAFT_COMPUTER_VERSION}"
 : "${RAFT_COMPUTER_INSTALL_DIR:=$HOME/.local/bin}"
 : "${RAFT_COMPUTER_OPERATION_ID:=$(date +%s)-$$}"
-: "${RAFT_COMPUTER_INSTALLER_VERSION:=0.1.0-rc.1}"
+: "${RAFT_COMPUTER_INSTALLER_VERSION:=0.1.0-rc.2}"
 : "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:=https://cdn.raft.build/installer/$RAFT_COMPUTER_INSTALLER_VERSION}"
 : "${RAFT_COMPUTER_INSTALLER_NODE:=node}"
 err(){ echo "[raft-computer-installer] error: $1" >&2; exit 1; }
