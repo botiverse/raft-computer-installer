@@ -96,6 +96,18 @@ npm test             # real processes against a fake Computer: unattended, fresh
 npm run test:native  # the same suite driving the single executables
 ```
 
+Against a real Computer build, everything but a live-service upgrade (that
+needs a login):
+
+```
+node scripts/e2e-real-computer.mjs ../slock/packages/computer/dist/raft-computer.js
+```
+
+It serves that build as two versions from a local release base and drives
+the bootstrap through fresh install, cold upgrade, up to date, held
+downgrade, rollback, `raft-computer upgrade`, status, and a broken machine
+repaired. Temp homes only.
+
 A tag `v*` runs `.github/workflows/release.yml`: one job per platform builds
 and tests the executables, then one job assembles the portable files and
 every executable under one `SHA256SUMS` and publishes a GitHub prerelease.

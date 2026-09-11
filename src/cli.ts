@@ -7,7 +7,7 @@ import type { OperationRead, RunnerLaunchResult } from "@botiverse/k-carrier";
 import { INSTALLER_VERSION, loadConfig, type Config } from "./config.js";
 import { adopt, freshInstall, nextStep, removeScratch, repair } from "./install.js";
 import { askYesNo, decidePresence, type Presence } from "./presence.js";
-import { failedBefore, held, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
+import { failedBefore, held, lastPromoted, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
 import { compareSemver, isSemver } from "./semver.js";
 import { assertSameIdentity, fetchManifest, resolveChannel, type Manifest } from "./source.js";
 import { resumeRecovery, runRunner } from "./supervisor.js";
@@ -164,10 +164,10 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
 
   let target: Manifest;
   if (a.command === "rollback") {
-    if (world.kind !== "managed" || world.operation.kind !== "observed") return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
-    const previous = world.operation.operation.previousStableVersion;
-    if (!previous || previous === world.version) return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
-    a.version = previous; a.allowDowngrade = true;
+    // Back to what the last promoted upgrade replaced, if that is what runs now.
+    const last = world.kind === "managed" ? await lastPromoted(cfg) : null;
+    if (world.kind !== "managed" || !last || last.targetVersion !== world.version) return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
+    a.version = last.fromVersion; a.allowDowngrade = true;
   }
   const resolved = await resolveTarget(cfg, a, presence);
   if ("outcome" in resolved) return { outcome: resolved.outcome, settled: s.settled, target: a.version ?? null };
@@ -194,7 +194,8 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
     outcome = await upgradeManaged(cfg, runEnv, id, target, world.version, a.allowDowngrade);
   }
   await removeScratch(cfg, target.version).catch(() => {});
-  await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: target.version, approvedBy: runEnv.RAFT_COMPUTER_APPROVED_BY ?? null, settled: s.settled })).catch(() => {});
+  const fromVersion = world.kind === "managed" || world.kind === "adopted" ? world.version : null;
+  await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: target.version, fromVersion, approvedBy: runEnv.RAFT_COMPUTER_APPROVED_BY ?? null, settled: s.settled })).catch(() => {});
   return { outcome, settled: s.settled, target: target.version };
 }
 

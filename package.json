@@ -15,7 +15,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "verify:release": "node -e \"const fs=require('fs');const m=JSON.parse(fs.readFileSync('dist/installer-manifest.json'));const c=require('crypto');for(const [f,x] of Object.entries(m.files)){const b=fs.readFileSync('dist/'+f);if(b.length!==x.size||c.createHash('sha256').update(b).digest('hex')!==x.sha256)throw new Error('release_integrity:'+f)}console.log(JSON.stringify({ok:true,installerVersion:m.installerVersion,files:Object.keys(m.files)}))\"",
     "build:native": "node scripts/build.mjs dist --native",
-    "test:native": "RCI_NATIVE=1 node --import tsx --test test/*.test.ts"
+    "test:native": "RCI_NATIVE=1 node --import tsx --test test/*.test.ts",
+    "e2e": "node scripts/e2e-real-computer.mjs"
   },
   "dependencies": {
     "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/e423792e648961099d17a3e9e5fc09a65be1e23e"
