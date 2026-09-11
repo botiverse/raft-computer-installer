@@ -1,0 +1,4 @@
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises"; import { join } from "node:path"; import type { InstallReceipt } from "./contract.js";
+export function stateDir(installDir:string){return join(installDir,"computer","installer");} export function requestPath(d:string,id:string){return join(stateDir(d),`${id}.request.json`)} export function receiptPath(d:string,id:string){return join(stateDir(d),`${id}.receipt.json`)}
+export async function writeJson(path:string,v:unknown){await mkdir(join(path,".."),{recursive:true}); const t=`${path}.${process.pid}.tmp`; await writeFile(t,JSON.stringify(v,null,2)+"\n",{mode:0o600}); await rename(t,path)}
+export async function readReceipt(d:string,id:string):Promise<InstallReceipt|null>{try{return JSON.parse(await readFile(receiptPath(d,id),"utf8")) as InstallReceipt}catch{return null}}

@@ -1,0 +1,7 @@
+{
+  "name":"@botiverse/raft-computer-installer","version":"0.1.0","private":true,"type":"module",
+  "engines":{"node":">=24"},"bin":{"raft-computer-installer":"dist/cli.js"},
+  "scripts":{"build":"tsc -p tsconfig.json","test":"node --test --import tsx test/*.test.ts"},
+  "dependencies":{"@botiverse/k-carrier":"file:../k-carrier","semver":"^7.7.1"},
+  "devDependencies":{"@types/node":"^22.0.0","tsx":"^4.21.0","typescript":"^5.9.3"}
+}
