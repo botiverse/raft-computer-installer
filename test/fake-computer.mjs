@@ -39,7 +39,8 @@ if (cmd === "stop") {
 if (cmd === "status" && flag === "--json") {
   const s = readState();
   if (!s || !alive(s.pid)) { console.error("not running"); process.exit(1); }
-  console.log(JSON.stringify({ attestation: { servicePid: s.pid, computerVersion: s.version, serviceGeneration: s.generation } }));
+  const nextStep = process.env.RAFT_FAKE_NEXT_STEP ?? null;
+  console.log(JSON.stringify({ attestation: { servicePid: s.pid, computerVersion: s.version, serviceGeneration: s.generation }, ...(nextStep ? { nextStep } : {}) }));
   process.exit(0);
 }
 console.error(`fake computer: unknown command ${cmd}`);

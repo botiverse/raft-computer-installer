@@ -48,19 +48,21 @@ export async function selfVersion(binary: string, env: NodeJS.ProcessEnv): Promi
   }
 }
 
-export interface Attestation { version: string; pid: number; startId: string }
+export interface Attestation { version: string; pid: number; startId: string; nextStep: string | null }
 
 /** Live evidence only: version, pid and start id answered by one running service. */
 export async function attest(binary: string, env: NodeJS.ProcessEnv): Promise<Attestation> {
   const r = await runCommand(binary, ["status", "--json"], env, 30_000);
   if (r.code !== 0) throw new Error("computer_status_unavailable");
-  let parsed: { attestation?: { servicePid?: unknown; computerVersion?: unknown; serviceGeneration?: unknown } };
+  let parsed: { attestation?: { servicePid?: unknown; computerVersion?: unknown; serviceGeneration?: unknown }; nextStep?: unknown };
   try { parsed = JSON.parse(r.stdout); } catch { throw new Error("computer_status_unparseable"); }
   const a = parsed.attestation;
   if (!a || typeof a.servicePid !== "number" || typeof a.computerVersion !== "string" || typeof a.serviceGeneration !== "string") {
     throw new Error("computer_attestation_missing");
   }
-  return { version: a.computerVersion.replace(/^v/, ""), pid: a.servicePid, startId: a.serviceGeneration };
+  // The product says what the user should do next, if anything; the installer repeats it.
+  const nextStep = typeof parsed.nextStep === "string" && parsed.nextStep.trim() ? parsed.nextStep.trim() : null;
+  return { version: a.computerVersion.replace(/^v/, ""), pid: a.servicePid, startId: a.serviceGeneration, nextStep };
 }
 
 /** Stop is idempotent: a service that is not running is a stopped service. */

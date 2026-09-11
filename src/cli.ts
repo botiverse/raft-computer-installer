@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { userInfo } from "node:os";
 import type { OperationRead, RunnerLaunchResult } from "@botiverse/k-carrier";
 import { INSTALLER_VERSION, loadConfig, type Config } from "./config.js";
-import { adopt, freshInstall, removeScratch, repair } from "./install.js";
+import { adopt, freshInstall, nextStep, removeScratch, repair } from "./install.js";
 import { askYesNo, decidePresence, type Presence } from "./presence.js";
 import { failedBefore, held, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
 import { compareSemver, isSemver } from "./semver.js";
@@ -109,7 +109,7 @@ async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m
       const { attest } = await import("./computer.js");
       const live = await attest(cfg.binaryPath, { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome }).catch(() => null);
       const replayed = r.response?.result === "replayed";
-      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}. It is running.`, detail: { live, receipt: record?.id, result: r.response?.result } };
+      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}. It is running.${nextStep(live)}`, detail: { live, receipt: record?.id, result: r.response?.result } };
     }
     case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} is already installed and running. Nothing to do.` };
     case "rolled-back": return { code: 1, status: "rolled-back", line: `${m.version} did not start correctly, so ${current} was put back and is running.`, detail: { reason: record?.reason } };

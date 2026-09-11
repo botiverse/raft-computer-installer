@@ -65,7 +65,10 @@ The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
 `status --json`, whose `attestation` carries `servicePid`,
 `computerVersion` and `serviceGeneration`, the start id K compares across the
 handover. Slot bytes are published onto `PATH` atomically before `start`;
-nothing runs from inside a slot. The `photon_rs_bg.wasm` sidecar is verified
+nothing runs from inside a slot. `start` and `status` must work before
+anyone has logged in: "running" means the process answered, not that it is
+usable. An optional top-level `nextStep` string in `status --json` ("run
+raft-computer login") is repeated on the installer's success line. The `photon_rs_bg.wasm` sidecar is verified
 against the release manifest, kept per version under the installer's state,
 and published beside the binary with the slot it belongs to.
 

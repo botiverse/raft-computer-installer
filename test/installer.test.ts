@@ -10,7 +10,7 @@ const machine = () => { const m = h.machine(); machines.push(m); return m; };
 
 before(async () => {
   await h.start();
-  h.publish({ version: "1.0.0" });
+  h.publish({ version: "1.0.0", nextStep: "run raft-computer login" });
   h.publish({ version: "1.1.0" });
   h.publish({ version: "1.2.0", startFail: true });
   h.publish({ version: "1.3.0", reportedVersion: "9.9.9" });
@@ -52,7 +52,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("installs on a fresh machine: verify, seed stable, start, read back", async () => {
     const r = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.0\.0\. It is running\.$/m);
+    assert.match(r.stdout, /^Installed 1\.0\.0\. It is running\. Next: run raft-computer login$/m);
     assert.equal((await m.live())?.version, "1.0.0");
     assert.equal(readFileSync(join(m.kStateDir, "slots", "stable", "VERSION"), "utf8").trim(), "1.0.0");
     assert.ok(existsSync(join(m.installDir, "photon_rs_bg.wasm")), "sidecar published beside the binary");

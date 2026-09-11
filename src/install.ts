@@ -11,18 +11,23 @@ import { plain, type Outcome } from "./report.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-async function readback(cfg: Config, env: NodeJS.ProcessEnv, version: string, timeoutMs = 60_000): Promise<{ pid: number; startId: string }> {
+async function readback(cfg: Config, env: NodeJS.ProcessEnv, version: string, timeoutMs = 60_000): Promise<{ pid: number; startId: string; nextStep: string | null }> {
   const deadline = Date.now() + timeoutMs;
   let last = "no answer";
   while (Date.now() < deadline) {
     try {
       const a = await attest(cfg.binaryPath, env);
-      if (a.version === version) return { pid: a.pid, startId: a.startId };
+      if (a.version === version) return { pid: a.pid, startId: a.startId, nextStep: a.nextStep };
       last = `live service reports ${a.version}`;
     } catch (error) { last = error instanceof Error ? error.message : String(error); }
     await new Promise((r) => setTimeout(r, 250));
   }
   throw new Error(last);
+}
+
+/** What the product wants the user to do next, if it said so. */
+export function nextStep(live: { nextStep: string | null } | null): string {
+  return live?.nextStep ? ` Next: ${live.nextStep}` : "";
 }
 
 /** Fresh: verify, seed stable, start, probe. No transaction, no rollback. */
@@ -35,7 +40,7 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
     seeded = true;
     await createHostAdapter(cfg, { env }).start("stable");
     const live = await readback(cfg, env, m.version);
-    return { code: 0, status: "installed", line: `Installed ${m.version}. It is running.`, detail: live };
+    return { code: 0, status: "installed", line: `Installed ${m.version}. It is running.${nextStep(live)}`, detail: live };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (seeded) {
@@ -86,7 +91,7 @@ export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, i
     const live = await readback(cfg, env, m.version);
     return {
       code: 0, status: "repaired",
-      line: `Reinstalled ${m.version}. It is running.${quarantine ? ` The previous installation was kept at ${quarantine}.` : ""}`,
+      line: `Reinstalled ${m.version}. It is running.${quarantine ? ` The previous installation was kept at ${quarantine}.` : ""}${nextStep(live)}`,
       detail: { ...live, quarantine },
     };
   } catch (error) {
