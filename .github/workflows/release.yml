@@ -64,6 +64,24 @@ jobs:
           '
           npm run verify:release
           (cd dist && sha256sum installer-manifest.json >> SHA256SUMS)
+      - name: Mirror the release to the CDN
+        # cdn.raft.build/installer/<version>/ is where the bootstrap fetches
+        # from. Needs the production R2 credentials as repository secrets;
+        # without them the release is only on GitHub and this step says so.
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_PROD_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_PROD_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://a699265b21e68a0071d322cc5051cc4f.r2.cloudflarestorage.com
+        run: |
+          if [ -z "$R2_ACCESS_KEY_ID" ]; then echo "::warning::R2_PROD_* secrets are not set; not mirrored to the CDN"; exit 0; fi
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto
+          version="${GITHUB_REF_NAME#v}"
+          dest="s3://slock-cdn/installer/$version"
+          if aws --endpoint-url "$R2_ENDPOINT" s3 ls "$dest/SHA256SUMS" >/dev/null 2>&1; then echo "::error::$dest already exists; releases are immutable"; exit 1; fi
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp dist/ "$dest/" --recursive --no-progress
+          for f in cli.cjs runner.mjs install.sh SHA256SUMS; do
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "$dest/$f" "readback-$f" --no-progress && cmp "dist/$f" "readback-$f"
+          done
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

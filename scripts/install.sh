@@ -14,6 +14,9 @@
 # never ask: no --version means the channel's current release, and running
 # the installer is the consent, repair included.
 set -eu
+# Publish workflows may patch this for a channel-specific copy of the script
+# (the staging pointer sets "alpha"). An explicit --channel or --version wins.
+INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_VERSION:=0.2.0-rc.1}"
 : "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:=https://cdn.raft.build/installer/$RAFT_COMPUTER_INSTALLER_VERSION}"
 err() { printf 'Failed before any change: %s. Nothing changed.\n' "$1" >&2; exit 1; }
@@ -41,6 +44,9 @@ fetch() {
 }
 # The first word may be a command; everything else is passed through.
 case "${1:-}" in install|upgrade|repair|rollback|recover|status|help) cmd=$1; shift ;; *) cmd=install ;; esac
+if [ -n "$INSTALL_CHANNEL_DEFAULT" ]; then
+  case " $* " in *" --channel"*|*" --version"*) ;; *) set -- "$@" --channel "$INSTALL_CHANNEL_DEFAULT" ;; esac
+fi
 native="native/$plat-$arch/raft-computer-installer"
 if [ -z "${RAFT_COMPUTER_INSTALLER_NODE:-}" ] && grep -q " $native\$" "$tmp/SHA256SUMS"; then
   # A single executable for this machine: no Node needed.
