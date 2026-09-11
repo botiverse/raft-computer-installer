@@ -37,19 +37,24 @@ export async function publishSlot(cfg: Config, slot: Slot): Promise<void> {
 
 function modePath(cfg: Config): string { return join(cfg.installerDir, "host-mode.json"); }
 
-export async function readMode(cfg: Config): Promise<"service" | "cold" | null> {
+export interface HostRecord { mode: "service" | "cold"; forcedStops: number[] }
+
+export async function readHostRecord(cfg: Config): Promise<HostRecord | null> {
   try {
-    const parsed = JSON.parse(await readFile(modePath(cfg), "utf8")) as { mode?: unknown };
-    return parsed.mode === "service" || parsed.mode === "cold" ? parsed.mode : null;
+    const parsed = JSON.parse(await readFile(modePath(cfg), "utf8")) as Partial<HostRecord>;
+    if (parsed.mode !== "service" && parsed.mode !== "cold") return null;
+    return { mode: parsed.mode, forcedStops: Array.isArray(parsed.forcedStops) ? parsed.forcedStops.filter((p): p is number => typeof p === "number") : [] };
   } catch { return null; }
 }
+export async function readMode(cfg: Config): Promise<"service" | "cold" | null> { return (await readHostRecord(cfg))?.mode ?? null; }
 
-async function writeMode(cfg: Config, mode: "service" | "cold"): Promise<void> {
+async function writeHostRecord(cfg: Config, record: HostRecord): Promise<void> {
   await mkdir(cfg.installerDir, { recursive: true });
   const tmp = `${modePath(cfg)}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify({ mode }));
+  await writeFile(tmp, JSON.stringify(record));
   await rename(tmp, modePath(cfg));
 }
+const writeMode = (cfg: Config, mode: "service" | "cold") => writeHostRecord(cfg, { mode, forcedStops: [] });
 
 export function createHostAdapter(cfg: Config, deps: HostDeps = {}): HostAdapter {
   const env = { ...(deps.env ?? process.env), RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
@@ -73,7 +78,13 @@ export function createHostAdapter(cfg: Config, deps: HostDeps = {}): HostAdapter
     },
     async resume() {},
     async stop(_slot: Slot) {
-      if ((await currentMode()) === "service") await stopComputer(cfg.binaryPath, env);
+      if ((await currentMode()) !== "service") return;
+      const { forced } = await stopComputer(cfg.binaryPath, env);
+      if (forced.length) {
+        // The receipt says the installer had to finish the stop itself.
+        const record = (await readHostRecord(cfg)) ?? { mode: "service" as const, forcedStops: [] };
+        await writeHostRecord(cfg, { ...record, forcedStops: [...record.forcedStops, ...forced] });
+      }
     },
     async start(slot: Slot) {
       // Never throw for a world-state failure: the probe is the judge, and a

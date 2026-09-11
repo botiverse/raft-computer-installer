@@ -14,7 +14,7 @@ const platformKey = `${process.platform}-${process.arch}`;
 /** RCI_NATIVE=1 drives the single executables instead of node + cli.cjs. */
 export const NATIVE = process.env.RCI_NATIVE === "1";
 
-export interface FakeRelease { version: string; startFail?: boolean; reportedVersion?: string; nextStep?: string }
+export interface FakeRelease { version: string; startFail?: boolean; reportedVersion?: string; nextStep?: string; stopBroken?: boolean }
 
 export class Harness {
   dist = "";
@@ -61,8 +61,8 @@ export class Harness {
   }
 
   publish(r: FakeRelease): Buffer {
-    const env = [`RAFT_FAKE_VERSION=${r.reportedVersion ?? r.version}`, r.startFail ? "RAFT_FAKE_START_FAIL=1" : "", r.nextStep ? `RAFT_FAKE_NEXT_STEP="${r.nextStep}"` : ""].filter(Boolean).join(" ");
-    const bytes = Buffer.from(`#!/bin/sh\n${env} exec "${process.execPath}" "${fakePath}" "$@"\n`);
+    const env = [`RAFT_FAKE_VERSION=${r.reportedVersion ?? r.version}`, r.startFail ? "RAFT_FAKE_START_FAIL=1" : "", r.nextStep ? `RAFT_FAKE_NEXT_STEP="${r.nextStep}"` : "", r.stopBroken ? "RAFT_FAKE_STOP_BROKEN=1" : ""].filter(Boolean).join(" ");
+    const bytes = Buffer.from(`#!/bin/sh\n${env} RAFT_FAKE_SELF="$0" exec "${process.execPath}" "${fakePath}" "$@"\n`);
     this.releases.set(r.version, bytes);
     return bytes;
   }

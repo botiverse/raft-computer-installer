@@ -76,9 +76,10 @@ export async function statusHint(binary: string, env: NodeJS.ProcessEnv): Promis
   }
 }
 
-/** Is a service answering right now? */
+/** Is the service running: answering, or at least present as a process of the binary. */
 export async function isLive(binary: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-  try { await attest(binary, env); return true; } catch { return false; }
+  try { await attest(binary, env); return true; } catch { /* not answering */ }
+  return (await productProcesses(binary)).length > 0;
 }
 
 /**
@@ -111,13 +112,61 @@ export function firstSetup(binary: string, env: NodeJS.ProcessEnv): Promise<bool
   });
 }
 
-/** Stop is idempotent: a service that is not running is a stopped service. */
-export async function stopComputer(binary: string, env: NodeJS.ProcessEnv): Promise<void> {
-  if (!(await exists(binary))) return;
-  const r = await runCommand(binary, ["stop"], env, 90_000);
-  if (r.code !== 0 && !/not running|no service|not started/i.test(r.stdout + r.stderr)) {
-    throw new Error(`computer_stop_failed:${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+/**
+ * Processes that are provably the installed binary: the binary's path is a
+ * whole token of their command line. Never a bare pid, never a name.
+ */
+export async function productProcesses(binary: string): Promise<number[]> {
+  const ps = await runCommand("ps", ["-eo", "pid=,command="], process.env, 15_000).catch(() => null);
+  if (!ps || ps.code !== 0) return [];
+  const pids: number[] = [];
+  for (const line of ps.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (pid === process.pid || pid <= 1) continue;
+    if (m[2].split(/\s+/).includes(binary)) pids.push(pid);
   }
+  return pids;
+}
+
+async function waitGone(pids: number[], ms: number): Promise<number[]> {
+  const deadline = Date.now() + ms;
+  let left = pids;
+  while (left.length && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    left = left.filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  }
+  return left;
+}
+
+/** Terminate, wait, kill. Returns the pids it had to touch. */
+export async function terminateProduct(binary: string): Promise<number[]> {
+  const pids = await productProcesses(binary);
+  if (!pids.length) return [];
+  for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ } }
+  let left = await waitGone(pids, 20_000);
+  for (const pid of left) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+  left = await waitGone(left, 5_000);
+  if (left.length) throw new Error(`computer_processes_survive:${left.join(",")}`);
+  return pids;
+}
+
+/**
+ * Stop is idempotent: a service that is not running is a stopped service.
+ * The product's command goes first; if its processes are still there
+ * afterwards, the installer finishes the job by identity.
+ */
+export async function stopComputer(binary: string, env: NodeJS.ProcessEnv): Promise<{ forced: number[] }> {
+  if (await exists(binary)) {
+    const r = await runCommand(binary, ["stop"], env, 90_000).catch(() => null);
+    if (r && r.code !== 0 && !/not running|no service|not started/i.test(r.stdout + r.stderr)) {
+      // A failed stop is not the end: the fallback below decides.
+    }
+  }
+  const remaining = await waitGone(await productProcesses(binary), 5_000);
+  if (!remaining.length) return { forced: [] };
+  return { forced: await terminateProduct(binary) };
 }
 
 export async function startComputer(binary: string, env: NodeJS.ProcessEnv): Promise<CommandResult> {

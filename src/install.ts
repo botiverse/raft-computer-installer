@@ -3,14 +3,13 @@
 import { rm } from "node:fs/promises";
 import { bootstrapStable, quarantineState } from "@botiverse/k-carrier";
 import { acquireRelease, acquireSidecar } from "./artifact.js";
-import { attest, exists, firstSetup, runCommand, selfReport, startComputer, statusHint, stopComputer } from "./computer.js";
+import { attest, exists, firstSetup, selfReport, startComputer, statusHint, stopComputer, terminateProduct } from "./computer.js";
 import type { Presence } from "./presence.js";
 import { ensureOnPath } from "./shellPath.js";
 import { quarantineDir, type Config } from "./config.js";
 import { publishSlot } from "./hostAdapter.js";
 import type { Manifest } from "./source.js";
 import { plain, type Outcome } from "./report.js";
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /** What the product wants the user to do next, if it said so. */
@@ -68,7 +67,7 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
     const reason = error instanceof Error ? error.message : String(error);
     if (seeded) {
       // Nothing was running before; the seeded slot is evidence, not a fallback.
-      await stopComputer(cfg.binaryPath, env).catch(() => {});
+      await stopComputer(cfg.binaryPath, env).catch(() => ({ forced: [] }));
       await quarantineState(cfg.kStateDir, { destination: quarantineDir(cfg, id), timestampMs: Date.now(), assertActiveHandoff: async () => {} }).catch(() => {});
     }
     return { code: 1, status: "failed", line: `Could not install ${m.version}: ${plain(reason)}. Nothing is installed.`, detail: { reason } };
@@ -80,31 +79,15 @@ export async function adopt(cfg: Config, version: string): Promise<void> {
   await bootstrapStable({ stateDir: cfg.kStateDir, version, artifactPath: cfg.binaryPath });
 }
 
-/** Stop an unresponsive Computer only by an identity we recorded ourselves. */
-async function stopByRecordedIdentity(cfg: Config): Promise<void> {
-  let pid = 0;
-  try { pid = Number((await readFile(join(cfg.stateHome, "computer", "run", "service.pid"), "utf8")).trim()); } catch { return; }
-  if (!Number.isInteger(pid) || pid <= 1) return;
-  try { process.kill(pid, 0); } catch { return; }
-  const ps = await runCommand("ps", ["-p", String(pid), "-o", "command="], process.env, 10_000).catch(() => null);
-  if (!ps || !ps.stdout.includes(cfg.binaryPath)) return; // not provably ours: leave it alone
-  process.kill(pid, "SIGTERM");
-  for (let i = 0; i < 60; i++) {
-    await new Promise((r) => setTimeout(r, 500));
-    try { process.kill(pid, 0); } catch { return; }
-  }
-  throw new Error(`service process ${pid} did not stop`);
-}
-
 /** Broken, with consent: stop, quarantine, reinstall, seed. Reported as a repair. */
 export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, id: string, presence: Presence): Promise<Outcome> {
   let quarantine: string | null = null;
+  let forced: number[] = [];
   try {
-    if (await exists(cfg.binaryPath)) await stopComputer(cfg.binaryPath, env).catch(() => {});
-    await stopByRecordedIdentity(cfg);
+    forced = (await stopComputer(cfg.binaryPath, env)).forced;
     const q = await quarantineState(cfg.kStateDir, {
       destination: quarantineDir(cfg, id), timestampMs: Date.now(),
-      assertActiveHandoff: async () => { await stopByRecordedIdentity(cfg); },
+      assertActiveHandoff: async () => { forced = [...forced, ...(await terminateProduct(cfg.binaryPath))]; },
     });
     quarantine = q.status === "not-found" ? null : q.quarantinePath;
     const artifact = await acquireRelease(cfg, m, env);
@@ -116,7 +99,7 @@ export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, i
     return {
       code: 0, status: "repaired",
       line: `Reinstalled ${m.version}.${quarantine ? ` The previous installation was kept at ${quarantine}.` : ""}${after.tail}`,
-      detail: { ...after.detail, quarantine },
+      detail: { ...after.detail, quarantine, forcedStops: forced },
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);

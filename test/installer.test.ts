@@ -14,6 +14,7 @@ before(async () => {
   h.publish({ version: "1.1.0" });
   h.publish({ version: "1.2.0", startFail: true });
   h.publish({ version: "1.3.0", reportedVersion: "9.9.9" });
+  h.publish({ version: "1.4.0", stopBroken: true });
   h.channel.main = "1.1.0";
 });
 after(async () => { for (const m of machines) await m.cleanup(); await h.stop(); });
@@ -140,6 +141,22 @@ describe("PATH", () => {
     const again = await m.installer(["upgrade", "--version", "1.1.0"], { RAFT_COMPUTER_INSTALL_DIR: installDir });
     assert.equal(again.code, 0, again.stdout + again.stderr);
     assert.equal((readFileSync(join(m.home, ".zshrc"), "utf8").match(/raft-computer/g) ?? []).length, 1, "written once");
+  });
+});
+
+describe("process fallback", () => {
+  it("finishes a stop the product only pretended to do, by identity, and records it", async () => {
+    const m = machine();
+    await m.preinstall("1.4.0");
+    const before = await m.live();
+    assert.ok(before, "1.4.0 is running");
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--allow-downgrade", "--id", "forced-1"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Upgraded 1\.4\.0 → 1\.1\.0\. It is running\.$/m);
+    assert.throws(() => process.kill(before!.pid, 0), "the old service process is gone");
+    assert.equal((await m.live())?.version, "1.1.0");
+    const receipt = JSON.parse(readFileSync(join(m.home, "computer", "installer", "receipts", "forced-1.json"), "utf8"));
+    assert.deepEqual(receipt.detail.forcedStops, [before!.pid]);
   });
 });
 

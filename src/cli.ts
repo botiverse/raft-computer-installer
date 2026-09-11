@@ -111,7 +111,9 @@ async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m
       const live = await attest(cfg.binaryPath, hostEnv).catch(() => null);
       const hint = live ?? { nextStep: await statusHint(cfg.binaryPath, hostEnv) };
       const replayed = r.response?.result === "replayed";
-      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}.${live ? " It is running." : ""}${nextStep(hint)}`, detail: { live, receipt: record?.id, result: r.response?.result } };
+      const { readHostRecord } = await import("./hostAdapter.js");
+      const forcedStops = (await readHostRecord(cfg))?.forcedStops ?? [];
+      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}.${live ? " It is running." : ""}${nextStep(hint)}`, detail: { live, receipt: record?.id, result: r.response?.result, forcedStops } };
     }
     case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} is already installed. Nothing to do.` };
     case "rolled-back": {
