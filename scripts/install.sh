@@ -3,9 +3,10 @@ set -eu
 : "${RAFT_COMPUTER_VERSION:?set RAFT_COMPUTER_VERSION}"
 : "${RAFT_COMPUTER_INSTALL_DIR:=$HOME/.local/bin}"
 : "${RAFT_COMPUTER_OPERATION_ID:=$(date +%s)-$$}"
-: "${RAFT_COMPUTER_INSTALLER_VERSION:=0.1.0-rc.4}"
+: "${RAFT_COMPUTER_INSTALLER_VERSION:=0.1.0-rc.5}"
 : "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:=https://cdn.raft.build/installer/$RAFT_COMPUTER_INSTALLER_VERSION}"
 : "${RAFT_COMPUTER_INSTALLER_NODE:=node}"
+: "${RAFT_COMPUTER_PRODUCT_MANIFEST_URL:=https://cdn.raft.build/computer/$RAFT_COMPUTER_VERSION/manifest.json}"
 err(){ echo "[raft-computer-installer] error: $1" >&2; exit 1; }
 command -v "$RAFT_COMPUTER_INSTALLER_NODE" >/dev/null 2>&1 || err "Node 24 is required (set RAFT_COMPUTER_INSTALLER_NODE)"
 command -v curl >/dev/null 2>&1 || err "curl is required"
@@ -21,6 +22,6 @@ if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$tmp/cli.cjs" 
 [ "$actual" = "$expected" ] || err "installer SHA-256 mismatch"
 request="$tmp/request.json"
 cat >"$request" <<JSON
-{"protocol":"raft-computer-installer/v1","installerVersion":"$RAFT_COMPUTER_INSTALLER_VERSION","computerVersion":"$RAFT_COMPUTER_VERSION","operation":"upgrade","operationId":"$RAFT_COMPUTER_OPERATION_ID","installDir":"$RAFT_COMPUTER_INSTALL_DIR"}
+{"protocol":"raft-computer-installer/v1","installerVersion":"$RAFT_COMPUTER_INSTALLER_VERSION","computerVersion":"$RAFT_COMPUTER_VERSION","operation":"upgrade","operationId":"$RAFT_COMPUTER_OPERATION_ID","installDir":"$RAFT_COMPUTER_INSTALL_DIR","artifactUrl":"$RAFT_COMPUTER_PRODUCT_MANIFEST_URL"}
 JSON
-exec "$RAFT_COMPUTER_INSTALLER_NODE" "$tmp/cli.cjs" --validate-request --request "$request"
+exec "$RAFT_COMPUTER_INSTALLER_NODE" "$tmp/cli.cjs" --request "$request"

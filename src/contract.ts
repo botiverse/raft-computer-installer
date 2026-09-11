@@ -1,5 +1,5 @@
 export const INSTALLER_PROTOCOL = "raft-computer-installer/v1" as const;
-export const INSTALLER_VERSION = "0.1.0-rc.4" as const;
+export const INSTALLER_VERSION = "0.1.0-rc.5" as const;
 export type Operation = "install"|"upgrade"|"repair"|"rollback";
 export interface InstallRequest { protocol: typeof INSTALLER_PROTOCOL; installerVersion: string; computerVersion: string; operation: Operation; operationId: string; installDir: string; artifactUrl?: string; artifactSha256?: string; artifactSize?: number; }
 export interface InstallReceipt { protocol: typeof INSTALLER_PROTOCOL; installerVersion: string; computerVersion: string; operationId: string; operation: Operation; status: "succeeded"|"failed"|"rolled_back"; phase: string; error?: string; startedAt: string; finishedAt: string; pid?: number; startId?: string; }
