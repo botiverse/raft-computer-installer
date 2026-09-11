@@ -18,14 +18,24 @@ before(async () => {
 });
 after(async () => { for (const m of machines) await m.cleanup(); await h.stop(); });
 
-describe("unattended refusals", () => {
-  it("refuses without an exact version and consent, and changes nothing", async () => {
+describe("unattended", () => {
+  it("installs the channel's current release without a version or --yes, and records the consent", async () => {
     const m = machine();
-    for (const args of [["install"], ["install", "--version", "1.0.0"], ["install", "--yes"], ["install", "--channel", "main", "--yes"]]) {
-      const r = await m.installer(args);
-      assert.equal(r.code, 2, r.stdout + r.stderr);
-      assert.match(r.stdout, /Unattended runs need an exact version and consent/);
-    }
+    const r = await m.installer(["install"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^1\.1\.0 installed and running \(pid \d+\)\.$/m);
+    assert.equal((await m.live())?.version, "1.1.0");
+    const { readdirSync } = await import("node:fs");
+    const dir = join(m.home, "computer", "installer", "receipts");
+    const receipt = JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]), "utf8"));
+    assert.match(receipt.approvedBy, /\(unattended\)$/);
+    assert.equal(receipt.targetVersion, "1.1.0");
+  });
+  it("fails before any change when the authority cannot be reached", async () => {
+    const m = machine();
+    const r = await m.installer(["install"], { RAFT_COMPUTER_HANDS_ORIGIN: "http://127.0.0.1:9" });
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Failed before any change: release authority unreachable/m);
     assert.equal(existsSync(m.binary), false);
     assert.equal(existsSync(m.kStateDir), false);
   });
@@ -127,7 +137,7 @@ describe("adopted and broken", () => {
     const first = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(first.code, 0, first.stdout);
     rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0"]);
     assert.equal(r.code, 2, r.stdout + r.stderr);
     assert.match(r.stdout, /Repair needs consent; no one here\. Nothing changed\./);
     assert.equal((await m.live())?.version, "1.0.0", "the old service was not touched");

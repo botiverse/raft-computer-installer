@@ -8,9 +8,11 @@
 #   curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha
 #   curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --version 1.0.31 --yes
 #   curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --version 1.0.31 --yes
+#   CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh
 #
 # Unattended runs (CI=1, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal)
-# need --version and --yes; nothing is assumed and nothing prompts.
+# never ask: no --version means the channel's current release, and running
+# the installer is the consent. Repair is attended only.
 set -eu
 : "${RAFT_COMPUTER_INSTALLER_VERSION:=0.2.0-rc.1}"
 : "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:=https://cdn.raft.build/installer/$RAFT_COMPUTER_INSTALLER_VERSION}"

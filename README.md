@@ -18,6 +18,7 @@ curl -fsSL https://cdn.raft.build/computer/install.sh | sh
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --version 1.0.31 --yes
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --version 1.0.31 --yes
+CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # unattended: current release, no questions
 ```
 
 | Command | Does |
@@ -30,9 +31,9 @@ curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --versio
 
 | Option | Meaning |
 |---|---|
-| `--version V` | The exact version. Required unattended. |
-| `--channel main\|alpha` | Resolve the version through Hands, then ask. Attended only. |
-| `--yes` | Consent, recorded in the receipt. Required unattended. |
+| `--version V` | The exact version. Default: the channel's current release, resolved through Hands. |
+| `--channel main\|alpha` | Which channel to resolve. Attended, the resolved version is shown and asked about. |
+| `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent. Repair always needs it, and is attended only. |
 | `--approved-by WHO` | Who consented, for the receipt; defaults to the local user. |
 | `--id ID` | Operation id; the same id replays the first receipt. |
 | `--allow-downgrade` | Intend an older target; otherwise it is held. |
@@ -40,7 +41,7 @@ curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --versio
 
 | Environment | Meaning |
 |---|---|
-| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: nothing prompts, nothing is assumed. Otherwise a terminal decides. |
+| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: no questions, no repair. Otherwise a terminal decides. |
 | `RAFT_HOME` (or `SLOCK_HOME`) | Computer's state root; K state lives at `<home>/computer/k`. Default `~/.slock`. |
 | `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`. |
 | `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |

@@ -36,7 +36,8 @@ function usage(): string {
     "  recover         <recovery.json>      retry an unresolved recovery offline",
     "  status                               what is installed, and the last receipt",
     "",
-    "Unattended (CI, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal) runs need --version and --yes.",
+    "Unattended (CI, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal) runs never ask: no --version means the",
+    "channel's current release, and running the installer is the consent. Repair is attended only.",
     "Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back; 2 held or refused; 3 unresolved.",
   ].join("\n");
 }
@@ -125,7 +126,6 @@ async function resolveTarget(cfg: Config, a: Args, presence: Presence): Promise<
     try { return { manifest: await fetchManifest(cfg, a.version) }; }
     catch (error) { return { outcome: failedBefore(error instanceof Error ? error.message : String(error), null) }; }
   }
-  if (presence === "unattended") return { outcome: refused("Unattended runs need an exact version and consent (--version and --yes). Nothing changed.") };
   try {
     const hands = await resolveChannel(cfg, a.channel ?? "main");
     const manifest = await fetchManifest(cfg, hands.version);
@@ -148,10 +148,9 @@ function consentLine(world: World, target: string): string {
 
 async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.ProcessEnv): Promise<{ outcome: Outcome; settled: string | null; target: string | null }> {
   const id = a.id ?? `${a.command}-${randomUUID().slice(0, 8)}`;
-  // Rollback names its version from K's receipt; every other unattended run must name one.
-  if (presence === "unattended" && !(a.yes && (a.version || a.command === "rollback"))) {
-    return { outcome: refused("Unattended runs need an exact version and consent (--version and --yes). Nothing changed."), settled: null, target: a.version ?? null };
-  }
+  // Unattended: no questions, and running the installer is the consent.
+  // Repair is the one thing an unattended run never does.
+  if (presence === "unattended") a.yes = a.command !== "repair";
   if (a.command === "repair" && presence === "unattended") {
     return { outcome: refused("Repair needs consent; no one here. Nothing changed."), settled: null, target: a.version ?? null };
   }
@@ -182,7 +181,7 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   if (!a.yes) {
     if (!askYesNo(consentLine(world, target.version))) return { outcome: refused("Declined. Nothing changed."), settled: s.settled, target: target.version };
   }
-  const runEnv = { ...env, RAFT_COMPUTER_APPROVED_BY: a.approvedBy ?? userInfo().username };
+  const runEnv = { ...env, RAFT_COMPUTER_APPROVED_BY: a.approvedBy ?? (presence === "unattended" ? `${userInfo().username} (unattended)` : userInfo().username) };
 
   let outcome: Outcome;
   if (a.command === "repair" || world.kind === "broken") outcome = await repair(cfg, target, runEnv, id);
@@ -196,7 +195,7 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
     outcome = await upgradeManaged(cfg, runEnv, id, target, world.version, a.allowDowngrade);
   }
   await removeScratch(cfg, target.version).catch(() => {});
-  await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: target.version, approvedBy: a.approvedBy ?? (a.yes ? userInfo().username : null), settled: s.settled })).catch(() => {});
+  await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: target.version, approvedBy: runEnv.RAFT_COMPUTER_APPROVED_BY ?? null, settled: s.settled })).catch(() => {});
   return { outcome, settled: s.settled, target: target.version };
 }
 
