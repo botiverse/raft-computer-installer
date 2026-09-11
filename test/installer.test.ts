@@ -23,7 +23,7 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["install"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.1\.0\. Next: run raft-computer login$/m);
+    assert.match(r.stdout, /^Installed 1\.1\.0\. Add .*\/bin to your PATH\. Next: run raft-computer login$/m);
     assert.equal(await m.live(), null, "nothing is started before login");
     assert.equal(await m.selfVersion(), "1.1.0");
     const { readdirSync } = await import("node:fs");
@@ -53,7 +53,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("installs on a fresh machine: verify, seed stable, publish, self-check; unattended, nothing is set up or started", async () => {
     const r = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.0\.0\. Next: run raft-computer login$/m);
+    assert.match(r.stdout, /^Installed 1\.0\.0\. Add .*\/bin to your PATH\. Next: run raft-computer login$/m);
     assert.equal(await m.live(), null);
     assert.equal(await m.selfVersion(), "1.0.0");
     assert.equal(readFileSync(join(m.kStateDir, "slots", "stable", "VERSION"), "utf8").trim(), "1.0.0");
@@ -129,6 +129,20 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   });
 });
 
+describe("PATH", () => {
+  it("puts the default install directory on PATH in the shell profile and says so", async () => {
+    const m = machine();
+    const installDir = join(m.home, ".local", "bin");
+    const r = await m.installer(["install", "--version", "1.0.0"], { RAFT_COMPUTER_INSTALL_DIR: installDir });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Installed 1\.0\.0\. Added .*\.local\/bin to PATH in .*\.zshrc; open a new terminal\. Next: run raft-computer login$/m);
+    assert.match(readFileSync(join(m.home, ".zshrc"), "utf8"), /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
+    const again = await m.installer(["upgrade", "--version", "1.1.0"], { RAFT_COMPUTER_INSTALL_DIR: installDir });
+    assert.equal(again.code, 0, again.stdout + again.stderr);
+    assert.equal((readFileSync(join(m.home, ".zshrc"), "utf8").match(/raft-computer/g) ?? []).length, 1, "written once");
+  });
+});
+
 describe("first setup", () => {
   it("attended, a fresh install logs in, starts and reads back", async () => {
     const m = machine();
@@ -138,7 +152,7 @@ describe("first setup", () => {
     const cfg = loadConfig(m.env());
     const outcome = await freshInstall(cfg, await fetchManifest(cfg, "1.0.0"), m.env(), "setup-1", "attended");
     assert.equal(outcome.code, 0, outcome.line);
-    assert.equal(outcome.line, "Installed 1.0.0. Set up and running.");
+    assert.match(outcome.line, /^Installed 1\.0\.0\. Add .*\/bin to your PATH\. Set up and running\.$/);
     assert.equal((await m.live())?.version, "1.0.0");
   });
 });

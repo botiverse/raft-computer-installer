@@ -42,7 +42,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 |---|---|
 | `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: no questions. Otherwise a terminal decides. |
 | `RAFT_HOME` (or `SLOCK_HOME`) | Computer's state root; K state lives at `<home>/computer/k`. Default `~/.slock`. |
-| `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`. |
+| `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`, which a fresh install adds to `~/.zshrc` or `~/.bashrc` when missing; `RAFT_COMPUTER_NO_MODIFY_PATH=1` leaves profiles alone. |
 | `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |
 | `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | The release authority a channel is resolved through. |
 | `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |

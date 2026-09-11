@@ -89,7 +89,7 @@ export class Machine {
   get kStateDir(): string { return join(this.home, "computer", "k"); }
   env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     return {
-      ...process.env, RAFT_HOME: this.home, RAFT_COMPUTER_INSTALL_DIR: this.installDir,
+      ...process.env, HOME: this.home, SHELL: "/bin/zsh", RAFT_HOME: this.home, RAFT_COMPUTER_INSTALL_DIR: this.installDir,
       RAFT_COMPUTER_RELEASE_BASE: `${this.h.base}/computer`, RAFT_COMPUTER_HANDS_ORIGIN: this.h.base,
       RAFT_COMPUTER_INSTALLER_RUNNER: NATIVE ? join(this.h.dist, "native", platformKey, "raft-computer-installer-runner") : join(this.h.dist, "runner.mjs"),
       RAFT_COMPUTER_NON_INTERACTIVE: "1", ...extra,

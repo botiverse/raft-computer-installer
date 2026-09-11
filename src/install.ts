@@ -5,6 +5,7 @@ import { bootstrapStable, quarantineState } from "@botiverse/k-carrier";
 import { acquireRelease, acquireSidecar } from "./artifact.js";
 import { attest, exists, firstSetup, runCommand, selfReport, startComputer, statusHint, stopComputer } from "./computer.js";
 import type { Presence } from "./presence.js";
+import { ensureOnPath } from "./shellPath.js";
 import { quarantineDir, type Config } from "./config.js";
 import { publishSlot } from "./hostAdapter.js";
 import type { Manifest } from "./source.js";
@@ -60,8 +61,9 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
     seeded = true;
     await publishSlot(cfg, "stable");
     await verifyPublished(cfg, env, m.version);
+    const path = await ensureOnPath(cfg, env);
     const after = await setUpAndStart(cfg, env, m.version, presence);
-    return { code: 0, status: "installed", line: `Installed ${m.version}.${after.tail}`, detail: after.detail };
+    return { code: 0, status: "installed", line: `Installed ${m.version}.${path}${after.tail}`, detail: after.detail };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (seeded) {
