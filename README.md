@@ -23,7 +23,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 
 | Command | Does |
 |---|---|
-| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed, repair if broken. |
+| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed, repair if broken. A fresh install ends with first setup (`raft-computer login`) when someone is there, then starts Computer; unattended it stays installed and says what to do next. |
 | `rollback` | Upgrade to the previous stable version as an explicit target. |
 | `repair` | Ask for repair explicitly: quarantine K's state and reinstall. Held unless the machine is broken. |
 | `recover <recovery.json>` | Retry an unresolved recovery offline. |
@@ -65,10 +65,18 @@ The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
 `status --json`, whose `attestation` carries `servicePid`,
 `computerVersion` and `serviceGeneration`, the start id K compares across the
 handover. Slot bytes are published onto `PATH` atomically before `start`;
-nothing runs from inside a slot. `start` and `status` must work before
-anyone has logged in: "running" means the process answered, not that it is
-usable. An optional top-level `nextStep` string in `status --json` ("run
-raft-computer login") is repeated on the installer's success line. The `photon_rs_bg.wasm` sidecar is verified
+nothing runs from inside a slot.
+
+Computer needs a login before it can start, so the adapter has two modes,
+decided at `quiesce` and remembered in `<home>/computer/installer/host-mode.json`
+for recovery. If a service was running, it is stopped and the candidate must
+come back as a live service. If nothing was running, the candidate is run
+for its `--version` and that process is the readback: a new pid and start id
+every time. A fresh install never starts Computer by itself: it publishes,
+self-checks, then runs `raft-computer login` on the terminal when someone
+is there, and only after a successful login starts Computer and reads it
+back. `status --json` must work without a service and may carry a top-level
+`nextStep` string ("run raft-computer login"), which the installer repeats. The `photon_rs_bg.wasm` sidecar is verified
 against the release manifest, kept per version under the installer's state,
 and published beside the binary with the slot it belongs to.
 
@@ -82,8 +90,9 @@ npm ci
 npm run typecheck
 npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUMS
 npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
-npm test             # real processes against a fake Computer: unattended, fresh, managed,
-                     # replay, rollback, downgrade, adopt, foreign manager, broken and repair
+npm test             # real processes against a fake Computer: unattended, fresh, cold and live
+                     # upgrades, replay, rollback, downgrade, first setup, adopt, foreign
+                     # manager, broken and repair
 npm run test:native  # the same suite driving the single executables
 ```
 

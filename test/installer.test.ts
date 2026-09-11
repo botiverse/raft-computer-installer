@@ -10,7 +10,7 @@ const machine = () => { const m = h.machine(); machines.push(m); return m; };
 
 before(async () => {
   await h.start();
-  h.publish({ version: "1.0.0", nextStep: "run raft-computer login" });
+  h.publish({ version: "1.0.0" });
   h.publish({ version: "1.1.0" });
   h.publish({ version: "1.2.0", startFail: true });
   h.publish({ version: "1.3.0", reportedVersion: "9.9.9" });
@@ -23,8 +23,9 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["install"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.1\.0\. It is running\.$/m);
-    assert.equal((await m.live())?.version, "1.1.0");
+    assert.match(r.stdout, /^Installed 1\.1\.0\. Next: run raft-computer login$/m);
+    assert.equal(await m.live(), null, "nothing is started before login");
+    assert.equal(await m.selfVersion(), "1.1.0");
     const { readdirSync } = await import("node:fs");
     const dir = join(m.home, "computer", "installer", "receipts");
     const receipt = JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]), "utf8"));
@@ -49,13 +50,31 @@ describe("unattended", () => {
 
 describe("fresh, managed, replay, rollback, downgrade", () => {
   const m = h.machine(); machines.push(m);
-  it("installs on a fresh machine: verify, seed stable, start, read back", async () => {
+  it("installs on a fresh machine: verify, seed stable, publish, self-check; unattended, nothing is set up or started", async () => {
     const r = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.0\.0\. It is running\. Next: run raft-computer login$/m);
-    assert.equal((await m.live())?.version, "1.0.0");
+    assert.match(r.stdout, /^Installed 1\.0\.0\. Next: run raft-computer login$/m);
+    assert.equal(await m.live(), null);
+    assert.equal(await m.selfVersion(), "1.0.0");
     assert.equal(readFileSync(join(m.kStateDir, "slots", "stable", "VERSION"), "utf8").trim(), "1.0.0");
     assert.ok(existsSync(join(m.installDir, "photon_rs_bg.wasm")), "sidecar published beside the binary");
+  });
+  it("upgrades an installed machine where nothing runs: the new bytes must check out, nothing is started", async () => {
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "cold-1"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. Next: run raft-computer login$/m);
+    assert.equal(await m.live(), null);
+    assert.equal(await m.selfVersion(), "1.1.0");
+  });
+  it("rolls back a cold upgrade whose bytes answer as the wrong version", async () => {
+    const r = await m.installer(["upgrade", "--version", "1.3.0", "--yes"]);
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /^1\.3\.0 did not check out correctly, so 1\.1\.0 was put back\.$/m);
+    assert.equal(await m.selfVersion(), "1.1.0");
+    const back = await m.installer(["upgrade", "--version", "1.0.0", "--yes", "--allow-downgrade"]);
+    assert.equal(back.code, 0, back.stdout + back.stderr);
+    await m.loginAndStart();
+    assert.equal((await m.live())?.version, "1.0.0");
   });
   it("upgrades a managed machine through K and reports the live readback", async () => {
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "up-1"]);
@@ -76,7 +95,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("says up to date when the target is what is running", async () => {
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^1\.1\.0 is already installed and running\. Nothing to do\.$/m);
+    assert.match(r.stdout, /^1\.1\.0 is already installed\. Nothing to do\.$/m);
   });
   it("rolls back a candidate that will not start, exit 1, old version running", async () => {
     const r = await m.installer(["upgrade", "--version", "1.2.0", "--yes"]);
@@ -110,6 +129,20 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   });
 });
 
+describe("first setup", () => {
+  it("attended, a fresh install logs in, starts and reads back", async () => {
+    const m = machine();
+    const { freshInstall } = await import("../src/install.ts");
+    const { loadConfig } = await import("../src/config.ts");
+    const { fetchManifest } = await import("../src/source.ts");
+    const cfg = loadConfig(m.env());
+    const outcome = await freshInstall(cfg, await fetchManifest(cfg, "1.0.0"), m.env(), "setup-1", "attended");
+    assert.equal(outcome.code, 0, outcome.line);
+    assert.equal(outcome.line, "Installed 1.0.0. Set up and running.");
+    assert.equal((await m.live())?.version, "1.0.0");
+  });
+});
+
 describe("adopted and broken", () => {
   it("adopts a pre-K install, then upgrades it", async () => {
     const m = machine();
@@ -137,8 +170,8 @@ describe("adopted and broken", () => {
     rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--id", "repair-1"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Reinstalled 1\.1\.0\. It is running\. The previous installation was kept at .*repair-1\.$/m);
-    assert.equal((await m.live())?.version, "1.1.0");
+    assert.match(r.stdout, /^Reinstalled 1\.1\.0\. The previous installation was kept at .*repair-1\. Next: run raft-computer login$/m);
+    assert.equal(await m.selfVersion(), "1.1.0");
     assert.ok(existsSync(join(m.home, "computer", "installer", "quarantine", "repair-1", "slots", "stable", "VERSION")), "old state kept whole");
     const receipt = JSON.parse(readFileSync(join(m.home, "computer", "installer", "receipts", "repair-1.json"), "utf8"));
     assert.equal(receipt.status, "repaired");

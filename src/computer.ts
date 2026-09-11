@@ -5,7 +5,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export interface CommandResult { code: number; stdout: string; stderr: string }
+export interface CommandResult { code: number; stdout: string; stderr: string; pid: number }
 
 export function runCommand(binary: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = 60_000): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
@@ -21,7 +21,7 @@ export function runCommand(binary: string, args: string[], env: NodeJS.ProcessEn
     child.stdout.on("data", (d: Buffer) => { stdout += d; if (stdout.length > 1 << 20) child.kill("SIGKILL"); });
     child.stderr.on("data", (d: Buffer) => { stderr += d; });
     child.on("error", (error) => { if (done) return; done = true; clearTimeout(timer); reject(error); });
-    child.on("close", (code) => { if (done) return; done = true; clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr }); });
+    child.on("close", (code) => { if (done) return; done = true; clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr, pid: child.pid ?? 0 }); });
   });
 }
 
@@ -63,6 +63,52 @@ export async function attest(binary: string, env: NodeJS.ProcessEnv): Promise<At
   // The product says what the user should do next, if anything; the installer repeats it.
   const nextStep = typeof parsed.nextStep === "string" && parsed.nextStep.trim() ? parsed.nextStep.trim() : null;
   return { version: a.computerVersion.replace(/^v/, ""), pid: a.servicePid, startId: a.serviceGeneration, nextStep };
+}
+
+/** The product's next step for the user, if it names one; works without a running service. */
+export async function statusHint(binary: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  try {
+    const r = await runCommand(binary, ["status", "--json"], env, 30_000);
+    const parsed = JSON.parse(r.stdout) as { nextStep?: unknown };
+    return typeof parsed.nextStep === "string" && parsed.nextStep.trim() ? parsed.nextStep.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Is a service answering right now? */
+export async function isLive(binary: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  try { await attest(binary, env); return true; } catch { return false; }
+}
+
+/**
+ * Cold self-report: run the binary itself and take its answer as the
+ * evidence. Every run is a new process, so the start id is always new.
+ * This is what "probe" means on a machine where nothing runs.
+ */
+export async function selfReport(binary: string, env: NodeJS.ProcessEnv): Promise<Attestation> {
+  const home = await mkdtemp(join(tmpdir(), "raft-installer-probe-"));
+  try {
+    const r = await runCommand(binary, ["--version"], { ...env, RAFT_HOME: home, SLOCK_HOME: home }, 20_000);
+    if (r.code !== 0) throw new Error("computer_self_report_failed");
+    const token = (r.stdout.trim().split(/\s+/)[0] ?? "").replace(/^v/, "");
+    if (!token) throw new Error("computer_self_report_empty");
+    return { version: token, pid: r.pid, startId: `cold-${r.pid}-${Date.now()}`, nextStep: null };
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The product's first setup, run on the user's terminal: for Computer,
+ * `login`. Only attended; an unattended run has nobody to log in.
+ */
+export function firstSetup(binary: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(binary, ["login"], { env, stdio: "inherit" });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
 }
 
 /** Stop is idempotent: a service that is not running is a stopped service. */

@@ -100,18 +100,25 @@ export class Machine {
       ? run(join(this.h.dist, "native", platformKey, "raft-computer-installer"), args, { env: this.env(extra), allowFailure: true })
       : run(process.execPath, [join(this.h.dist, "cli.cjs"), ...args], { env: this.env(extra), allowFailure: true });
   }
-  /** Put a pre-K Computer on PATH and start it, as the old install.sh would have. */
+  /** Put a pre-K Computer on PATH, log in and start it, as the old install.sh plus a user would have. */
   async preinstall(version: string): Promise<void> {
     const bytes = this.h.releases.get(version) ?? this.h.publish({ version });
     writeFileSync(this.binary, bytes, { mode: 0o755 });
     chmodSync(this.binary, 0o755);
+    await this.loginAndStart();
+  }
+  async loginAndStart(): Promise<void> {
+    await run(this.binary, ["login"], { env: { ...process.env, RAFT_HOME: this.home } });
     await run(this.binary, ["start"], { env: { ...process.env, RAFT_HOME: this.home } });
+  }
+  async selfVersion(): Promise<string> {
+    return (await run(this.binary, ["--version"], { env: { ...process.env, RAFT_HOME: this.home } })).stdout.trim();
   }
   async live(): Promise<{ version: string; pid: number } | null> {
     const r = await run(this.binary, ["status", "--json"], { env: { ...process.env, RAFT_HOME: this.home }, allowFailure: true });
     if (r.code !== 0) return null;
     const a = JSON.parse(r.stdout).attestation;
-    return { version: a.computerVersion, pid: a.servicePid };
+    return a ? { version: a.computerVersion, pid: a.servicePid } : null;
   }
   async cleanup(): Promise<void> {
     if (existsSync(this.binary)) {

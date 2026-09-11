@@ -19,7 +19,11 @@ function alive(pid) { try { process.kill(pid, 0); return true; } catch { return 
 
 if (cmd === "--version") { console.log(version); process.exit(0); }
 if (!home) { console.error("no home"); process.exit(1); }
+const loginFile = join(home, "computer", "login");
+const loggedIn = () => { try { readFileSync(loginFile); return true; } catch { return false; } };
+if (cmd === "login") { mkdirSync(join(home, "computer"), { recursive: true }); writeFileSync(loginFile, "ok"); process.exit(0); }
 if (cmd === "start") {
+  if (!loggedIn()) { console.error("not logged in; run login first"); process.exit(1); }
   if (process.env.RAFT_FAKE_START_FAIL === "1") { console.error("refusing to start"); process.exit(1); }
   const existing = readState();
   if (existing && alive(existing.pid)) process.exit(0);
@@ -38,9 +42,9 @@ if (cmd === "stop") {
 }
 if (cmd === "status" && flag === "--json") {
   const s = readState();
-  if (!s || !alive(s.pid)) { console.error("not running"); process.exit(1); }
-  const nextStep = process.env.RAFT_FAKE_NEXT_STEP ?? null;
-  console.log(JSON.stringify({ attestation: { servicePid: s.pid, computerVersion: s.version, serviceGeneration: s.generation }, ...(nextStep ? { nextStep } : {}) }));
+  const running = Boolean(s && alive(s.pid));
+  const nextStep = !loggedIn() ? "run raft-computer login" : (process.env.RAFT_FAKE_NEXT_STEP ?? null);
+  console.log(JSON.stringify({ running, ...(running ? { attestation: { servicePid: s.pid, computerVersion: s.version, serviceGeneration: s.generation } } : {}), ...(nextStep ? { nextStep } : {}) }));
   process.exit(0);
 }
 console.error(`fake computer: unknown command ${cmd}`);

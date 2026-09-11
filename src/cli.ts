@@ -106,13 +106,19 @@ async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m
   if (r.exitCode === 3) return unresolvedOutcome(r);
   switch (outcome) {
     case "promoted": {
-      const { attest } = await import("./computer.js");
-      const live = await attest(cfg.binaryPath, { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome }).catch(() => null);
+      const { attest, statusHint } = await import("./computer.js");
+      const hostEnv = { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
+      const live = await attest(cfg.binaryPath, hostEnv).catch(() => null);
+      const hint = live ?? { nextStep: await statusHint(cfg.binaryPath, hostEnv) };
       const replayed = r.response?.result === "replayed";
-      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}. It is running.${nextStep(live)}`, detail: { live, receipt: record?.id, result: r.response?.result } };
+      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}.${live ? " It is running." : ""}${nextStep(hint)}`, detail: { live, receipt: record?.id, result: r.response?.result } };
     }
-    case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} is already installed and running. Nothing to do.` };
-    case "rolled-back": return { code: 1, status: "rolled-back", line: `${m.version} did not start correctly, so ${current} was put back and is running.`, detail: { reason: record?.reason } };
+    case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} is already installed. Nothing to do.` };
+    case "rolled-back": {
+      const { readMode } = await import("./hostAdapter.js");
+      const running = (await readMode(cfg)) === "service";
+      return { code: 1, status: "rolled-back", line: `${m.version} did not ${running ? "start" : "check out"} correctly, so ${current} was put back${running ? " and is running" : ""}.`, detail: { reason: record?.reason } };
+    }
     case "held": return held(plain(record?.reason ?? "the upgrade was not allowed on this machine"));
     case "failed": return failedBefore(record?.reason ?? error ?? "unknown", current);
     default: return { code: 1, status: "failed", line: `Could not upgrade: ${plain(error ?? "no answer from the installer")}. Check with: raft-computer-installer status`, detail: { error } };
@@ -175,8 +181,8 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   const runEnv = { ...env, RAFT_COMPUTER_APPROVED_BY: a.approvedBy ?? (presence === "unattended" ? `${userInfo().username} (unattended)` : userInfo().username) };
 
   let outcome: Outcome;
-  if (a.command === "repair" || world.kind === "broken") outcome = await repair(cfg, target, runEnv, id);
-  else if (world.kind === "fresh") outcome = await freshInstall(cfg, target, runEnv, id);
+  if (a.command === "repair" || world.kind === "broken") outcome = await repair(cfg, target, runEnv, id, presence);
+  else if (world.kind === "fresh") outcome = await freshInstall(cfg, target, runEnv, id, presence);
   else {
     if (world.kind === "adopted") {
       try { await adopt(cfg, world.version); } catch (error) {

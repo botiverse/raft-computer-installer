@@ -1,11 +1,17 @@
 // K's HostAdapter over the Computer CLI. Every lifecycle call goes through
 // the PATH-visible binary; slot bytes are published there before start, so
-// nothing ever runs from inside a slot directory.
-import { chmod, copyFile, mkdir, readFile, rename, rm } from "node:fs/promises";
+// nothing ever runs from inside a slot.
+//
+// Two modes, decided once at quiesce and remembered on disk for recovery:
+// a service that was running is stopped and must come back as a live
+// service; a machine where nothing runs (installed, not logged in) is
+// verified by running the candidate itself. Either way the readback comes
+// from a process of the new bytes.
+import { chmod, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { HostAdapter, ProcessEvidence, Slot } from "@botiverse/k-carrier";
 import { slotArtifactPath } from "@botiverse/k-carrier";
-import { attest, exists, startComputer, stopComputer } from "./computer.js";
+import { attest, exists, isLive, selfReport, startComputer, stopComputer } from "./computer.js";
 import { SIDECAR_NAME, sidecarDir, type Config } from "./config.js";
 
 export interface HostDeps { env?: NodeJS.ProcessEnv; startReadyTimeoutMs?: number; pollMs?: number }
@@ -29,22 +35,51 @@ export async function publishSlot(cfg: Config, slot: Slot): Promise<void> {
   if (sidecar && await exists(sidecar)) await publishFile(sidecar, cfg.sidecarPath, 0o644);
 }
 
+function modePath(cfg: Config): string { return join(cfg.installerDir, "host-mode.json"); }
+
+export async function readMode(cfg: Config): Promise<"service" | "cold" | null> {
+  try {
+    const parsed = JSON.parse(await readFile(modePath(cfg), "utf8")) as { mode?: unknown };
+    return parsed.mode === "service" || parsed.mode === "cold" ? parsed.mode : null;
+  } catch { return null; }
+}
+
+async function writeMode(cfg: Config, mode: "service" | "cold"): Promise<void> {
+  await mkdir(cfg.installerDir, { recursive: true });
+  const tmp = `${modePath(cfg)}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify({ mode }));
+  await rename(tmp, modePath(cfg));
+}
+
 export function createHostAdapter(cfg: Config, deps: HostDeps = {}): HostAdapter {
   const env = { ...(deps.env ?? process.env), RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
   const readyTimeout = deps.startReadyTimeoutMs ?? 60_000;
   const poll = deps.pollMs ?? 250;
+  let mode: "service" | "cold" | null = null;
+  const currentMode = async (): Promise<"service" | "cold"> => {
+    mode ??= await readMode(cfg);
+    if (mode === null) { mode = (await isLive(cfg.binaryPath, env)) ? "service" : "cold"; await writeMode(cfg, mode); }
+    return mode;
+  };
   return {
     // Every controller call is awaited to completion; nothing is queued that
     // could land after the worker is gone. Acknowledge.
     async fence() {},
-    // Computer parks and restores its own workloads across stop/start.
-    async quiesce() {},
+    // Decide the mode from what is running now, before anything is stopped,
+    // and remember it so a recovery driver stops and starts the same way.
+    async quiesce() {
+      mode = (await isLive(cfg.binaryPath, env)) ? "service" : "cold";
+      await writeMode(cfg, mode);
+    },
     async resume() {},
-    async stop(_slot: Slot) { await stopComputer(cfg.binaryPath, env); },
+    async stop(_slot: Slot) {
+      if ((await currentMode()) === "service") await stopComputer(cfg.binaryPath, env);
+    },
     async start(slot: Slot) {
       // Never throw for a world-state failure: the probe is the judge, and a
       // throwing start would skip K's rollback path.
       try { await publishSlot(cfg, slot); } catch { return; }
+      if ((await currentMode()) !== "service") return;
       const started = await startComputer(cfg.binaryPath, env).catch(() => null);
       if (!started || started.code !== 0) return;
       const deadline = Date.now() + readyTimeout;
@@ -54,7 +89,7 @@ export function createHostAdapter(cfg: Config, deps: HostDeps = {}): HostAdapter
       }
     },
     async healthProbe(): Promise<ProcessEvidence> {
-      return attest(cfg.binaryPath, env);
+      return (await currentMode()) === "service" ? attest(cfg.binaryPath, env) : selfReport(cfg.binaryPath, env);
     },
   };
 }
