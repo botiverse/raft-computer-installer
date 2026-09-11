@@ -17,13 +17,13 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run verify:release
-      - run: npm run test:artifact
+      - run: npm test
       - name: Add provenance and checksums
         env:
-          K_COMMIT: 58c576da48d810380d8c0ed9b8230aedbb99a9be
+          K_COMMIT: b14fa62e06937bb8a4639410bf6ccaaaf0d460a8
         run: |
           node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync("dist/installer-manifest.json")); m.gitCommit=process.env.GITHUB_SHA; m.kCommit=process.env.K_COMMIT; fs.writeFileSync("dist/release-provenance.json", JSON.stringify(m,null,2)+"\n")'
-          (cd dist && sha256sum cli.cjs install.sh install.ps1 installer-manifest.json release-provenance.json > SHA256SUMS)
+          (cd dist && sha256sum cli.cjs runner.mjs install.sh installer-manifest.json release-provenance.json > SHA256SUMS)
           tar -czf "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" -C dist .
           sha256sum "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" > "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz.sha256"
       - name: Publish GitHub release

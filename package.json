@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft-computer-installer",
-  "version": "0.1.0-rc.6",
+  "version": "0.2.0-rc.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -12,14 +12,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",
-    "build:native": "node scripts/build.mjs --native",
-    "manifest": "node scripts/release.mjs assemble dist",
-    "verify:release": "node scripts/release.mjs verify dist",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:artifact": "node scripts/acceptance.mjs dist"
+    "verify:release": "node -e \"const fs=require('fs');const m=JSON.parse(fs.readFileSync('dist/installer-manifest.json'));const c=require('crypto');for(const [f,x] of Object.entries(m.files)){const b=fs.readFileSync('dist/'+f);if(b.length!==x.size||c.createHash('sha256').update(b).digest('hex')!==x.sha256)throw new Error('release_integrity:'+f)}console.log(JSON.stringify({ok:true,installerVersion:m.installerVersion,files:Object.keys(m.files)}))\""
   },
   "dependencies": {
-    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/58c576da48d810380d8c0ed9b8230aedbb99a9be"
+    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/b14fa62e06937bb8a4639410bf6ccaaaf0d460a8"
   },
   "devDependencies": {
     "@types/node": "22.20.2",

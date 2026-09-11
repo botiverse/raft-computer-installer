@@ -1,64 +1,94 @@
 # Raft Computer Installer
 
-An independent installer, upgrader and repair tool for Raft Computer, built on
-[K](https://github.com/botiverse/k-carrier). The installer can be released without
-releasing Computer and must remain usable when Computer cannot start.
+An independent installer, upgrader and repair tool for Raft Computer, built
+on [K](https://github.com/botiverse/k-carrier). It is released on its own
+schedule and works when Computer cannot start.
 
-The installer is released independently from Computer. A bootstrap script may be
-published beside the installer, but the three identities remain separate:
+It is the reference implementation of K's
+[installer contract](https://botiverse.github.io/k-carrier/installer.html):
+what an installer does for every way a request can arrive, every machine it
+can land on, and every way it can end. K supplies the transaction; this
+project supplies everything around it. Read the contract first; this README
+only says what is specific to Computer.
 
-- **bootstrap** (`install.sh`/`install.ps1`) — platform detection, installer
-  download, hash/signature verification, and process launch only;
-- **installer** — its own version and platform artifacts, state directory,
-  request/receipt protocol, and K transaction runner;
-- **Computer** — the product version and platform artifact selected by the
-  Computer release authority.
+## Interface
 
-The bootstrap does not need Hands. It selects a pinned, authenticated installer
-release and starts it. The installer may consult Hands to resolve a Computer
-channel or fetch a pinned Computer manifest directly. Hands chooses the product
-release; it does not define the installer version.
+```
+curl -fsSL https://cdn.raft.build/computer/install.sh | sh
+curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha
+curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --version 1.0.31 --yes
+curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --version 1.0.31 --yes
+```
 
-## Scope
+| Command | Does |
+|---|---|
+| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed. Refuse if broken. |
+| `rollback` | Upgrade to the previous stable version as an explicit target. |
+| `repair` | Quarantine K's state and reinstall. Attended only; its own request and consent. |
+| `recover <recovery.json>` | Retry an unresolved recovery offline. |
+| `status` | What is installed and what is running. The receipt is not a live observation. |
 
-- A thin installation script that obtains, verifies and starts the installer.
-- The Computer adapter: release lookup, installation ownership, service lifecycle,
-  health checks, and product-specific setup and repair.
-- Installer builds, independent release metadata and platform acceptance tests.
+| Option | Meaning |
+|---|---|
+| `--version V` | The exact version. Required unattended. |
+| `--channel main\|alpha` | Resolve the version through Hands, then ask. Attended only. |
+| `--yes` | Consent, recorded in the receipt. Required unattended. |
+| `--approved-by WHO` | Who consented, for the receipt; defaults to the local user. |
+| `--id ID` | Operation id; the same id replays the first receipt. |
+| `--allow-downgrade` | Intend an older target; otherwise it is held. |
+| `--json` | Print the outcome as JSON instead of one line. |
 
-## Identity and receipt contract
+| Environment | Meaning |
+|---|---|
+| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: nothing prompts, nothing is assumed. Otherwise a terminal decides. |
+| `RAFT_HOME` (or `SLOCK_HOME`) | Computer's state root; K state lives at `<home>/computer/k`. Default `~/.slock`. |
+| `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`. |
+| `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |
+| `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | The release authority a channel is resolved through. |
+| `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |
+| `RAFT_COMPUTER_INSTALLER_NODE` | Node 24+ used to run the installer. |
 
-Every request and receipt carries the protocol version, `installerVersion`,
-`computerVersion`, `operationId`, operation, phase and terminal status. Artifact
-metadata carries its own URL, size and SHA-256. `installerVersion` identifies
-the helper that performed the operation; `computerVersion` identifies the
-product bytes being installed. They must never be compared as one version
-stream.
+Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back;
+2 held or refused; 3 unresolved. Every run prints one line.
 
-Installer publication is not machine upgrade success. A machine is upgraded
-only after the installer writes a terminal receipt and the Computer adapter
-reads back the live product version, pid and start-id from the running process.
-Credentials, agent configuration, workspaces and user data are outside the
-executable rollback boundary.
+## Pieces
 
-K supplies the upgrade transaction, executable slots, journal and recovery.
-Computer exposes lifecycle and health controls. Credentials, agent configuration
-and workspaces must survive installation and repair; executable rollback does not
-undo application data migrations.
+| File | Role |
+|---|---|
+| `install.sh` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. |
+| `cli.cjs` | The entry: presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
+| `runner.mjs` | K plus the Computer adapter. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
 
-## Release workflow
+The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
+`status --json`, whose `attestation` carries `servicePid`,
+`computerVersion` and `serviceGeneration`, the start id K compares across the
+handover. Slot bytes are published onto `PATH` atomically before `start`;
+nothing runs from inside a slot. The `photon_rs_bg.wasm` sidecar is verified
+against the release manifest, kept per version under the installer's state,
+and published beside the binary with the slot it belongs to.
 
-A tag such as `v0.1.0-rc.1` runs `.github/workflows/release.yml`. CI pins Node
-24, installs the immutable K commit, bundles the installer, writes an installer
-manifest and provenance record, generates `SHA256SUMS`, runs the bootstrap
-acceptance test, and publishes a private prerelease. A deployment may mirror
-the release assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`; the bootstrap
-never trusts an unverified `cli.cjs`.
+State: K owns `<home>/computer/k`. The installer owns
+`<home>/computer/installer/{receipts,scratch,sidecars,quarantine}`.
 
-The current release artifact is a Node 24 portable installer. Packaging a
-runtime-independent SEA is a separate platform build step; until that is
-published, machines must provide Node 24 (or set `RAFT_COMPUTER_INSTALLER_NODE`)
-and a release mirror.
+## Develop
 
-This project is intended to serve as a real product integration of K's external
-runner, alongside K's smaller [service example](https://github.com/botiverse/k-carrier/tree/archer/external-runner-17/examples/external-service).
+```
+npm ci
+npm run typecheck
+npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUMS
+npm test             # real processes against a fake Computer: fresh, managed, replay,
+                     # rollback, downgrade, adopt, foreign manager, broken and repair
+```
+
+A tag `v*` runs `.github/workflows/release.yml`: build, verify, test, then a
+GitHub prerelease with `SHA256SUMS` and provenance. Mirror the assets under
+`RAFT_COMPUTER_INSTALLER_RELEASE_BASE`; the bootstrap never runs an
+unverified file.
+
+## Not yet
+
+- A runtime-independent build. Machines need Node 24 until a single
+  executable ships.
+- `raft-computer upgrade` in Computer itself: it should ask, then run this
+  bootstrap unattended with `--version` and `--yes`.
+- Windows: `install.ps1` was removed until the entry is ported.

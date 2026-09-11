@@ -1,6 +1,0 @@
-export const INSTALLER_PROTOCOL = "raft-computer-installer/v1" as const;
-export const INSTALLER_VERSION = "0.1.0-rc.6" as const;
-export type Operation = "install"|"upgrade"|"repair"|"rollback";
-export interface InstallRequest { protocol: typeof INSTALLER_PROTOCOL; installerVersion: string; computerVersion: string; operation: Operation; operationId: string; installDir: string; artifactUrl?: string; artifactSha256?: string; artifactSize?: number; }
-export interface InstallReceipt { protocol: typeof INSTALLER_PROTOCOL; installerVersion: string; computerVersion: string; operationId: string; operation: Operation; status: "succeeded"|"failed"|"rolled_back"; phase: string; error?: string; startedAt: string; finishedAt: string; pid?: number; startId?: string; }
-export function assertRequest(v: unknown): asserts v is InstallRequest { if (!v || typeof v !== "object") throw new Error("invalid_request"); const x=v as Record<string,unknown>; for (const k of ["computerVersion","operationId","installDir"]) if(typeof x[k]!=="string"||!(x[k] as string)) throw new Error(`invalid_${k}`); if(x.protocol!==INSTALLER_PROTOCOL) throw new Error("protocol_mismatch"); if(typeof x.installerVersion!=="string") throw new Error("installer_version_missing"); if(!["install","upgrade","repair","rollback"].includes(String(x.operation))) throw new Error("invalid_operation"); }

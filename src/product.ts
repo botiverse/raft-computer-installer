@@ -1,7 +1,0 @@
-import { createHash } from 'node:crypto';
-import { mkdir, writeFile, rename } from 'node:fs/promises';
-import { dirname } from 'node:path';
-export interface ProductArtifact { version:string; url:string; sha256:string; size:number; }
-export function platformKey(){return `${process.platform}-${process.arch}`}
-export async function fetchManifest(url:string, version:string):Promise<ProductArtifact>{const r=await fetch(url);if(!r.ok)throw new Error(`product_manifest_http_${r.status}`);const m=await r.json() as any;const t=m.targets?.[platformKey()];if(!t||typeof t.file!=='string'||typeof t.sha256!=='string'||!Number.isSafeInteger(t.size))throw new Error('product_manifest_target_invalid');return {version:m.version??version,url:new URL(t.file,new URL(url)).toString(),sha256:t.sha256.toLowerCase(),size:t.size}}
-export async function downloadArtifact(a:ProductArtifact,dest:string){const r=await fetch(a.url);if(!r.ok||!r.body)throw new Error(`product_artifact_http_${r.status}`);const b=Buffer.from(await r.arrayBuffer());if(b.length!==a.size)throw new Error(`product_artifact_size_mismatch:${b.length}:${a.size}`);const h=createHash('sha256').update(b).digest('hex');if(h!==a.sha256)throw new Error(`product_artifact_sha256_mismatch:${h}:${a.sha256}`);await mkdir(dirname(dest),{recursive:true});const tmp=`${dest}.${process.pid}.partial`;await writeFile(tmp,b,{mode:0o755});await rename(tmp,dest)}
