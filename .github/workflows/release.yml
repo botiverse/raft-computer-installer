@@ -5,8 +5,15 @@ on:
 permissions:
   contents: write
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  native:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, platform: darwin-arm64 }
+          - { os: macos-13, platform: darwin-x64 }
+          - { os: ubuntu-24.04, platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -15,21 +22,58 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm run build
-      - run: npm run verify:release
+      - run: npm run build:native
       - run: npm test
-      - name: Add provenance and checksums
+      - run: npm run test:native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: dist/native/${{ matrix.platform }}/
+          if-no-files-found: error
+  release:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist/native/
+      - name: Assemble one manifest over portable and native files
         env:
-          K_COMMIT: b14fa62e06937bb8a4639410bf6ccaaaf0d460a8
+          K_COMMIT: e423792e648961099d17a3e9e5fc09a65be1e23e
         run: |
-          node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync("dist/installer-manifest.json")); m.gitCommit=process.env.GITHUB_SHA; m.kCommit=process.env.K_COMMIT; fs.writeFileSync("dist/release-provenance.json", JSON.stringify(m,null,2)+"\n")'
-          (cd dist && sha256sum cli.cjs runner.mjs install.sh installer-manifest.json release-provenance.json > SHA256SUMS)
-          tar -czf "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" -C dist .
-          sha256sum "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" > "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz.sha256"
+          for d in dist/native/native-*; do mv "$d" "dist/native/${d##*/native-}"; done
+          chmod 0755 dist/native/*/raft-computer-installer*
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto");
+            const m = JSON.parse(fs.readFileSync("dist/installer-manifest.json"));
+            for (const platform of fs.readdirSync("dist/native")) for (const name of fs.readdirSync(path.join("dist/native", platform))) {
+              const f = `native/${platform}/${name}`; const b = fs.readFileSync(path.join("dist", f));
+              m.files[f] = { sha256: crypto.createHash("sha256").update(b).digest("hex"), size: b.length };
+            }
+            m.gitCommit = process.env.GITHUB_SHA; m.kCommit = process.env.K_COMMIT;
+            fs.writeFileSync("dist/installer-manifest.json", JSON.stringify(m, null, 2) + "\n");
+            fs.writeFileSync("dist/SHA256SUMS", Object.entries(m.files).map(([f, x]) => `${x.sha256}  ${f}\n`).join(""));
+          '
+          npm run verify:release
+          (cd dist && sha256sum installer-manifest.json >> SHA256SUMS)
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          (cd dist && tar -czf "../raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" .)
           gh release create "$GITHUB_REF_NAME" \
-            dist/* "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz.sha256" \
+            dist/cli.cjs dist/runner.mjs dist/install.sh dist/installer-manifest.json dist/SHA256SUMS \
+            "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" --title "Installer $GITHUB_REF_NAME" --generate-notes --prerelease
+          for d in dist/native/*; do
+            gh release upload "$GITHUB_REF_NAME" "$d/raft-computer-installer#native-${d##*/}-raft-computer-installer" \
+              "$d/raft-computer-installer-runner#native-${d##*/}-raft-computer-installer-runner" --repo "$GITHUB_REPOSITORY"
+          done

@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 const root = resolve(fileURLToPath(import.meta.url), "..", "..");
 export const fakePath = join(root, "test", "fake-computer.mjs");
 const platformKey = `${process.platform}-${process.arch}`;
+/** RCI_NATIVE=1 drives the single executables instead of node + cli.cjs. */
+export const NATIVE = process.env.RCI_NATIVE === "1";
 
 export interface FakeRelease { version: string; startFail?: boolean; reportedVersion?: string }
 
@@ -24,7 +26,7 @@ export class Harness {
 
   async start(): Promise<void> {
     this.dist = mkdtempSync(join(tmpdir(), "rci-dist-"));
-    await run(process.execPath, [join(root, "scripts", "build.mjs"), this.dist], { cwd: root });
+    await run(process.execPath, [join(root, "scripts", "build.mjs"), this.dist, ...(NATIVE ? ["--native"] : [])], { cwd: root });
     this.server = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://x");
       const m = /^\/computer\/([^/]+)\/(.+)$/.exec(url.pathname);
@@ -89,11 +91,14 @@ export class Machine {
     return {
       ...process.env, RAFT_HOME: this.home, RAFT_COMPUTER_INSTALL_DIR: this.installDir,
       RAFT_COMPUTER_RELEASE_BASE: `${this.h.base}/computer`, RAFT_COMPUTER_HANDS_ORIGIN: this.h.base,
-      RAFT_COMPUTER_INSTALLER_RUNNER: join(this.h.dist, "runner.mjs"), RAFT_COMPUTER_NON_INTERACTIVE: "1", ...extra,
+      RAFT_COMPUTER_INSTALLER_RUNNER: NATIVE ? join(this.h.dist, "native", platformKey, "raft-computer-installer-runner") : join(this.h.dist, "runner.mjs"),
+      RAFT_COMPUTER_NON_INTERACTIVE: "1", ...extra,
     };
   }
   async installer(args: string[], extra: NodeJS.ProcessEnv = {}): Promise<Result> {
-    return run(process.execPath, [join(this.h.dist, "cli.cjs"), ...args], { env: this.env(extra), allowFailure: true });
+    return NATIVE
+      ? run(join(this.h.dist, "native", platformKey, "raft-computer-installer"), args, { env: this.env(extra), allowFailure: true })
+      : run(process.execPath, [join(this.h.dist, "cli.cjs"), ...args], { env: this.env(extra), allowFailure: true });
   }
   /** Put a pre-K Computer on PATH and start it, as the old install.sh would have. */
   async preinstall(version: string): Promise<void> {

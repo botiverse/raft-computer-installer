@@ -47,9 +47,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     releaseBase: (env.RAFT_COMPUTER_RELEASE_BASE ?? "https://cdn.raft.build/computer").replace(/\/$/, ""),
     handsOrigin: (env.RAFT_COMPUTER_HANDS_ORIGIN ?? "https://hands.build").replace(/\/$/, ""),
     handsApp: env.RAFT_COMPUTER_HANDS_APP ?? "raft-computer-cli",
-    runnerPath: resolve(env.RAFT_COMPUTER_INSTALLER_RUNNER ?? join(process.argv[1] ? resolve(process.argv[1], "..") : process.cwd(), "runner.mjs")),
+    runnerPath: resolve(env.RAFT_COMPUTER_INSTALLER_RUNNER ?? defaultRunnerPath()),
     node: env.RAFT_COMPUTER_INSTALLER_NODE ?? process.execPath,
   };
+}
+
+/** Beside the entry: runner.mjs next to cli.cjs, or the native runner next to the native entry. */
+function defaultRunnerPath(): string {
+  const here = process.argv[1] ? resolve(process.argv[1], "..") : process.cwd();
+  const self = process.argv[1] ?? "";
+  if (self.endsWith(".cjs") || self.endsWith(".js") || self.endsWith(".mjs")) return join(here, "runner.mjs");
+  return join(resolve(process.execPath, ".."), `${process.execPath.split(/[\\/]/).pop()}-runner`);
 }
 
 export function platformKey(): string {

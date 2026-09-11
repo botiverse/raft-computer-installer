@@ -56,9 +56,10 @@ Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back;
 
 | File | Role |
 |---|---|
-| `install.sh` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. |
-| `cli.cjs` | The entry: presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
-| `runner.mjs` | K plus the Computer adapter. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
+| `install.sh` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. Prefers the single executable for this machine; falls back to Node 24 and the portable files. |
+| `native/<platform>/raft-computer-installer` | The entry as a single executable (Node SEA): presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
+| `native/<platform>/raft-computer-installer-runner` | K plus the Computer adapter as a single executable. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
+| `cli.cjs`, `runner.mjs` | The same two, portable, for machines without a published executable. Need Node 24. |
 
 The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
 `status --json`, whose `attestation` carries `servicePid`,
@@ -77,19 +78,22 @@ State: K owns `<home>/computer/k`. The installer owns
 npm ci
 npm run typecheck
 npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUMS
-npm test             # real processes against a fake Computer: fresh, managed, replay,
-                     # rollback, downgrade, adopt, foreign manager, broken and repair
+npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
+npm test             # real processes against a fake Computer: unattended, fresh, managed,
+                     # replay, rollback, downgrade, adopt, foreign manager, broken and repair
+npm run test:native  # the same suite driving the single executables
 ```
 
-A tag `v*` runs `.github/workflows/release.yml`: build, verify, test, then a
-GitHub prerelease with `SHA256SUMS` and provenance. Mirror the assets under
-`RAFT_COMPUTER_INSTALLER_RELEASE_BASE`; the bootstrap never runs an
-unverified file.
+A tag `v*` runs `.github/workflows/release.yml`: one job per platform builds
+and tests the executables, then one job assembles the portable files and
+every executable under one `SHA256SUMS` and publishes a GitHub prerelease.
+Mirror the assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`, keeping the
+`native/<platform>/` layout; the bootstrap never runs an unverified file.
 
 ## Not yet
 
-- A runtime-independent build. Machines need Node 24 until a single
-  executable ships.
 - `raft-computer upgrade` in Computer itself: it should ask, then run this
-  bootstrap unattended with `--version` and `--yes`.
+  bootstrap unattended with `--version`.
 - Windows: `install.ps1` was removed until the entry is ported.
+- macOS executables are ad-hoc signed; set `RAFT_CODESIGN_IDENTITY` in the
+  build for a Developer ID signature.
