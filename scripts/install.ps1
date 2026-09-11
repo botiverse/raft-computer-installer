@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $version = $env:RAFT_COMPUTER_VERSION
 if (-not $version) { throw 'RAFT_COMPUTER_VERSION is required' }
-$installerVersion = if ($env:RAFT_COMPUTER_INSTALLER_VERSION) { $env:RAFT_COMPUTER_INSTALLER_VERSION } else { '0.1.0-rc.5' }
+$installerVersion = if ($env:RAFT_COMPUTER_INSTALLER_VERSION) { $env:RAFT_COMPUTER_INSTALLER_VERSION } else { '0.1.0-rc.6' }
 $manifest = if ($env:RAFT_COMPUTER_PRODUCT_MANIFEST_URL) { $env:RAFT_COMPUTER_PRODUCT_MANIFEST_URL } else { "https://cdn.raft.build/computer/$version/manifest.json" }
 $base = if ($env:RAFT_COMPUTER_INSTALLER_RELEASE_BASE) { $env:RAFT_COMPUTER_INSTALLER_RELEASE_BASE.TrimEnd('/') } else { "https://cdn.raft.build/installer/$installerVersion" }
 $dir = if ($env:RAFT_COMPUTER_INSTALL_DIR) { $env:RAFT_COMPUTER_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'RaftComputer' }
