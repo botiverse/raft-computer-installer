@@ -95,7 +95,7 @@ const env = {
   RAFT_COMPUTER_INSTALLER_RELEASE_BASE: `${base}/installer`, RAFT_COMPUTER_INSTALLER_NODE: process.execPath,
   RAFT_COMPUTER_INSTALL_URL: `${base}/computer/install.sh`, RAFT_COMPUTER_NON_INTERACTIVE: "1",
 };
-const bootstrap = (args) => run("/bin/sh", [join(dist, "install.sh"), ...args], env);
+const bootstrap = (args, extra = {}) => run("/bin/sh", [join(dist, "install.sh"), ...args], { ...env, ...extra });
 const computer = (args) => run(join(installDir, "raft-computer"), args, env);
 let failed = 0;
 const step = async (name, r, expectCode, pattern) => {
@@ -114,11 +114,11 @@ try {
   await step("binary is 9.0.1", await computer(["--version"]), 0, /^9\.0\.1$/m);
   await step("same again is up to date", await bootstrap(["upgrade", "--version", "9.0.1"]), 0, /already installed/);
   await step("downgrade is held", await bootstrap(["upgrade", "--version", "9.0.0"]), 2, /^Not done: 9\.0\.0 is older/m);
-  await step("rollback to 9.0.0", await bootstrap(["rollback"]), 0, /^Upgraded 9\.0\.1 → 9\.0\.0\./m);
+  await step("back to 9.0.0 as an intended downgrade", await bootstrap(["upgrade", "--version", "9.0.0", "--allow-downgrade"]), 0, /^Upgraded 9\.0\.1 → 9\.0\.0\./m);
   await step("raft-computer upgrade runs the bootstrap", await computer(["upgrade", "--target-version", "9.0.1"]), 0, /^Upgraded 9\.0\.0 → 9\.0\.1\./m);
   await step("status reads the world", await bootstrap(["status"]), 0, /^9\.0\.1 is installed but not running\./m);
   rmSync(join(home, "computer", "k", "slots", "stable", "artifact.bin"));
-  await step("broken machine is repaired", await bootstrap(["upgrade", "--version", "9.0.1", "--id", "e2e-repair"]), 0, /^Reinstalled 9\.0\.1\. The previous installation was kept at .*e2e-repair\. Next: run raft-computer login$/m);
+  await step("broken machine is repaired", await bootstrap(["upgrade", "--version", "9.0.1"], { RAFT_COMPUTER_OPERATION_ID: "e2e-repair" }), 0, /^Reinstalled 9\.0\.1\. The previous installation was kept at .*e2e-repair\. Next: run raft-computer login$/m);
   await step("binary after repair", await computer(["--version"]), 0, /^9\.0\.1$/m);
 } finally {
   server.close();

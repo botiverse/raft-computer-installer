@@ -40,23 +40,6 @@ export function receipt(cfg: Config, base: Omit<Receipt, "protocol" | "installer
   return { protocol: "raft-computer-installer/v2", installerVersion: INSTALLER_VERSION, finishedAt: new Date().toISOString(), ...base };
 }
 
-/** The most recent promoted upgrade, from this installer's own receipts: what rollback goes back to. */
-export async function lastPromoted(cfg: Config): Promise<{ fromVersion: string; targetVersion: string } | null> {
-  const { readdir, readFile } = await import("node:fs/promises");
-  const dir = join(cfg.installerDir, "receipts");
-  let names: string[];
-  try { names = await readdir(dir); } catch { return null; }
-  const receipts: Receipt[] = [];
-  for (const name of names) {
-    try { receipts.push(JSON.parse(await readFile(join(dir, name), "utf8")) as Receipt); } catch { /* not a receipt */ }
-  }
-  const promoted = receipts
-    .filter((r) => r.status === "promoted" && typeof r.fromVersion === "string" && typeof r.targetVersion === "string" && r.fromVersion !== r.targetVersion)
-    .sort((a, b) => (a.finishedAt < b.finishedAt ? 1 : -1));
-  const last = promoted[0];
-  return last ? { fromVersion: last.fromVersion as string, targetVersion: last.targetVersion as string } : null;
-}
-
 // Lines are in the user's words: what happened, what did not change, what to
 // do next. Slots, journals, receipts, ids and quarantines stay in --json.
 export const held = (reason: string, next?: string): Outcome => ({ code: 2, status: "held", line: `Not done: ${reason}. Nothing changed.${next ? ` ${next}` : ""}` });

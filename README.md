@@ -24,9 +24,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | Command | Does |
 |---|---|
 | `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed, repair if broken. A fresh install ends with first setup (`raft-computer login`) when someone is there, then starts Computer; unattended it stays installed and says what to do next. |
-| `rollback` | Upgrade to the previous stable version as an explicit target. |
 | `repair` | Ask for repair explicitly: quarantine K's state and reinstall. Held unless the machine is broken. |
-| `recover <recovery.json>` | Retry an unresolved recovery offline. |
 | `status` | What is installed and what is running. The receipt is not a live observation. |
 
 | Option | Meaning |
@@ -34,9 +32,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `--version V` | The exact version. Default: the channel's current release, resolved through Hands. |
 | `--channel main\|alpha` | Which channel to resolve. Attended, the resolved version is shown and asked about. |
 | `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent, repair included. |
-| `--approved-by WHO` | Who consented, for the receipt; defaults to the local user. |
-| `--id ID` | Operation id; the same id replays the first receipt. |
-| `--allow-downgrade` | Intend an older target; otherwise it is held. |
+| `--allow-downgrade` | Intend an older target; otherwise it is held. Going back to a version that worked is this. |
 
 | Environment | Meaning |
 |---|---|
@@ -47,6 +43,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | The release authority a channel is resolved through. |
 | `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |
 | `RAFT_COMPUTER_INSTALLER_NODE` | Node 24+ used to run the installer. |
+| `RAFT_COMPUTER_OPERATION_ID` | For launchers only: the operation id, so a repeated request replays its receipt instead of running again. |
 
 Exit codes: 0 upgraded, up to date or installed; 1 failed or rolled back;
 2 not done; 3 unresolved. Every run prints one line, in plain words; the
@@ -91,7 +88,7 @@ npm run typecheck
 npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUMS
 npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
 npm test             # real processes against a fake Computer: unattended, fresh, cold and live
-                     # upgrades, replay, rollback, downgrade, first setup, adopt, foreign
+                     # upgrades, replay, downgrade, first setup, adopt, foreign
                      # manager, broken and repair
 npm run test:native  # the same suite driving the single executables
 ```
@@ -105,8 +102,8 @@ node scripts/e2e-real-computer.mjs ../slock/packages/computer/dist/raft-computer
 
 It serves that build as two versions from a local release base and drives
 the bootstrap through fresh install, cold upgrade, up to date, held
-downgrade, rollback, `raft-computer upgrade`, status, and a broken machine
-repaired. Temp homes only.
+downgrade, an intended downgrade, `raft-computer upgrade`, status, and a
+broken machine repaired. Temp homes only.
 
 A tag `v*` runs `.github/workflows/release.yml`: one job per platform builds
 and tests the executables, then one job assembles the portable files and

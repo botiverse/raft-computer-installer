@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { Release, RunnerLaunchResult, RunnerRequest } from "@botiverse/k-carrier";
-import { resumeRunner, superviseRunner } from "@botiverse/k-carrier";
+import { superviseRunner } from "@botiverse/k-carrier";
 import { scratchDir, type Config } from "./config.js";
 
 function isSea(): boolean {
@@ -54,8 +54,4 @@ export async function runRunner(cfg: Config, request: RunnerRequest, env: NodeJS
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
   }
-}
-
-export async function resumeRecovery(recoveryFile: string): Promise<RunnerLaunchResult> {
-  return resumeRunner(recoveryFile, {});
 }

@@ -61,7 +61,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
     assert.ok(existsSync(join(m.installDir, "photon_rs_bg.wasm")), "sidecar published beside the binary");
   });
   it("upgrades an installed machine where nothing runs: the new bytes must check out, nothing is started", async () => {
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "cold-1"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"], { RAFT_COMPUTER_OPERATION_ID: "cold-1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. Next: run raft-computer login$/m);
     assert.equal(await m.live(), null);
@@ -78,7 +78,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
     assert.equal((await m.live())?.version, "1.0.0");
   });
   it("upgrades a managed machine through K and reports the live readback", async () => {
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "up-1"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"], { RAFT_COMPUTER_OPERATION_ID: "up-1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. It is running\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
@@ -88,7 +88,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   });
   it("replays the same id without touching the service", async () => {
     const before = await m.live();
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "up-1"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"], { RAFT_COMPUTER_OPERATION_ID: "up-1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0 earlier\. It is running\.$/m);
     assert.deepEqual(await m.live(), before);
@@ -118,8 +118,8 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
     assert.equal(r2.code, 0, r2.stdout + r2.stderr);
     assert.equal((await m.live())?.version, "1.0.0");
   });
-  it("rolls back to the previous stable as an explicit target", async () => {
-    const r = await m.installer(["rollback", "--yes"]);
+  it("goes back to a version that worked as an intended downgrade", async () => {
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--allow-downgrade"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.equal((await m.live())?.version, "1.1.0");
   });
@@ -150,7 +150,7 @@ describe("process fallback", () => {
     await m.preinstall("1.4.0");
     const before = await m.live();
     assert.ok(before, "1.4.0 is running");
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--allow-downgrade", "--id", "forced-1"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--allow-downgrade"], { RAFT_COMPUTER_OPERATION_ID: "forced-1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Upgraded 1\.4\.0 → 1\.1\.0\. It is running\.$/m);
     assert.throws(() => process.kill(before!.pid, 0), "the old service process is gone");
@@ -199,7 +199,7 @@ describe("adopted and broken", () => {
     const first = await m.installer(["install", "--version", "1.0.0"]);
     assert.equal(first.code, 0, first.stdout);
     rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
-    const r = await m.installer(["upgrade", "--version", "1.1.0", "--id", "repair-1"]);
+    const r = await m.installer(["upgrade", "--version", "1.1.0"], { RAFT_COMPUTER_OPERATION_ID: "repair-1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Reinstalled 1\.1\.0\. The previous installation was kept at .*repair-1\. Next: run raft-computer login$/m);
     assert.equal(await m.selfVersion(), "1.1.0");

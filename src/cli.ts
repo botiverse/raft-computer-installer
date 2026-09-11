@@ -7,10 +7,10 @@ import type { OperationRead, RunnerLaunchResult } from "@botiverse/k-carrier";
 import { INSTALLER_VERSION, loadConfig, type Config } from "./config.js";
 import { adopt, freshInstall, nextStep, removeScratch, repair } from "./install.js";
 import { askYesNo, decidePresence, type Presence } from "./presence.js";
-import { failedBefore, held, lastPromoted, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
+import { failedBefore, held, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
 import { compareSemver, isSemver } from "./semver.js";
 import { assertSameIdentity, fetchManifest, resolveChannel, type Manifest } from "./source.js";
-import { resumeRecovery, runRunner } from "./supervisor.js";
+import { runRunner } from "./supervisor.js";
 import { readWorld, type World } from "./worlds.js";
 import { acquireSidecar } from "./artifact.js";
 
@@ -19,8 +19,6 @@ interface Args {
   version?: string;
   channel?: "main" | "alpha";
   yes: boolean;
-  approvedBy?: string;
-  id?: string;
   allowDowngrade: boolean;
   rest: string[];
 }
@@ -29,10 +27,8 @@ function usage(): string {
   return [
     `raft-computer-installer ${INSTALLER_VERSION}`,
     "",
-    "  install|upgrade [--version V | --channel main|alpha] [--yes] [--approved-by WHO] [--id ID] [--allow-downgrade]",
-    "  rollback        [--yes]              upgrade to the previous stable version",
+    "  install|upgrade [--version V | --channel main|alpha] [--yes] [--allow-downgrade]",
     "  repair          [--version V]        quarantine K state and reinstall; held unless the machine is broken",
-    "  recover         <recovery.json>      retry an unresolved recovery offline",
     "  status                               what is installed, and the last receipt",
     "",
     "Unattended (CI, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal) runs never ask: no --version means the",
@@ -51,8 +47,6 @@ function parseArgs(argv: string[]): Args {
     else if (t === "--channel") a.channel = channelOf(val());
     else if (t.startsWith("--channel=")) a.channel = channelOf(t.slice(10));
     else if (t === "--yes" || t === "-y") a.yes = true;
-    else if (t === "--approved-by") a.approvedBy = val();
-    else if (t === "--id") a.id = val();
     else if (t === "--allow-downgrade") a.allowDowngrade = true;
     else if (t.startsWith("-")) throw new Error(`unknown option ${t}`);
     else a.rest.push(t);
@@ -90,7 +84,7 @@ async function settle(cfg: Config, env: NodeJS.ProcessEnv): Promise<{ read: Oper
 }
 
 function unresolvedOutcome(r: RunnerLaunchResult): Outcome {
-  return { code: 3, status: "unresolved", line: `Could not finish safely. Nothing was lost. To try again, run: raft-computer-installer recover ${r.recoveryFile ?? "<recovery file>"}`, detail: { recoveryFile: r.recoveryFile, error: r.error } };
+  return { code: 3, status: "unresolved", line: "Could not finish safely. Nothing was lost. Run the installer again to retry.", detail: { recoveryFile: r.recoveryFile, error: r.error } };
 }
 
 async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m: Manifest, current: string, allowDowngrade: boolean): Promise<Outcome> {
@@ -153,7 +147,9 @@ function consentLine(world: World, target: string): string {
 }
 
 async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.ProcessEnv): Promise<{ outcome: Outcome; settled: string | null; target: string | null }> {
-  const id = a.id ?? `${a.command}-${randomUUID().slice(0, 8)}`;
+  // The operation id is the installer's. A launcher that must be able to
+  // repeat a request names it through the environment; a person never does.
+  const id = env.RAFT_COMPUTER_OPERATION_ID?.trim() || `${a.command}-${randomUUID().slice(0, 8)}`;
   // Unattended: no questions. Running the installer is the consent to whatever
   // the machine needs, repair included.
   if (presence === "unattended") a.yes = true;
@@ -163,12 +159,6 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   if (world.kind === "held") return { outcome: held(world.reason), settled: s.settled, target: a.version ?? null };
 
   let target: Manifest;
-  if (a.command === "rollback") {
-    // Back to what the last promoted upgrade replaced, if that is what runs now.
-    const last = world.kind === "managed" ? await lastPromoted(cfg) : null;
-    if (world.kind !== "managed" || !last || last.targetVersion !== world.version) return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
-    a.version = last.fromVersion; a.allowDowngrade = true;
-  }
   const resolved = await resolveTarget(cfg, a, presence);
   if ("outcome" in resolved) return { outcome: resolved.outcome, settled: s.settled, target: a.version ?? null };
   target = resolved.manifest;
@@ -180,7 +170,9 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   if (!a.yes) {
     if (!askYesNo(consentLine(world, target.version))) return { outcome: refused("Declined. Nothing changed."), settled: s.settled, target: target.version };
   }
-  const runEnv = { ...env, RAFT_COMPUTER_APPROVED_BY: a.approvedBy ?? (presence === "unattended" ? `${userInfo().username} (unattended)` : userInfo().username) };
+  // Who consented: the person at the terminal, or whoever ran it unattended.
+  // A remote launcher may name the request instead through the environment.
+  const runEnv = { ...env, RAFT_COMPUTER_APPROVED_BY: env.RAFT_COMPUTER_APPROVED_BY ?? (presence === "unattended" ? `${userInfo().username} (unattended)` : userInfo().username) };
 
   let outcome: Outcome;
   if (a.command === "repair" || world.kind === "broken") outcome = await repair(cfg, target, runEnv, id, presence);
@@ -221,19 +213,9 @@ async function main(): Promise<number> {
   let outcome: Outcome;
   let settled: string | null = null;
   switch (a.command) {
-    case "install": case "upgrade": case "repair": case "rollback": {
+    case "install": case "upgrade": case "repair": {
       const r = await apply(cfg, a, presence, env);
       outcome = r.outcome; settled = r.settled;
-      break;
-    }
-    case "recover": {
-      const file = a.rest[0];
-      if (!file) { outcome = refused("recover needs the recovery file printed by the unresolved run."); break; }
-      const r = await resumeRecovery(file);
-      const { outcome: o, op } = describe(r);
-      const record = op?.kind === "observed" ? op.operation : null;
-      outcome = r.exitCode === 3 ? unresolvedOutcome(r)
-        : { code: r.exitCode as Outcome["code"], status: o ?? "recovered", line: o === "promoted" ? "Finished the interrupted upgrade. It is running." : o === "rolled-back" ? "Finished the interrupted upgrade: the previous version was put back and is running." : `Finished the interrupted upgrade (${o ?? r.response?.result ?? "settled"}).`, detail: { receipt: record?.id } };
       break;
     }
     case "status": outcome = await status(cfg, env); break;

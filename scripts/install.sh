@@ -43,7 +43,7 @@ fetch() {
   [ "$(sha "$tmp/$1")" = "$expected" ] || err "installer $1 does not match its published checksum"
 }
 # The first word may be a command; everything else is passed through.
-case "${1:-}" in install|upgrade|repair|rollback|recover|status|help) cmd=$1; shift ;; *) cmd=install ;; esac
+case "${1:-}" in install|upgrade|repair|status|help) cmd=$1; shift ;; *) cmd=install ;; esac
 if [ -n "$INSTALL_CHANNEL_DEFAULT" ]; then
   case " $* " in *" --channel"*|*" --version"*) ;; *) set -- "$@" --channel "$INSTALL_CHANNEL_DEFAULT" ;; esac
 fi
