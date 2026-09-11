@@ -23,7 +23,7 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["install"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^1\.1\.0 installed and running \(pid \d+\)\.$/m);
+    assert.match(r.stdout, /^Installed 1\.1\.0\. It is running\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
     const { readdirSync } = await import("node:fs");
     const dir = join(m.home, "computer", "installer", "receipts");
@@ -35,7 +35,7 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["install"], { RAFT_COMPUTER_HANDS_ORIGIN: "http://127.0.0.1:9" });
     assert.equal(r.code, 1, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Failed before any change: release authority unreachable/m);
+    assert.match(r.stdout, /^Could not install: the release server could not be reached\. Nothing changed\.$/m);
     assert.equal(existsSync(m.binary), false);
     assert.equal(existsSync(m.kStateDir), false);
   });
@@ -43,7 +43,7 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["repair", "--version", "1.0.0"]);
     assert.equal(r.code, 2, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Held: repair was asked for, but the machine is fresh/m);
+    assert.match(r.stdout, /^Not done: nothing here needs repair\. Nothing changed\. Run install or upgrade instead\.$/m);
   });
 });
 
@@ -52,7 +52,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("installs on a fresh machine: verify, seed stable, start, read back", async () => {
     const r = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^1\.0\.0 installed and running \(pid \d+\)\.$/m);
+    assert.match(r.stdout, /^Installed 1\.0\.0\. It is running\.$/m);
     assert.equal((await m.live())?.version, "1.0.0");
     assert.equal(readFileSync(join(m.kStateDir, "slots", "stable", "VERSION"), "utf8").trim(), "1.0.0");
     assert.ok(existsSync(join(m.installDir, "photon_rs_bg.wasm")), "sidecar published beside the binary");
@@ -60,7 +60,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("upgrades a managed machine through K and reports the live readback", async () => {
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "up-1"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^1\.0\.0 → 1\.1\.0 promoted\. Running pid \d+\. Receipt up-1\.$/m);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. It is running\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
     const receipt = JSON.parse(readFileSync(join(m.home, "computer", "installer", "receipts", "up-1.json"), "utf8"));
     assert.equal(receipt.status, "promoted");
@@ -70,18 +70,18 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
     const before = await m.live();
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes", "--id", "up-1"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /promoted/);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0 earlier\. It is running\.$/m);
     assert.deepEqual(await m.live(), before);
   });
   it("says up to date when the target is what is running", async () => {
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /1\.1\.0 already running\. Nothing to do\./);
+    assert.match(r.stdout, /^1\.1\.0 is already installed and running\. Nothing to do\.$/m);
   });
   it("rolls back a candidate that will not start, exit 1, old version running", async () => {
     const r = await m.installer(["upgrade", "--version", "1.2.0", "--yes"]);
     assert.equal(r.code, 1, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Candidate 1\.2\.0 failed probe\. Rolled back; 1\.1\.0 running\./m);
+    assert.match(r.stdout, /^1\.2\.0 did not start correctly, so 1\.1\.0 was put back and is running\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
   });
   it("fails before any change when the bytes report the wrong version", async () => {
@@ -93,7 +93,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("holds a downgrade unless it is intended", async () => {
     const r = await m.installer(["upgrade", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 2, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Held: 1\.0\.0 is older than the installed 1\.1\.0/m);
+    assert.match(r.stdout, /^Not done: 1\.0\.0 is older than the installed 1\.1\.0\. Nothing changed\. Add --allow-downgrade to install it anyway\.$/m);
     const r2 = await m.installer(["upgrade", "--version", "1.0.0", "--yes", "--allow-downgrade"]);
     assert.equal(r2.code, 0, r2.stdout + r2.stderr);
     assert.equal((await m.live())?.version, "1.0.0");
@@ -104,11 +104,9 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
     assert.equal((await m.live())?.version, "1.1.0");
   });
   it("status reads the world and the live service", async () => {
-    const r = await m.installer(["status", "--json"]);
+    const r = await m.installer(["status"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    const s = JSON.parse(r.stdout);
-    assert.equal(s.status, "managed");
-    assert.equal(s.detail.live.version, "1.1.0");
+    assert.match(r.stdout, /^1\.1\.0 is installed and running\.$/m);
   });
 });
 
@@ -119,7 +117,7 @@ describe("adopted and broken", () => {
     assert.equal(existsSync(m.kStateDir), false);
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /1\.0\.0 → 1\.1\.0 promoted/);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. It is running\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
     assert.ok(existsSync(join(m.kStateDir, "slots", "stable")));
   });
@@ -130,7 +128,7 @@ describe("adopted and broken", () => {
     chmodSync(m.binary, 0o755);
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--yes"]);
     assert.equal(r.code, 2, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Held: .* is managed by npm/m);
+    assert.match(r.stdout, /^Not done: .* was installed by npm; remove it, or let this installer's directory come first on PATH\. Nothing changed\.$/m);
   });
   it("repairs a broken machine: quarantine, fresh install, reported as a repair", async () => {
     const m = machine();
@@ -139,7 +137,7 @@ describe("adopted and broken", () => {
     rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
     const r = await m.installer(["upgrade", "--version", "1.1.0", "--id", "repair-1"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Repaired: quarantined .*repair-1; 1\.1\.0 installed and running \(pid \d+\)\.$/m);
+    assert.match(r.stdout, /^Reinstalled 1\.1\.0\. It is running\. The previous installation was kept at .*repair-1\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
     assert.ok(existsSync(join(m.home, "computer", "installer", "quarantine", "repair-1", "slots", "stable", "VERSION")), "old state kept whole");
     const receipt = JSON.parse(readFileSync(join(m.home, "computer", "installer", "receipts", "repair-1.json"), "utf8"));

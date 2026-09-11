@@ -37,7 +37,6 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `--approved-by WHO` | Who consented, for the receipt; defaults to the local user. |
 | `--id ID` | Operation id; the same id replays the first receipt. |
 | `--allow-downgrade` | Intend an older target; otherwise it is held. |
-| `--json` | Print the outcome as JSON instead of one line. |
 
 | Environment | Meaning |
 |---|---|
@@ -49,8 +48,9 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |
 | `RAFT_COMPUTER_INSTALLER_NODE` | Node 24+ used to run the installer. |
 
-Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back;
-2 held or refused; 3 unresolved. Every run prints one line.
+Exit codes: 0 upgraded, up to date or installed; 1 failed or rolled back;
+2 not done; 3 unresolved. Every run prints one line, in plain words; the
+receipt under `<home>/computer/installer/receipts/` has the details.
 
 ## Pieces
 

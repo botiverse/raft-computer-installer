@@ -7,7 +7,7 @@ import { attest, exists, runCommand, stopComputer } from "./computer.js";
 import { quarantineDir, type Config } from "./config.js";
 import { createHostAdapter } from "./hostAdapter.js";
 import type { Manifest } from "./source.js";
-import type { Outcome } from "./report.js";
+import { plain, type Outcome } from "./report.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -35,7 +35,7 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
     seeded = true;
     await createHostAdapter(cfg, { env }).start("stable");
     const live = await readback(cfg, env, m.version);
-    return { code: 0, status: "installed", line: `${m.version} installed and running (pid ${live.pid}).`, detail: live };
+    return { code: 0, status: "installed", line: `Installed ${m.version}. It is running.`, detail: live };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (seeded) {
@@ -43,7 +43,7 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
       await stopComputer(cfg.binaryPath, env).catch(() => {});
       await quarantineState(cfg.kStateDir, { destination: quarantineDir(cfg, id), timestampMs: Date.now(), assertActiveHandoff: async () => {} }).catch(() => {});
     }
-    return { code: 1, status: "failed", line: `Install failed: ${reason}. No prior version to restore.` };
+    return { code: 1, status: "failed", line: `Could not install ${m.version}: ${plain(reason)}. Nothing is installed.`, detail: { reason } };
   }
 }
 
@@ -86,12 +86,12 @@ export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, i
     const live = await readback(cfg, env, m.version);
     return {
       code: 0, status: "repaired",
-      line: `Repaired: ${quarantine ? `quarantined ${quarantine}; ` : ""}${m.version} installed and running (pid ${live.pid}).`,
+      line: `Reinstalled ${m.version}. It is running.${quarantine ? ` The previous installation was kept at ${quarantine}.` : ""}`,
       detail: { ...live, quarantine },
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    return { code: 1, status: "failed", line: `Repair failed: ${reason}.${quarantine ? ` Previous state kept at ${quarantine}.` : ""}`, detail: { quarantine } };
+    return { code: 1, status: "failed", line: `Could not reinstall ${m.version}: ${plain(reason)}.${quarantine ? ` The previous installation was kept at ${quarantine}.` : " Nothing changed."}`, detail: { quarantine, reason } };
   }
 }
 

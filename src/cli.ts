@@ -7,7 +7,7 @@ import type { OperationRead, RunnerLaunchResult } from "@botiverse/k-carrier";
 import { INSTALLER_VERSION, loadConfig, type Config } from "./config.js";
 import { adopt, freshInstall, removeScratch, repair } from "./install.js";
 import { askYesNo, decidePresence, type Presence } from "./presence.js";
-import { failedBefore, held, receipt, refused, writeReceipt, type Outcome } from "./report.js";
+import { failedBefore, held, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
 import { compareSemver, isSemver } from "./semver.js";
 import { assertSameIdentity, fetchManifest, resolveChannel, type Manifest } from "./source.js";
 import { resumeRecovery, runRunner } from "./supervisor.js";
@@ -22,7 +22,6 @@ interface Args {
   approvedBy?: string;
   id?: string;
   allowDowngrade: boolean;
-  json: boolean;
   rest: string[];
 }
 
@@ -43,7 +42,7 @@ function usage(): string {
 }
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { command: argv[0] ?? "help", yes: false, allowDowngrade: false, json: false, rest: [] };
+  const a: Args = { command: argv[0] ?? "help", yes: false, allowDowngrade: false, rest: [] };
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
     const val = (): string => { const v = argv[++i]; if (v === undefined) throw new Error(`${t} needs a value`); return v; };
@@ -55,7 +54,6 @@ function parseArgs(argv: string[]): Args {
     else if (t === "--approved-by") a.approvedBy = val();
     else if (t === "--id") a.id = val();
     else if (t === "--allow-downgrade") a.allowDowngrade = true;
-    else if (t === "--json") a.json = true;
     else if (t.startsWith("-")) throw new Error(`unknown option ${t}`);
     else a.rest.push(t);
   }
@@ -87,16 +85,17 @@ async function settle(cfg: Config, env: NodeJS.ProcessEnv): Promise<{ read: Oper
   if (recovered.exitCode === 3 || !after.op || (after.op.kind === "observed" && after.op.operation.outcome === null)) {
     return { read: after.op, settled: null, unresolved: recovered };
   }
-  return { read: after.op, settled: `Settled interrupted upgrade ${op.operation.id}: ${after.outcome ?? "settled"}.`, unresolved: null };
+  const what = after.outcome === "promoted" ? "it was completed" : after.outcome === "rolled-back" ? "the previous version was put back" : "it was settled";
+  return { read: after.op, settled: `An earlier upgrade was interrupted; ${what}.`, unresolved: null };
 }
 
 function unresolvedOutcome(r: RunnerLaunchResult): Outcome {
-  return { code: 3, status: "unresolved", line: `Cannot settle. Recover with: raft-computer-installer recover ${r.recoveryFile ?? "<recovery.json>"}.`, detail: { recoveryFile: r.recoveryFile, error: r.error } };
+  return { code: 3, status: "unresolved", line: `Could not finish safely. Nothing was lost. To try again, run: raft-computer-installer recover ${r.recoveryFile ?? "<recovery file>"}`, detail: { recoveryFile: r.recoveryFile, error: r.error } };
 }
 
 async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m: Manifest, current: string, allowDowngrade: boolean): Promise<Outcome> {
   if (isSemver(current) && isSemver(m.version) && compareSemver(m.version, current) < 0 && !allowDowngrade) {
-    return held(`${m.version} is older than the installed ${current}; pass --allow-downgrade to intend it`);
+    return held(`${m.version} is older than the installed ${current}`, "Add --allow-downgrade to install it anyway.");
   }
   try { await acquireSidecar(cfg, m); } catch (error) {
     return failedBefore(error instanceof Error ? error.message : String(error), current);
@@ -104,25 +103,25 @@ async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m
   const r = await runRunner(cfg, { protocolVersion: 1, action: "upgrade", id, targetVersion: m.version, consented: true }, env);
   const { outcome, op, error } = describe(r);
   const record = op?.kind === "observed" ? op.operation : null;
-  const receiptId = record ? ` Receipt ${record.id}.` : "";
   if (r.exitCode === 3) return unresolvedOutcome(r);
   switch (outcome) {
     case "promoted": {
       const { attest } = await import("./computer.js");
       const live = await attest(cfg.binaryPath, { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome }).catch(() => null);
-      return { code: 0, status: "promoted", line: `${current} → ${m.version} promoted.${live ? ` Running pid ${live.pid}.` : ""}${receiptId}`, detail: { live, result: r.response?.result } };
+      const replayed = r.response?.result === "replayed";
+      return { code: 0, status: "promoted", line: `Upgraded ${record?.fromVersion ?? current} → ${m.version}${replayed ? " earlier" : ""}. It is running.`, detail: { live, receipt: record?.id, result: r.response?.result } };
     }
-    case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} already running. Nothing to do.` };
-    case "rolled-back": return { code: 1, status: "rolled-back", line: `Candidate ${m.version} failed probe. Rolled back; ${current} running.${record?.reason ? ` Reason: ${record.reason}.` : ""}` };
-    case "held": return held(record?.reason ?? "policy");
+    case "up-to-date": return { code: 0, status: "up-to-date", line: `${m.version} is already installed and running. Nothing to do.` };
+    case "rolled-back": return { code: 1, status: "rolled-back", line: `${m.version} did not start correctly, so ${current} was put back and is running.`, detail: { reason: record?.reason } };
+    case "held": return held(plain(record?.reason ?? "the upgrade was not allowed on this machine"));
     case "failed": return failedBefore(record?.reason ?? error ?? "unknown", current);
-    default: return { code: 1, status: "failed", line: `Failed: ${error ?? "no receipt"}. ${current} may still be running; run status.` };
+    default: return { code: 1, status: "failed", line: `Could not upgrade: ${plain(error ?? "no answer from the installer")}. Check with: raft-computer-installer status`, detail: { error } };
   }
 }
 
 async function resolveTarget(cfg: Config, a: Args, presence: Presence): Promise<{ manifest: Manifest } | { outcome: Outcome }> {
   if (a.version) {
-    if (!isSemver(a.version)) return { outcome: refused(`"${a.version}" is not a version. Nothing changed.`) };
+    if (!isSemver(a.version)) return { outcome: refused(`"${a.version}" is not a version number. Nothing changed.`) };
     try { return { manifest: await fetchManifest(cfg, a.version) }; }
     catch (error) { return { outcome: failedBefore(error instanceof Error ? error.message : String(error), null) }; }
   }
@@ -138,10 +137,9 @@ async function resolveTarget(cfg: Config, a: Args, presence: Presence): Promise<
 
 function consentLine(world: World, target: string): string {
   switch (world.kind) {
-    case "fresh": return `Nothing installed. Install ${target}?`;
-    case "adopted": return `Adopt the running ${world.version}, then upgrade to ${target}?`;
-    case "managed": return `Upgrade ${world.version} → ${target}?`;
-    case "broken": return `Stable won't settle (${world.reason}). Repair = quarantine + fresh ${target}. No rollback. Proceed?`;
+    case "fresh": return `Nothing is installed. Install ${target}?`;
+    case "adopted": case "managed": return `Upgrade ${world.version} → ${target}?`;
+    case "broken": return `The current installation cannot be recovered (${world.reason}). Reinstall ${target} fresh? The old installation is kept aside, but this cannot be undone.`;
     default: return `Proceed with ${target}?`;
   }
 }
@@ -158,9 +156,9 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
 
   let target: Manifest;
   if (a.command === "rollback") {
-    if (world.kind !== "managed" || world.operation.kind !== "observed") return { outcome: held("nothing to roll back to"), settled: s.settled, target: null };
+    if (world.kind !== "managed" || world.operation.kind !== "observed") return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
     const previous = world.operation.operation.previousStableVersion;
-    if (!previous || previous === world.version) return { outcome: held("nothing to roll back to"), settled: s.settled, target: null };
+    if (!previous || previous === world.version) return { outcome: held("there is no earlier version to go back to"), settled: s.settled, target: null };
     a.version = previous; a.allowDowngrade = true;
   }
   const resolved = await resolveTarget(cfg, a, presence);
@@ -169,7 +167,7 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
 
   if (world.kind === "broken" && a.command !== "repair") a.command = "repair";
   if (a.command === "repair" && world.kind !== "broken") {
-    return { outcome: held(`repair was asked for, but the machine is ${world.kind}; run upgrade instead`), settled: s.settled, target: target.version };
+    return { outcome: held("nothing here needs repair", "Run install or upgrade instead."), settled: s.settled, target: target.version };
   }
   if (!a.yes) {
     if (!askYesNo(consentLine(world, target.version))) return { outcome: refused("Declined. Nothing changed."), settled: s.settled, target: target.version };
@@ -182,7 +180,7 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   else {
     if (world.kind === "adopted") {
       try { await adopt(cfg, world.version); } catch (error) {
-        return { outcome: failedBefore(`could not adopt the running ${world.version}: ${error instanceof Error ? error.message : String(error)}`, world.version), settled: s.settled, target: target.version };
+        return { outcome: failedBefore(`the existing ${world.version} could not be taken over (${plain(error instanceof Error ? error.message : String(error))})`, world.version), settled: s.settled, target: target.version };
       }
     }
     outcome = await upgradeManaged(cfg, runEnv, id, target, world.version, a.allowDowngrade);
@@ -198,9 +196,9 @@ async function status(cfg: Config, env: NodeJS.ProcessEnv): Promise<Outcome> {
   const world = await readWorld(cfg, read, env);
   const { attest } = await import("./computer.js");
   const live = await attest(cfg.binaryPath, { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome }).catch(() => null);
-  const line = world.kind === "managed" ? `${world.version} installed${live ? `, ${live.version} running (pid ${live.pid})` : ", not running"}. Last receipt is not a live observation.`
-    : world.kind === "adopted" ? `${world.version} installed before K${live ? `, running (pid ${live.pid})` : ""}.`
-    : world.kind === "fresh" ? "Nothing installed." : world.kind === "broken" ? `Broken: ${world.reason}.` : `Held: ${world.reason}.`;
+  const line = world.kind === "managed" ? `${world.version} is installed${live ? ` and ${live.version === world.version ? "running" : `${live.version} is running`}` : " but not running"}.`
+    : world.kind === "adopted" ? `${world.version} is installed${live ? " and running" : ""} (not yet managed by this installer).`
+    : world.kind === "fresh" ? "Nothing is installed." : world.kind === "broken" ? `Needs repair: ${world.reason}. Run install to reinstall.` : `Not done: ${world.reason}.`;
   return { code: 0, status: world.kind, line, detail: { world, live, operation: read } };
 }
 
@@ -226,19 +224,18 @@ async function main(): Promise<number> {
       const { outcome: o, op } = describe(r);
       const record = op?.kind === "observed" ? op.operation : null;
       outcome = r.exitCode === 3 ? unresolvedOutcome(r)
-        : { code: r.exitCode as Outcome["code"], status: o ?? "recovered", line: `Settled ${record?.id ?? "operation"}: ${o ?? r.response?.result ?? "unknown"}.${o === "rolled-back" ? " The previous version is running." : ""}` };
+        : { code: r.exitCode as Outcome["code"], status: o ?? "recovered", line: o === "promoted" ? "Finished the interrupted upgrade. It is running." : o === "rolled-back" ? "Finished the interrupted upgrade: the previous version was put back and is running." : `Finished the interrupted upgrade (${o ?? r.response?.result ?? "settled"}).`, detail: { receipt: record?.id } };
       break;
     }
     case "status": outcome = await status(cfg, env); break;
     default: outcome = refused(`unknown command ${a.command}. ${usage()}`); break;
   }
   if (settled) process.stderr.write(`${settled}\n`);
-  if (a.json) console.log(JSON.stringify({ ...outcome, settled }));
-  else console.log(outcome.line);
+  console.log(outcome.line);
   return outcome.code;
 }
 
 main().then((code) => { process.exitCode = code; }, (error) => {
-  console.log(`Failed: ${error instanceof Error ? error.message : String(error)}.`);
+  console.log(`Could not continue: ${plain(error instanceof Error ? error.message : String(error))}.`);
   process.exitCode = 1;
 });

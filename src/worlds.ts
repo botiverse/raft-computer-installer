@@ -33,17 +33,17 @@ export async function readWorld(cfg: Config, operation: OperationRead | null, en
   if (!(await exists(cfg.kStateDir))) {
     if (!(await exists(cfg.binaryPath))) return { kind: "fresh" };
     const manager = await foreignManager(cfg.binaryPath);
-    if (manager) return { kind: "held", reason: `${cfg.binaryPath} is managed by ${manager}` };
+    if (manager) return { kind: "held", reason: `${cfg.binaryPath} was installed by ${manager}; remove it, or let this installer's directory come first on PATH` };
     const version = await selfVersion(cfg.binaryPath, env);
-    if (!version) return { kind: "broken", reason: `${cfg.binaryPath} exists but does not report a version`, operation: null };
+    if (!version) return { kind: "broken", reason: `the installed program at ${cfg.binaryPath} does not answer`, operation: null };
     return { kind: "adopted", version };
   }
-  if (operation === null) return { kind: "broken", reason: "K state exists but could not be read", operation: null };
-  if (operation.kind === "unreadable") return { kind: "broken", reason: `K receipt unreadable: ${operation.reason}`, operation };
+  if (operation === null) return { kind: "broken", reason: "the installation records could not be read", operation: null };
+  if (operation.kind === "unreadable") return { kind: "broken", reason: "the installation records are unreadable", operation };
   if (operation.kind === "observed" && operation.operation.outcome === null) {
-    return { kind: "broken", reason: `operation ${operation.operation.id} could not be settled`, operation };
+    return { kind: "broken", reason: "an earlier upgrade could not be finished", operation };
   }
   const version = await stableVersion(cfg);
-  if (!version) return { kind: "broken", reason: "stable slot is missing or incomplete", operation };
+  if (!version) return { kind: "broken", reason: "the installation is incomplete", operation };
   return { kind: "managed", version, operation };
 }
