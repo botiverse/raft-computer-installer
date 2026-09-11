@@ -23,9 +23,9 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 
 | Command | Does |
 |---|---|
-| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed. Refuse if broken. |
+| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed, repair if broken. |
 | `rollback` | Upgrade to the previous stable version as an explicit target. |
-| `repair` | Quarantine K's state and reinstall. Attended only; its own request and consent. |
+| `repair` | Ask for repair explicitly: quarantine K's state and reinstall. Held unless the machine is broken. |
 | `recover <recovery.json>` | Retry an unresolved recovery offline. |
 | `status` | What is installed and what is running. The receipt is not a live observation. |
 
@@ -33,7 +33,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 |---|---|
 | `--version V` | The exact version. Default: the channel's current release, resolved through Hands. |
 | `--channel main\|alpha` | Which channel to resolve. Attended, the resolved version is shown and asked about. |
-| `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent. Repair always needs it, and is attended only. |
+| `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent, repair included. |
 | `--approved-by WHO` | Who consented, for the receipt; defaults to the local user. |
 | `--id ID` | Operation id; the same id replays the first receipt. |
 | `--allow-downgrade` | Intend an older target; otherwise it is held. |
@@ -41,7 +41,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 
 | Environment | Meaning |
 |---|---|
-| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: no questions, no repair. Otherwise a terminal decides. |
+| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: no questions. Otherwise a terminal decides. |
 | `RAFT_HOME` (or `SLOCK_HOME`) | Computer's state root; K state lives at `<home>/computer/k`. Default `~/.slock`. |
 | `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`. |
 | `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |

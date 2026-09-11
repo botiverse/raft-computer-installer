@@ -32,12 +32,12 @@ function usage(): string {
     "",
     "  install|upgrade [--version V | --channel main|alpha] [--yes] [--approved-by WHO] [--id ID] [--allow-downgrade]",
     "  rollback        [--yes]              upgrade to the previous stable version",
-    "  repair          --version V --yes    quarantine K state and reinstall; attended only",
+    "  repair          [--version V]        quarantine K state and reinstall; held unless the machine is broken",
     "  recover         <recovery.json>      retry an unresolved recovery offline",
     "  status                               what is installed, and the last receipt",
     "",
     "Unattended (CI, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal) runs never ask: no --version means the",
-    "channel's current release, and running the installer is the consent. Repair is attended only.",
+    "channel's current release, and running the installer is the consent, repair included.",
     "Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back; 2 held or refused; 3 unresolved.",
   ].join("\n");
 }
@@ -148,12 +148,9 @@ function consentLine(world: World, target: string): string {
 
 async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.ProcessEnv): Promise<{ outcome: Outcome; settled: string | null; target: string | null }> {
   const id = a.id ?? `${a.command}-${randomUUID().slice(0, 8)}`;
-  // Unattended: no questions, and running the installer is the consent.
-  // Repair is the one thing an unattended run never does.
-  if (presence === "unattended") a.yes = a.command !== "repair";
-  if (a.command === "repair" && presence === "unattended") {
-    return { outcome: refused("Repair needs consent; no one here. Nothing changed."), settled: null, target: a.version ?? null };
-  }
+  // Unattended: no questions. Running the installer is the consent to whatever
+  // the machine needs, repair included.
+  if (presence === "unattended") a.yes = true;
   const s = await settle(cfg, env);
   if (s.unresolved) return { outcome: unresolvedOutcome(s.unresolved), settled: null, target: a.version ?? null };
   const world = await readWorld(cfg, s.read, env);
@@ -170,11 +167,7 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   if ("outcome" in resolved) return { outcome: resolved.outcome, settled: s.settled, target: a.version ?? null };
   target = resolved.manifest;
 
-  if (world.kind === "broken" && a.command !== "repair") {
-    if (presence === "unattended") return { outcome: refused(`Stable won't settle: ${world.reason}. Repair needs consent; no one here. Nothing changed.`), settled: s.settled, target: target.version };
-    if (!a.yes && !askYesNo(consentLine(world, target.version))) return { outcome: refused("Declined. Nothing changed."), settled: s.settled, target: target.version };
-    a.command = "repair"; a.yes = true;
-  }
+  if (world.kind === "broken" && a.command !== "repair") a.command = "repair";
   if (a.command === "repair" && world.kind !== "broken") {
     return { outcome: held(`repair was asked for, but the machine is ${world.kind}; run upgrade instead`), settled: s.settled, target: target.version };
   }

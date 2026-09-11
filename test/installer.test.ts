@@ -39,11 +39,11 @@ describe("unattended", () => {
     assert.equal(existsSync(m.binary), false);
     assert.equal(existsSync(m.kStateDir), false);
   });
-  it("never repairs unattended", async () => {
+  it("holds an explicit repair on a machine that is not broken", async () => {
     const m = machine();
-    const r = await m.installer(["repair", "--version", "1.0.0", "--yes"]);
-    assert.equal(r.code, 2);
-    assert.match(r.stdout, /Repair needs consent; no one here/);
+    const r = await m.installer(["repair", "--version", "1.0.0"]);
+    assert.equal(r.code, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Held: repair was asked for, but the machine is fresh/m);
   });
 });
 
@@ -132,24 +132,18 @@ describe("adopted and broken", () => {
     assert.equal(r.code, 2, r.stdout + r.stderr);
     assert.match(r.stdout, /^Held: .* is managed by npm/m);
   });
-  it("refuses a broken machine unattended, and repairs it on consent", async () => {
+  it("repairs a broken machine: quarantine, fresh install, reported as a repair", async () => {
     const m = machine();
-    const first = await m.installer(["install", "--version", "1.0.0", "--yes"]);
+    const first = await m.installer(["install", "--version", "1.0.0"]);
     assert.equal(first.code, 0, first.stdout);
     rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
-    const r = await m.installer(["upgrade", "--version", "1.1.0"]);
-    assert.equal(r.code, 2, r.stdout + r.stderr);
-    assert.match(r.stdout, /Repair needs consent; no one here\. Nothing changed\./);
-    assert.equal((await m.live())?.version, "1.0.0", "the old service was not touched");
-    // Repair itself, as an attended run would invoke it.
-    const { repair } = await import("../src/install.ts");
-    const { loadConfig } = await import("../src/config.ts");
-    const { fetchManifest } = await import("../src/source.ts");
-    const cfg = loadConfig(m.env());
-    const outcome = await repair(cfg, await fetchManifest(cfg, "1.1.0"), m.env(), "repair-1");
-    assert.equal(outcome.code, 0, outcome.line);
-    assert.match(outcome.line, /^Repaired: quarantined .*; 1\.1\.0 installed and running/);
+    const r = await m.installer(["upgrade", "--version", "1.1.0", "--id", "repair-1"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Repaired: quarantined .*repair-1; 1\.1\.0 installed and running \(pid \d+\)\.$/m);
     assert.equal((await m.live())?.version, "1.1.0");
-    assert.ok(existsSync(join(m.home, "computer", "installer", "quarantine", "repair-1", "journal.jsonl")) || existsSync(join(m.home, "computer", "installer", "quarantine", "repair-1")));
+    assert.ok(existsSync(join(m.home, "computer", "installer", "quarantine", "repair-1", "slots", "stable", "VERSION")), "old state kept whole");
+    const receipt = JSON.parse(readFileSync(join(m.home, "computer", "installer", "receipts", "repair-1.json"), "utf8"));
+    assert.equal(receipt.status, "repaired");
+    assert.equal(receipt.operation, "repair");
   });
 });

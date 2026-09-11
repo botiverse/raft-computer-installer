@@ -12,7 +12,7 @@
 #
 # Unattended runs (CI=1, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal)
 # never ask: no --version means the channel's current release, and running
-# the installer is the consent. Repair is attended only.
+# the installer is the consent, repair included.
 set -eu
 : "${RAFT_COMPUTER_INSTALLER_VERSION:=0.2.0-rc.1}"
 : "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:=https://cdn.raft.build/installer/$RAFT_COMPUTER_INSTALLER_VERSION}"
