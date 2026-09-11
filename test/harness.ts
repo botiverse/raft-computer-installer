@@ -11,6 +11,10 @@ import { fileURLToPath } from "node:url";
 const root = resolve(fileURLToPath(import.meta.url), "..", "..");
 export const fakePath = join(root, "test", "fake-computer.mjs");
 const platformKey = `${process.platform}-${process.arch}`;
+export const WINDOWS = process.platform === "win32";
+/** The fake as a real executable: always on Windows, or RCI_FAKE_SEA=1 anywhere to exercise it. */
+const SEA_FAKE = WINDOWS || process.env.RCI_FAKE_SEA === "1";
+const BIN = WINDOWS ? "raft-computer.exe" : "raft-computer";
 /** RCI_NATIVE=1 drives the single executables instead of node + cli.cjs. */
 export const NATIVE = process.env.RCI_NATIVE === "1";
 
@@ -24,9 +28,15 @@ export class Harness {
   channel: { main?: string; alpha?: string } = {};
   sidecar = Buffer.from("not really wasm but verified all the same");
 
+  fakeSea: Buffer | null = null;
   async start(): Promise<void> {
     this.dist = mkdtempSync(join(tmpdir(), "rci-dist-"));
     await run(process.execPath, [join(root, "scripts", "build.mjs"), this.dist, ...(NATIVE ? ["--native"] : [])], { cwd: root });
+    if (SEA_FAKE) {
+      const { buildFakeSea } = await import("./build-fake-sea.mjs");
+      const { readFileSync } = await import("node:fs");
+      this.fakeSea = readFileSync(await buildFakeSea(join(this.dist, "fake"), fakePath));
+    }
     this.server = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://x");
       const m = /^\/computer\/([^/]+)\/(.+)$/.exec(url.pathname);
@@ -61,8 +71,13 @@ export class Harness {
   }
 
   publish(r: FakeRelease): Buffer {
-    const env = [`RAFT_FAKE_VERSION=${r.reportedVersion ?? r.version}`, r.startFail ? "RAFT_FAKE_START_FAIL=1" : "", r.nextStep ? `RAFT_FAKE_NEXT_STEP="${r.nextStep}"` : "", r.stopBroken ? "RAFT_FAKE_STOP_BROKEN=1" : ""].filter(Boolean).join(" ");
-    const bytes = Buffer.from(`#!/bin/sh\n${env} RAFT_FAKE_SELF="$0" exec "${process.execPath}" "${fakePath}" "$@"\n`);
+    const behaviour: Record<string, string> = { RAFT_FAKE_VERSION: r.reportedVersion ?? r.version };
+    if (r.startFail) behaviour.RAFT_FAKE_START_FAIL = "1";
+    if (r.nextStep) behaviour.RAFT_FAKE_NEXT_STEP = r.nextStep;
+    if (r.stopBroken) behaviour.RAFT_FAKE_STOP_BROKEN = "1";
+    const bytes = this.fakeSea
+      ? Buffer.concat([this.fakeSea, Buffer.from(`\n#RAFT_FAKE:${JSON.stringify(behaviour)}\n`)])
+      : Buffer.from(`#!/bin/sh\n${Object.entries(behaviour).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ")} RAFT_FAKE_SELF="$0" exec "${process.execPath}" "${fakePath}" "$@"\n`);
     this.releases.set(r.version, bytes);
     return bytes;
   }
@@ -85,19 +100,20 @@ export class Harness {
 
 export class Machine {
   constructor(readonly h: Harness, readonly home: string, readonly installDir: string) {}
-  get binary(): string { return join(this.installDir, "raft-computer"); }
+  get binary(): string { return join(this.installDir, BIN); }
   get kStateDir(): string { return join(this.home, "computer", "k"); }
   env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     return {
-      ...process.env, HOME: this.home, SHELL: "/bin/zsh", RAFT_HOME: this.home, RAFT_COMPUTER_INSTALL_DIR: this.installDir,
+      ...process.env, HOME: this.home, USERPROFILE: this.home, SHELL: "/bin/zsh", RAFT_HOME: this.home, RAFT_COMPUTER_INSTALL_DIR: this.installDir,
+      RAFT_COMPUTER_NO_MODIFY_PATH: WINDOWS ? "1" : "0",
       RAFT_COMPUTER_RELEASE_BASE: `${this.h.base}/computer`, RAFT_COMPUTER_HANDS_ORIGIN: this.h.base,
-      RAFT_COMPUTER_INSTALLER_RUNNER: NATIVE ? join(this.h.dist, "native", platformKey, "raft-computer-installer-runner") : join(this.h.dist, "runner.mjs"),
+      RAFT_COMPUTER_INSTALLER_RUNNER: NATIVE ? join(this.h.dist, "native", platformKey, WINDOWS ? "raft-computer-installer-runner.exe" : "raft-computer-installer-runner") : join(this.h.dist, "runner.mjs"),
       RAFT_COMPUTER_NON_INTERACTIVE: "1", ...extra,
     };
   }
   async installer(args: string[], extra: NodeJS.ProcessEnv = {}): Promise<Result> {
     return NATIVE
-      ? run(join(this.h.dist, "native", platformKey, "raft-computer-installer"), args, { env: this.env(extra), allowFailure: true })
+      ? run(join(this.h.dist, "native", platformKey, WINDOWS ? "raft-computer-installer.exe" : "raft-computer-installer"), args, { env: this.env(extra), allowFailure: true })
       : run(process.execPath, [join(this.h.dist, "cli.cjs"), ...args], { env: this.env(extra), allowFailure: true });
   }
   /** Put a pre-K Computer on PATH, log in and start it, as the old install.sh plus a user would have. */

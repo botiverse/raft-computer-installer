@@ -22,7 +22,8 @@ await chmod(join(out, 'cli.cjs'), 0o755);
 await chmod(join(out, 'runner.mjs'), 0o755);
 await cp('scripts/install.sh', join(out, 'install.sh'));
 await chmod(join(out, 'install.sh'), 0o755);
-const files = ['cli.cjs', 'runner.mjs', 'install.sh'];
+await cp('scripts/install.ps1', join(out, 'install.ps1'));
+const files = ['cli.cjs', 'runner.mjs', 'install.sh', 'install.ps1'];
 
 if (native) {
   const platform = `${process.platform}-${process.arch}`;
@@ -31,7 +32,8 @@ if (native) {
   const work = join(out, '.sea');
   await mkdir(work, { recursive: true });
   await build({ ...common, entryPoints: ['src/runner.ts'], outfile: join(work, 'runner.cjs') });
-  for (const [name, entry] of [['raft-computer-installer', join(out, 'cli.cjs')], ['raft-computer-installer-runner', join(work, 'runner.cjs')]]) {
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  for (const [name, entry] of [[`raft-computer-installer${exe}`, join(out, 'cli.cjs')], [`raft-computer-installer-runner${exe}`, join(work, 'runner.cjs')]]) {
     const blob = join(work, `${name}.blob`);
     const config = join(work, `${name}.sea.json`);
     await writeFile(config, JSON.stringify({ main: entry, output: blob, disableExperimentalSEAWarning: true }));
@@ -43,7 +45,7 @@ if (native) {
     if (process.platform === 'darwin') execFileSync('codesign', ['--remove-signature', bin], { stdio: 'inherit' });
     const postject = ['postject', bin, 'NODE_SEA_BLOB', blob, '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
       ...(process.platform === 'darwin' ? ['--macho-segment-name', 'NODE_SEA'] : [])];
-    execFileSync('npx', postject, { stdio: 'inherit' });
+    execFileSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', postject, { stdio: 'inherit', shell: process.platform === 'win32' });
     if (process.platform === 'darwin') execFileSync('codesign', ['--sign', process.env.RAFT_CODESIGN_IDENTITY ?? '-', bin], { stdio: 'inherit' });
     files.push(`native/${platform}/${name}`);
   }

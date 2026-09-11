@@ -12,7 +12,7 @@ import { join } from "node:path";
 import type { HostAdapter, ProcessEvidence, Slot } from "@botiverse/k-carrier";
 import { slotArtifactPath } from "@botiverse/k-carrier";
 import { attest, exists, isLive, selfReport, startComputer, stopComputer } from "./computer.js";
-import { SIDECAR_NAME, sidecarDir, type Config } from "./config.js";
+import { IS_WINDOWS, SIDECAR_NAME, sidecarDir, type Config } from "./config.js";
 
 export interface HostDeps { env?: NodeJS.ProcessEnv; startReadyTimeoutMs?: number; pollMs?: number }
 
@@ -22,12 +22,32 @@ async function publishFile(source: string, target: string, mode: number): Promis
   await rm(staged, { force: true });
   await copyFile(source, staged);
   await chmod(staged, mode);
+  if (IS_WINDOWS && await exists(target)) {
+    // Windows will not replace an executable that is running, but it will
+    // let it be renamed aside. The old file goes when nothing holds it.
+    const aside = `${target}.old-${process.pid}`;
+    await rename(target, aside);
+    try { await rename(staged, target); } catch (error) { await rename(aside, target).catch(() => {}); throw error; }
+    await rm(aside, { force: true }).catch(() => {});
+    return;
+  }
   await rename(staged, target);
+}
+
+/** Old executables renamed aside by earlier publishes, once nothing holds them. */
+async function sweepAside(target: string): Promise<void> {
+  const { readdir } = await import("node:fs/promises");
+  const dir = join(target, "..");
+  const base = target.slice(dir.length + 1);
+  for (const name of await readdir(dir).catch(() => [] as string[])) {
+    if (name.startsWith(`${base}.old-`)) await rm(join(dir, name), { force: true }).catch(() => {});
+  }
 }
 
 /** Copy a slot's bytes and matching sidecar onto PATH atomically. */
 export async function publishSlot(cfg: Config, slot: Slot): Promise<void> {
   const artifact = slotArtifactPath(cfg.kStateDir, slot);
+  if (IS_WINDOWS) await sweepAside(cfg.binaryPath);
   await publishFile(artifact, cfg.binaryPath, 0o755);
   let version = "";
   try { version = (await readFile(join(cfg.kStateDir, "slots", slot, "VERSION"), "utf8")).trim(); } catch { /* no version file */ }

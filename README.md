@@ -15,6 +15,7 @@ only says what is specific to Computer.
 
 ```
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh
+irm https://cdn.raft.build/computer/install.ps1 | iex                       # Windows
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --version 1.0.31 --yes
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --version 1.0.31 --yes
@@ -53,7 +54,7 @@ receipt under `<home>/computer/installer/receipts/` has the details.
 
 | File | Role |
 |---|---|
-| `install.sh` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. Prefers the single executable for this machine; falls back to Node 24 and the portable files. |
+| `install.sh`, `install.ps1` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. `install.sh` prefers the single executable for this machine and falls back to Node 24 and the portable files; `install.ps1` needs the Windows executable. |
 | `native/<platform>/raft-computer-installer` | The entry as a single executable (Node SEA): presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
 | `native/<platform>/raft-computer-installer-runner` | K plus the Computer adapter as a single executable. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
 | `cli.cjs`, `runner.mjs` | The same two, portable, for machines without a published executable. Need Node 24. |
@@ -115,6 +116,10 @@ Mirror the assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`, keeping the
 
 - `raft-computer upgrade` in Computer itself: it should ask, then run this
   bootstrap unattended with `--version`.
-- Windows: `install.ps1` was removed until the entry is ported.
+- Windows is ported (console instead of `/dev/tty`, processes through
+  CIM, the running exe renamed aside before the new one is published, the
+  user PATH in the registry, `win32-x64` in the release matrix, the test
+  fake built as a single executable) but has not yet run on a Windows
+  machine; CI's `windows-latest` job is the first check.
 - macOS executables are ad-hoc signed; set `RAFT_CODESIGN_IDENTITY` in the
   build for a Developer ID signature.

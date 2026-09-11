@@ -5,7 +5,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { downloadVerified, type Release } from "@botiverse/k-carrier";
 import { selfVersion } from "./computer.js";
-import { SIDECAR_NAME, scratchDir, sidecarDir, type Config } from "./config.js";
+import { BIN_NAME, SIDECAR_NAME, scratchDir, sidecarDir, type Config } from "./config.js";
 import type { Manifest } from "./source.js";
 import { releaseOf, sidecarReleaseOf } from "./source.js";
 
@@ -43,7 +43,7 @@ export async function acquireRelease(cfg: Config, m: Manifest, env: NodeJS.Proce
   const bytes = await downloadVerified(release, { resumeDir: dir });
   const mismatch = platformMismatch(bytes);
   if (mismatch) throw new Error(`downloaded ${m.version} is ${mismatch}`);
-  const path = join(dir, "raft-computer");
+  const path = join(dir, BIN_NAME);
   await rm(path, { force: true });
   await writeFile(path, bytes, { mode: 0o755 });
   await chmod(path, 0o755);

@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export const INSTALLER_VERSION = "0.2.0-rc.1";
-export const BIN_NAME = "raft-computer";
+export const IS_WINDOWS = process.platform === "win32";
+export const BIN_NAME = IS_WINDOWS ? "raft-computer.exe" : "raft-computer";
 export const SIDECAR_NAME = "photon_rs_bg.wasm";
 
 export interface Config {
@@ -57,7 +58,9 @@ function defaultRunnerPath(): string {
   const here = process.argv[1] ? resolve(process.argv[1], "..") : process.cwd();
   const self = process.argv[1] ?? "";
   if (self.endsWith(".cjs") || self.endsWith(".js") || self.endsWith(".mjs")) return join(here, "runner.mjs");
-  return join(resolve(process.execPath, ".."), `${process.execPath.split(/[\\/]/).pop()}-runner`);
+  const exe = process.execPath.split(/[\\/]/).pop() ?? "raft-computer-installer";
+  const stem = exe.replace(/\.exe$/i, "");
+  return join(resolve(process.execPath, ".."), IS_WINDOWS ? `${stem}-runner.exe` : `${stem}-runner`);
 }
 
 export function platformKey(): string {

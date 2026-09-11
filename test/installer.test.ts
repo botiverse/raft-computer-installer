@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { Harness, type Machine } from "./harness.ts";
+import { Harness, WINDOWS, type Machine } from "./harness.ts";
 
 const h = new Harness();
 const machines: Machine[] = [];
@@ -24,7 +24,7 @@ describe("unattended", () => {
     const m = machine();
     const r = await m.installer(["install"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.1\.0\. Add .*\/bin to your PATH\. Next: run raft-computer login$/m);
+    assert.match(r.stdout, /^Installed 1\.1\.0\. Add .*bin to your PATH\. Next: run raft-computer login$/m);
     assert.equal(await m.live(), null, "nothing is started before login");
     assert.equal(await m.selfVersion(), "1.1.0");
     const { readdirSync } = await import("node:fs");
@@ -54,7 +54,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   it("installs on a fresh machine: verify, seed stable, publish, self-check; unattended, nothing is set up or started", async () => {
     const r = await m.installer(["install", "--version", "1.0.0", "--yes"]);
     assert.equal(r.code, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^Installed 1\.0\.0\. Add .*\/bin to your PATH\. Next: run raft-computer login$/m);
+    assert.match(r.stdout, /^Installed 1\.0\.0\. Add .*bin to your PATH\. Next: run raft-computer login$/m);
     assert.equal(await m.live(), null);
     assert.equal(await m.selfVersion(), "1.0.0");
     assert.equal(readFileSync(join(m.kStateDir, "slots", "stable", "VERSION"), "utf8").trim(), "1.0.0");
@@ -130,7 +130,7 @@ describe("fresh, managed, replay, rollback, downgrade", () => {
   });
 });
 
-describe("PATH", () => {
+describe("PATH", { skip: WINDOWS && "the user PATH lives in the registry on Windows; not touched by tests" }, () => {
   it("puts the default install directory on PATH in the shell profile and says so", async () => {
     const m = machine();
     const installDir = join(m.home, ".local", "bin");
@@ -169,7 +169,7 @@ describe("first setup", () => {
     const cfg = loadConfig(m.env());
     const outcome = await freshInstall(cfg, await fetchManifest(cfg, "1.0.0"), m.env(), "setup-1", "attended");
     assert.equal(outcome.code, 0, outcome.line);
-    assert.match(outcome.line, /^Installed 1\.0\.0\. Add .*\/bin to your PATH\. Set up and running\.$/);
+    assert.match(outcome.line, /^Installed 1\.0\.0\. Add .*bin to your PATH\. Set up and running\.$/);
     assert.equal((await m.live())?.version, "1.0.0");
   });
 });

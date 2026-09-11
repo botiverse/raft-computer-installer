@@ -13,6 +13,7 @@ jobs:
           - { os: macos-13, platform: darwin-x64 }
           - { os: ubuntu-24.04, platform: linux-x64 }
           - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { os: windows-latest, platform: win32-x64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +51,7 @@ jobs:
           K_COMMIT: e423792e648961099d17a3e9e5fc09a65be1e23e
         run: |
           for d in dist/native/native-*; do mv "$d" "dist/native/${d##*/native-}"; done
-          chmod 0755 dist/native/*/raft-computer-installer*
+          chmod 0755 dist/native/*/raft-computer-installer* || true
           node -e '
             const fs = require("fs"), path = require("path"), crypto = require("crypto");
             const m = JSON.parse(fs.readFileSync("dist/installer-manifest.json"));
@@ -79,7 +80,7 @@ jobs:
           dest="s3://slock-cdn/installer/$version"
           if aws --endpoint-url "$R2_ENDPOINT" s3 ls "$dest/SHA256SUMS" >/dev/null 2>&1; then echo "::error::$dest already exists; releases are immutable"; exit 1; fi
           aws --endpoint-url "$R2_ENDPOINT" s3 cp dist/ "$dest/" --recursive --no-progress
-          for f in cli.cjs runner.mjs install.sh SHA256SUMS; do
+          for f in cli.cjs runner.mjs install.sh install.ps1 SHA256SUMS; do
             aws --endpoint-url "$R2_ENDPOINT" s3 cp "$dest/$f" "readback-$f" --no-progress && cmp "dist/$f" "readback-$f"
           done
       - name: Publish GitHub release
@@ -88,10 +89,9 @@ jobs:
         run: |
           (cd dist && tar -czf "../raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" .)
           gh release create "$GITHUB_REF_NAME" \
-            dist/cli.cjs dist/runner.mjs dist/install.sh dist/installer-manifest.json dist/SHA256SUMS \
+            dist/cli.cjs dist/runner.mjs dist/install.sh dist/install.ps1 dist/installer-manifest.json dist/SHA256SUMS \
             "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" --title "Installer $GITHUB_REF_NAME" --generate-notes --prerelease
-          for d in dist/native/*; do
-            gh release upload "$GITHUB_REF_NAME" "$d/raft-computer-installer#native-${d##*/}-raft-computer-installer" \
-              "$d/raft-computer-installer-runner#native-${d##*/}-raft-computer-installer-runner" --repo "$GITHUB_REPOSITORY"
+          for f in dist/native/*/raft-computer-installer*; do
+            p="${f#dist/native/}"; gh release upload "$GITHUB_REF_NAME" "$f#native-${p%%/*}-${p##*/}" --repo "$GITHUB_REPOSITORY"
           done

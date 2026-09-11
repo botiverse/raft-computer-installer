@@ -4,10 +4,24 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+// Works both as an ES module and inside a CJS single-executable bundle.
+const isSea = (() => { try { return Boolean(process.getBuiltinModule?.("node:sea")?.isSea()); } catch { return false; } })();
 import { join } from "node:path";
 
+// Behaviour comes from the wrapper's environment on POSIX, or from a JSON
+// marker appended to this executable's own bytes when built as a SEA.
+const marker = (() => {
+  if (process.env.RAFT_FAKE_VERSION) return {};
+  try {
+    const bytes = readFileSync(process.execPath);
+    const tail = bytes.subarray(Math.max(0, bytes.length - 4096)).toString("latin1");
+    const m = /#RAFT_FAKE:(\{[^\n]*\})/.exec(tail);
+    return m ? JSON.parse(m[1]) : {};
+  } catch { return {}; }
+})();
+for (const [k, v] of Object.entries(marker)) if (process.env[k] === undefined) process.env[k] = String(v);
 const version = process.env.RAFT_FAKE_VERSION ?? "0.0.0";
-const self = process.env.RAFT_FAKE_SELF ?? "";
+const self = process.env.RAFT_FAKE_SELF || process.execPath;
 if (process.argv[2] === "__service") {
   process.on("SIGTERM", () => process.exit(0));
   setInterval(() => {}, 1 << 30);
@@ -34,7 +48,7 @@ if (cmd === "start") {
   if (existing && alive(existing.pid)) process.exit(0);
   mkdirSync(runDir, { recursive: true });
   // The service process names the installed binary on its command line, as a real one would.
-  const child = spawn(process.execPath, [process.argv[1], "__service", self], { detached: true, stdio: "ignore", env: process.env });
+  const child = spawn(process.execPath, [...(isSea ? [] : [process.argv[1]]), "__service", self], { detached: true, stdio: "ignore", env: process.env, windowsHide: true });
   child.unref();
   writeFileSync(stateFile, JSON.stringify({ pid: child.pid, version, generation: randomUUID() }));
   writeFileSync(join(runDir, "service.pid"), String(child.pid));
