@@ -174,6 +174,24 @@ describe("first setup", () => {
   });
 });
 
+describe("records K cannot settle", () => {
+  it("fails safely once, then repairs on the second run", async () => {
+    const m = machine();
+    const first = await m.installer(["install", "--version", "1.0.0"]);
+    assert.equal(first.code, 0, first.stdout);
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(m.kStateDir, "journal.jsonl"), '{"seq":1,"timestampMs":1,"intent":"staged","detail":{}}\n{not json at all\n');
+    const r1 = await m.installer(["upgrade", "--version", "1.1.0"]);
+    assert.equal(r1.code, 3, r1.stdout + r1.stderr);
+    assert.match(r1.stdout, /^Could not finish safely\. Nothing was lost\. Run the installer again to retry\.$/m);
+    assert.equal(await m.selfVersion(), "1.0.0", "nothing changed");
+    const r2 = await m.installer(["upgrade", "--version", "1.1.0"]);
+    assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+    assert.match(r2.stdout, /^Reinstalled 1\.1\.0\. The previous installation was kept at .*\. Next: run raft-computer login$/m);
+    assert.equal(await m.selfVersion(), "1.1.0");
+  });
+});
+
 describe("adopted and broken", () => {
   it("adopts a pre-K install, then upgrades it", async () => {
     const m = machine();
