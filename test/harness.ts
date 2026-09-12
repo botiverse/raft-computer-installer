@@ -26,6 +26,9 @@ export class Harness {
   base = "";
   releases = new Map<string, Buffer>();
   channel: { main?: string; alpha?: string } = {};
+  /** Versions whose manifest lies about the bytes, and versions the authority lies about. */
+  wrongSha = new Set<string>();
+  authorityLies = new Set<string>();
   sidecar = Buffer.from("not really wasm but verified all the same");
 
   fakeSea: Buffer | null = null;
@@ -62,7 +65,7 @@ export class Harness {
         const bytes = version ? this.releases.get(version) : undefined;
         if (!version || !bytes) { res.statusCode = 404; return res.end(); }
         const [platform, arch] = platformKey.split("-");
-        return res.end(JSON.stringify({ build: { version }, assets: [{ platform, arch, variant: null, filetype: "binary", size_bytes: bytes.length, sha256: sha(bytes) }] }));
+        return res.end(JSON.stringify({ build: { version }, assets: [{ platform, arch, variant: null, filetype: "binary", size_bytes: bytes.length, sha256: this.authorityLies.has(version) ? sha(Buffer.from("something else")) : sha(bytes) }] }));
       }
       res.statusCode = 404; res.end();
     });
@@ -93,7 +96,7 @@ export class Harness {
     return {
       name: "raft-computer", version,
       photonWasm: { file: "photon_rs_bg.wasm", sha256: sha(this.sidecar), size: this.sidecar.length },
-      targets: { [platformKey]: { file: "raft-computer", sha256: sha(bytes), size: bytes.length } },
+      targets: { [platformKey]: { file: "raft-computer", sha256: this.wrongSha.has(version) ? sha(Buffer.from("not these bytes")) : sha(bytes), size: bytes.length } },
     };
   }
 
@@ -135,12 +138,12 @@ export class Machine {
       ? run(join(this.h.dist, "native", platformKey, WINDOWS ? "raft-computer-installer.exe" : "raft-computer-installer"), args, { env: this.env(extra), allowFailure: true })
       : run(process.execPath, [join(this.h.dist, "cli.cjs"), ...args], { env: this.env(extra), allowFailure: true });
   }
-  /** Put a pre-K Computer on PATH, log in and start it, as the old install.sh plus a user would have. */
-  async preinstall(version: string): Promise<void> {
+  /** Put a pre-K Computer on PATH as the old install.sh would have; by default log in and start it too. */
+  async preinstall(version: string, opts: { running?: boolean } = {}): Promise<void> {
     const bytes = this.h.releases.get(version) ?? this.h.publish({ version });
     writeFileSync(this.binary, bytes, { mode: 0o755 });
     chmodSync(this.binary, 0o755);
-    await this.loginAndStart();
+    if (opts.running !== false) await this.loginAndStart();
   }
   async loginAndStart(): Promise<void> {
     await run(this.binary, ["login"], { env: { ...process.env, RAFT_HOME: this.home } });

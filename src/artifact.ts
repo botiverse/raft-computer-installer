@@ -3,7 +3,13 @@
 // version we asked for.
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { downloadVerified, type Release } from "@botiverse/k-carrier";
+import { artifactTransferTimeouts, downloadVerified, type Release } from "@botiverse/k-carrier";
+
+/** Budgets derived from the size, as K's own runner does: a 150 MB binary is not a 10 second download. */
+function budgets(release: Release, resumeDir: string) {
+  const t = artifactTransferTimeouts(release.size);
+  return { resumeDir, timeoutMs: t.overallTimeoutMs, responseTimeoutMs: t.responseTimeoutMs, idleTimeoutMs: t.idleTimeoutMs };
+}
 import { selfVersion } from "./computer.js";
 import { BIN_NAME, SIDECAR_NAME, scratchDir, sidecarDir, type Config } from "./config.js";
 import type { Manifest } from "./source.js";
@@ -40,7 +46,7 @@ export async function acquireRelease(cfg: Config, m: Manifest, env: NodeJS.Proce
   const dir = join(scratchDir(cfg), `release-${m.version}`);
   await mkdir(dir, { recursive: true });
   const release: Release = releaseOf(m);
-  const bytes = await downloadVerified(release, { resumeDir: dir });
+  const bytes = await downloadVerified(release, budgets(release, dir));
   const mismatch = platformMismatch(bytes);
   if (mismatch) throw new Error(`downloaded ${m.version} is ${mismatch}`);
   const path = join(dir, BIN_NAME);
@@ -64,7 +70,7 @@ export async function acquireSidecar(cfg: Config, m: Manifest): Promise<string |
     if (existing.length === release.size && createHash("sha256").update(existing).digest("hex") === release.sha256) return path;
   } catch { /* not there yet */ }
   await mkdir(dir, { recursive: true });
-  const bytes = await downloadVerified(release, { resumeDir: dir });
+  const bytes = await downloadVerified(release, budgets(release, dir));
   await writeFile(`${path}.tmp`, bytes, { mode: 0o644 });
   const { rename } = await import("node:fs/promises");
   await rename(`${path}.tmp`, path);

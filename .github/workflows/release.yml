@@ -26,6 +26,10 @@ jobs:
       - run: npm run build:native
       - run: npm test
       - run: npm run test:native
+      - run: npm run test:real
+        if: runner.os != 'Windows'
+        env:
+          RCI_NATIVE: "1"
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.platform }}

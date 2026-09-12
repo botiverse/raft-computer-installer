@@ -65,6 +65,72 @@ describe("clean install through the bootstrap", () => {
   });
 });
 
+describe("an older version already installed", () => {
+  it("installed by the old script, not running: the new version replaces it, nothing is started", async () => {
+    const m = machine();
+    await m.preinstall("1.0.0", { running: false });
+    const r = await m.bootstrap([]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. Next: run raft-computer login$/m);
+    assert.equal(await m.live(), null);
+    assert.equal(await m.selfVersion(), "1.1.0");
+  });
+  it("installed by the old script, the same version: nothing to do", async () => {
+    const m = machine();
+    await m.preinstall("1.1.0", { running: false });
+    const r = await m.bootstrap([]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^1\.1\.0 is already installed\. Nothing to do\.$/m);
+  });
+  it("installed by the old script and running: the new version comes back running", async () => {
+    const m = machine();
+    await m.preinstall("1.0.0");
+    const r = await m.bootstrap(["--version", "1.1.0"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Upgraded 1\.0\.0 → 1\.1\.0\. It is running\.$/m);
+    assert.equal((await m.live())?.version, "1.1.0");
+  });
+  it("the word upgrade on a machine with nothing installed simply installs", async () => {
+    const m = machine();
+    const r = await m.bootstrap(["upgrade", "--version", "1.0.0"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Installed 1\.0\.0\./m);
+  });
+  it("an explicit repair on a broken machine reinstalls it", async () => {
+    const m = machine();
+    const first = await m.bootstrap(["--version", "1.0.0"]);
+    assert.equal(first.code, 0, first.stdout + first.stderr);
+    rmSync(join(m.kStateDir, "slots", "stable", "artifact.bin"));
+    const r = await m.bootstrap(["repair", "--version", "1.1.0"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Reinstalled 1\.1\.0\. The previous installation was kept at /m);
+    assert.equal(await m.selfVersion(), "1.1.0");
+  });
+});
+
+describe("bytes that do not check out", () => {
+  it("a manifest whose sha256 does not match the download fails before any change", async () => {
+    h.publish({ version: "1.2.0" });
+    h.wrongSha.add("1.2.0");
+    const m = machine();
+    const r = await m.bootstrap(["--version", "1.2.0"]);
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Could not install 1\.2\.0: the downloaded bytes did not match the release's checksum\. Nothing is installed\.$/m);
+    assert.equal(existsSync(m.binary), false);
+    assert.equal(existsSync(m.kStateDir), false, "a failed fresh install leaves no state behind");
+  });
+  it("an authority and a byte store that disagree fail before any download", async () => {
+    h.publish({ version: "1.3.0" });
+    h.authorityLies.add("1.3.0");
+    h.channel.alpha = "1.3.0";
+    const m = machine();
+    const r = await m.bootstrap(["--channel", "alpha"]);
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Could not install: the release server and the download server disagree about 1\.3\.0\. Nothing changed\.$/m);
+    assert.equal(existsSync(m.binary), false);
+  });
+});
+
 describe("a machine without Node", () => {
   it(NATIVE ? "installs with the single executable, no Node anywhere" : "says plainly that it needs Node or a published executable", async () => {
     const m = machine();
