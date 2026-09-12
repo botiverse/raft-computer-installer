@@ -3,7 +3,7 @@
 import { rm } from "node:fs/promises";
 import { bootstrapStable, quarantineState } from "@botiverse/k-carrier";
 import { acquireRelease, acquireSidecar } from "./artifact.js";
-import { attest, exists, firstSetup, selfReport, startComputer, statusHint, stopComputer, terminateProduct } from "./computer.js";
+import { attest, exists, firstSetup, isLive, selfReport, startComputer, statusHint, stopComputer, terminateProduct } from "./computer.js";
 import type { Presence } from "./presence.js";
 import { ensureOnPath } from "./shellPath.js";
 import { quarantineDir, type Config } from "./config.js";
@@ -23,35 +23,44 @@ async function verifyPublished(cfg: Config, env: NodeJS.ProcessEnv, version: str
   if (report.version !== version) throw new Error(`the installed program answers as ${report.version}, not ${version}`);
 }
 
-/**
- * After the bytes are in place: the product's first setup, then start and
- * read back. Attended, setup runs on the terminal. Unattended, there is
- * nobody to set it up, so the line says what to do next. A setup that is
- * declined or fails leaves a usable installation, not a failed one.
- */
-async function setUpAndStart(cfg: Config, env: NodeJS.ProcessEnv, version: string, presence: Presence): Promise<{ tail: string; detail: Record<string, unknown> }> {
-  const hostEnv = { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
-  if (presence === "attended") {
-    const done = await firstSetup(cfg.binaryPath, hostEnv);
-    if (done) {
-      const started = await startComputer(cfg.binaryPath, hostEnv).catch(() => null);
-      if (started?.code === 0) {
-        const deadline = Date.now() + 60_000;
-        while (Date.now() < deadline) {
-          const live = await attest(cfg.binaryPath, hostEnv).catch(() => null);
-          if (live?.version === version) return { tail: " Set up and running.", detail: { live } };
-          await new Promise((r) => setTimeout(r, 250));
-        }
-      }
-      return { tail: " Set up, but it did not start; check with: raft-computer status", detail: { setUp: true, started: false } };
-    }
+async function startAndReadBack(cfg: Config, hostEnv: NodeJS.ProcessEnv, version: string): Promise<{ pid: number } | null> {
+  const started = await startComputer(cfg.binaryPath, hostEnv).catch(() => null);
+  if (started?.code !== 0) return null;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const live = await attest(cfg.binaryPath, hostEnv).catch(() => null);
+    if (live?.version === version) return { pid: live.pid };
+    await new Promise((r) => setTimeout(r, 250));
   }
+  return null;
+}
+
+/**
+ * After the bytes are in place, the product's answer decides the rest.
+ * Not set up and attended: first setup on the terminal, then start. Not set
+ * up and unattended: nothing is started, the line names the step. Set up:
+ * start only if a service was running before, so a machine the user left
+ * stopped stays stopped. A declined or failed setup leaves a usable
+ * installation, not a failed one.
+ */
+async function afterPublish(cfg: Config, env: NodeJS.ProcessEnv, version: string, presence: Presence, wasRunning: boolean): Promise<{ tail: string; detail: Record<string, unknown> }> {
+  const hostEnv = { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
   const hint = await statusHint(cfg.binaryPath, hostEnv);
-  return { tail: hint ? ` Next: ${hint}` : "", detail: { setUp: false, nextStep: hint } };
+  if (hint === null) {
+    if (!wasRunning) return { tail: "", detail: { setUp: true, started: false } };
+    const live = await startAndReadBack(cfg, hostEnv, version);
+    return live ? { tail: " It is running.", detail: { live } } : { tail: " It did not start; check with: raft-computer status", detail: { started: false } };
+  }
+  if (presence === "attended" && await firstSetup(cfg.binaryPath, hostEnv)) {
+    const live = await startAndReadBack(cfg, hostEnv, version);
+    return live ? { tail: " Set up and running.", detail: { live } } : { tail: " Set up, but it did not start; check with: raft-computer status", detail: { setUp: true, started: false } };
+  }
+  return { tail: ` Next: ${hint}`, detail: { setUp: false, nextStep: hint } };
 }
 
 /** Fresh: verify, seed stable, publish, self-check. Nothing is started; that is the user's next step. */
 export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, id: string, presence: Presence): Promise<Outcome> {
+  const wasRunning = await isLive(cfg.binaryPath, { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome });
   let seeded = false;
   try {
     const artifact = await acquireRelease(cfg, m, env);
@@ -61,14 +70,14 @@ export async function freshInstall(cfg: Config, m: Manifest, env: NodeJS.Process
     await publishSlot(cfg, "stable");
     await verifyPublished(cfg, env, m.version);
     const path = await ensureOnPath(cfg, env);
-    const after = await setUpAndStart(cfg, env, m.version, presence);
+    const after = await afterPublish(cfg, env, m.version, presence, wasRunning);
     return { code: 0, status: "installed", line: `Installed ${m.version}.${path}${after.tail}`, detail: after.detail };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (seeded) {
       // Nothing was running before; the seeded slot is evidence, not a fallback.
       await stopComputer(cfg.binaryPath, env).catch(() => ({ forced: [] }));
-      await quarantineState(cfg.kStateDir, { destination: quarantineDir(cfg, id), timestampMs: Date.now(), assertActiveHandoff: async () => {} }).catch(() => {});
+      await quarantineState(cfg.kStateDir, { destination: quarantineDir(cfg, id), timestampMs: Date.now(), allowUnreadable: true, assertActiveHandoff: async () => {} }).catch(() => {});
     }
     return { code: 1, status: "failed", line: `Could not install ${m.version}: ${plain(reason)}. Nothing is installed.`, detail: { reason } };
   }
@@ -83,10 +92,15 @@ export async function adopt(cfg: Config, version: string): Promise<void> {
 export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, id: string, presence: Presence): Promise<Outcome> {
   let quarantine: string | null = null;
   let forced: number[] = [];
+  const hostEnv = { ...env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
+  // What was running comes back after the reinstall; what was not stays stopped.
+  const wasRunning = await isLive(cfg.binaryPath, hostEnv);
   try {
-    forced = (await stopComputer(cfg.binaryPath, env)).forced;
+    forced = (await stopComputer(cfg.binaryPath, hostEnv)).forced;
+    // Records a later K cannot read are moved aside like any other: under
+    // the lock, deleting nothing.
     const q = await quarantineState(cfg.kStateDir, {
-      destination: quarantineDir(cfg, id), timestampMs: Date.now(),
+      destination: quarantineDir(cfg, id), timestampMs: Date.now(), allowUnreadable: true,
       assertActiveHandoff: async () => { forced = [...forced, ...(await terminateProduct(cfg.binaryPath))]; },
     });
     quarantine = q.status === "not-found" ? null : q.quarantinePath;
@@ -95,7 +109,7 @@ export async function repair(cfg: Config, m: Manifest, env: NodeJS.ProcessEnv, i
     await bootstrapStable({ stateDir: cfg.kStateDir, version: m.version, artifactPath: artifact.path });
     await publishSlot(cfg, "stable");
     await verifyPublished(cfg, env, m.version);
-    const after = await setUpAndStart(cfg, env, m.version, presence);
+    const after = await afterPublish(cfg, env, m.version, presence, wasRunning);
     return {
       code: 0, status: "repaired",
       line: `Reinstalled ${m.version}.${quarantine ? ` The previous installation was kept at ${quarantine}.` : ""}${after.tail}`,

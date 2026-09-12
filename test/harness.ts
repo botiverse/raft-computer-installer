@@ -2,7 +2,7 @@
 // built cli.cjs as a real process with a fake Computer.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -48,6 +48,13 @@ export class Harness {
         if (file === "raft-computer") return res.end(bytes);
         if (file === "photon_rs_bg.wasm") return res.end(this.sidecar);
       }
+      const i = /^\/installer\/(.+)$/.exec(url.pathname);
+      if (i) {
+        const f = join(this.dist, ...i[1].split("/"));
+        if (existsSync(f)) return res.end(readFileSync(f));
+        res.statusCode = 404; return res.end();
+      }
+      if (url.pathname === "/computer/install.sh") return res.end(readFileSync(join(this.dist, "install.sh")));
       const h = /^\/public\/v2\/apps\/([^/]+)\/latest$/.exec(url.pathname);
       if (h) {
         const channel = url.searchParams.get("channel") === "alpha" ? "alpha" : "main";
@@ -110,6 +117,18 @@ export class Machine {
       RAFT_COMPUTER_INSTALLER_RUNNER: NATIVE ? join(this.h.dist, "native", platformKey, WINDOWS ? "raft-computer-installer-runner.exe" : "raft-computer-installer-runner") : join(this.h.dist, "runner.mjs"),
       RAFT_COMPUTER_NON_INTERACTIVE: "1", ...extra,
     };
+  }
+  /** The published entry point: install.sh (or install.ps1) from the local installer release base. */
+  async bootstrap(args: string[], extra: NodeJS.ProcessEnv = {}): Promise<Result> {
+    // Portable mode names the Node to use; native mode and a test that
+    // wants "no Node at all" (RAFT_COMPUTER_INSTALLER_NODE: "") leave it unset.
+    const env = { ...this.env(extra), RAFT_COMPUTER_INSTALLER_RELEASE_BASE: `${this.h.base}/installer` };
+    if (!NATIVE && extra.RAFT_COMPUTER_INSTALLER_NODE === undefined) env.RAFT_COMPUTER_INSTALLER_NODE = process.execPath;
+    if (!env.RAFT_COMPUTER_INSTALLER_NODE) delete env.RAFT_COMPUTER_INSTALLER_NODE;
+    delete env.RAFT_COMPUTER_INSTALLER_RUNNER;
+    return WINDOWS
+      ? run("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(this.h.dist, "install.ps1"), ...args], { env, allowFailure: true })
+      : run("/bin/sh", [join(this.h.dist, "install.sh"), ...args], { env, allowFailure: true });
   }
   async installer(args: string[], extra: NodeJS.ProcessEnv = {}): Promise<Result> {
     return NATIVE

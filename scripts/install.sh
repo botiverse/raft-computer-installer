@@ -55,7 +55,8 @@ if [ -z "${RAFT_COMPUTER_INSTALLER_NODE:-}" ] && grep -q " $native\$" "$tmp/SHA2
   RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/$native-runner" exec "$tmp/$native" "$cmd" "$@"
 fi
 : "${RAFT_COMPUTER_INSTALLER_NODE:=node}"
-need "$RAFT_COMPUTER_INSTALLER_NODE"
+command -v "$RAFT_COMPUTER_INSTALLER_NODE" >/dev/null 2>&1 \
+  || err "no single executable is published for $plat-$arch, and Node 24 or newer is required to run the portable installer (set RAFT_COMPUTER_INSTALLER_NODE)"
 case "$("$RAFT_COMPUTER_INSTALLER_NODE" --version 2>/dev/null)" in
   v2[4-9].*|v[3-9][0-9].*) ;;
   *) err "no single executable is published for $plat-$arch, and Node 24 or newer is required to run the portable installer (set RAFT_COMPUTER_INSTALLER_NODE)" ;;

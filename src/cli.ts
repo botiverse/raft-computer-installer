@@ -33,7 +33,7 @@ function usage(): string {
     "",
     "Unattended (CI, RAFT_COMPUTER_NON_INTERACTIVE=1, or no terminal) runs never ask: no --version means the",
     "channel's current release, and running the installer is the consent, repair included.",
-    "Exit codes: 0 promoted, up to date or installed; 1 failed or rolled back; 2 held or refused; 3 unresolved.",
+    "Exit codes: 0 upgraded, installed or up to date; 1 failed or rolled back; 2 not done.",
   ].join("\n");
 }
 
@@ -83,10 +83,6 @@ async function settle(cfg: Config, env: NodeJS.ProcessEnv): Promise<{ read: Oper
   return { read: after.op, settled: `An earlier upgrade was interrupted; ${what}.`, unresolved: null };
 }
 
-function unresolvedOutcome(r: RunnerLaunchResult): Outcome {
-  const op = r.response?.operation;
-  return { code: 3, status: "unresolved", line: "Could not finish safely. Nothing was lost. Run the installer again to retry.", detail: { recoveryFile: r.recoveryFile, error: r.error, operation: op?.kind === "observed" ? op.operation.id : null } };
-}
 
 async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m: Manifest, current: string, allowDowngrade: boolean): Promise<Outcome> {
   if (isSemver(current) && isSemver(m.version) && compareSemver(m.version, current) < 0 && !allowDowngrade) {
@@ -98,12 +94,9 @@ async function upgradeManaged(cfg: Config, env: NodeJS.ProcessEnv, id: string, m
   const r = await runRunner(cfg, { protocolVersion: 1, action: "upgrade", id, targetVersion: m.version, consented: true }, env);
   const { outcome, op, error } = describe(r);
   const record = op?.kind === "observed" ? op.operation : null;
-  if (r.exitCode === 3) {
-    // K could not settle. Once is a passing fault and the retry is running
-    // again; twice on the same records is a broken machine.
-    if (await failedToSettleBefore(cfg, r)) return { ...unresolvedOutcome(r), status: "unresolved-again" };
-    return unresolvedOutcome(r);
-  }
+  // K could not settle its own records mid-transaction: a broken machine,
+  // reinstalled by the caller in this same run.
+  if (r.exitCode === 3) return { code: 1, status: "unresolved", line: "", detail: { recoveryFile: r.recoveryFile, error: r.error } };
   switch (outcome) {
     case "promoted": {
       const { attest, statusHint } = await import("./computer.js");
@@ -160,16 +153,10 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
   // the machine needs, repair included.
   if (presence === "unattended") a.yes = true;
   const s = await settle(cfg, env);
-  // Recovery that fails once may be a passing fault; recovery that fails
-  // twice on the same operation is a broken machine, and broken is repaired.
-  const stuck = s.unresolved ? await failedToSettleBefore(cfg, s.unresolved) : false;
-  if (s.unresolved && !stuck) {
-    const outcome = unresolvedOutcome(s.unresolved);
-    await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: a.version ?? null, fromVersion: null, approvedBy: null, settled: null })).catch(() => {});
-    return { outcome, settled: null, target: a.version ?? null };
-  }
+  // Records K cannot settle are K's working memory gone wrong, not the
+  // user's problem: the machine is broken and is reinstalled in this run.
   const world = s.unresolved
-    ? { kind: "broken" as const, reason: "an earlier upgrade could not be finished, twice", operation: s.read }
+    ? { kind: "broken" as const, reason: "an earlier upgrade could not be finished", operation: s.read }
     : await readWorld(cfg, s.read, env);
   if (world.kind === "held") return { outcome: held(world.reason), settled: s.settled, target: a.version ?? null };
 
@@ -199,31 +186,12 @@ async function apply(cfg: Config, a: Args, presence: Presence, env: NodeJS.Proce
       }
     }
     outcome = await upgradeManaged(cfg, runEnv, id, target, world.version, a.allowDowngrade);
-    if (outcome.status === "unresolved-again") outcome = await repair(cfg, target, runEnv, id, presence);
+    if (outcome.status === "unresolved") outcome = await repair(cfg, target, runEnv, id, presence);
   }
   await removeScratch(cfg, target.version).catch(() => {});
   const fromVersion = world.kind === "managed" || world.kind === "adopted" ? world.version : null;
   await writeReceipt(cfg, receipt(cfg, { ...outcome, id, operation: a.command, presence, targetVersion: target.version, fromVersion, approvedBy: runEnv.RAFT_COMPUTER_APPROVED_BY ?? null, settled: s.settled })).catch(() => {});
   return { outcome, settled: s.settled, target: target.version };
-}
-
-/** Did the last run already fail to settle this same operation? */
-async function failedToSettleBefore(cfg: Config, r: RunnerLaunchResult): Promise<boolean> {
-  const op = r.response?.operation;
-  const opId = op?.kind === "observed" ? op.operation.id : null;
-  const { readdir, readFile } = await import("node:fs/promises");
-  const { join } = await import("node:path");
-  const dir = join(cfg.installerDir, "receipts");
-  let names: string[];
-  try { names = await readdir(dir); } catch { return false; }
-  let latest: { finishedAt: string; status: string; detail?: Record<string, unknown> } | null = null;
-  for (const name of names) {
-    try {
-      const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as { finishedAt: string; status: string; detail?: Record<string, unknown> };
-      if (!latest || parsed.finishedAt > latest.finishedAt) latest = parsed;
-    } catch { /* not a receipt */ }
-  }
-  return latest?.status === "unresolved" && (opId === null || latest.detail?.operation === opId);
 }
 
 async function status(cfg: Config, env: NodeJS.ProcessEnv): Promise<Outcome> {

@@ -47,7 +47,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `RAFT_COMPUTER_OPERATION_ID` | For launchers only: the operation id, so a repeated request replays its receipt instead of running again. |
 
 Exit codes: 0 upgraded, up to date or installed; 1 failed or rolled back;
-2 not done; 3 unresolved. Every run prints one line, in plain words; the
+2 not done. Every run prints one line, in plain words; the
 receipt under `<home>/computer/installer/receipts/` has the details.
 
 ## Pieces
@@ -79,7 +79,11 @@ against the release manifest, kept per version under the installer's state,
 and published beside the binary with the slot it belongs to.
 
 State: K owns `<home>/computer/k`. The installer owns
-`<home>/computer/installer/{receipts,scratch,sidecars,quarantine}`.
+`<home>/computer/installer/{receipts,scratch,sidecars,quarantine}`. K's
+records are its working memory for one transaction; anything there the
+installer or K cannot read is moved to `quarantine/` and the machine is
+reinstalled in the same run. Nothing under `<home>` is ever deleted by the
+installer, and nothing outside `computer/` is touched.
 
 ## Develop
 
@@ -90,8 +94,11 @@ npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUM
 npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
 npm test             # real processes against a fake Computer: unattended, fresh, cold and live
                      # upgrades, replay, downgrade, first setup, adopt, foreign
-                     # manager, broken and repair
-npm run test:native  # the same suite driving the single executables
+                     # manager, broken and repair; and through the bootstrap: clean
+                     # install of the current release and of one version, a machine
+                     # without Node, a tampered installer, and the dirty K state an
+                     # earlier K may have left (all reinstalled over, nothing deleted)
+npm run test:native  # the same suites driving the single executables
 ```
 
 Against a real Computer build, everything but a live-service upgrade (that

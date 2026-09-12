@@ -8,7 +8,7 @@ export type ExitCode = 0 | 1 | 2 | 3;
 
 export interface Outcome {
   code: ExitCode;
-  /** promoted | up-to-date | installed | repaired | failed | rolled-back | held | refused | unresolved */
+  /** promoted | up-to-date | installed | repaired | failed | rolled-back | held | refused */
   status: string;
   line: string;
   detail?: Record<string, unknown>;

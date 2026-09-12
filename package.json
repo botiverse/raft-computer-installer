@@ -19,7 +19,7 @@
     "e2e": "node scripts/e2e-real-computer.mjs"
   },
   "dependencies": {
-    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/e423792e648961099d17a3e9e5fc09a65be1e23e"
+    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/04df46ad372a2fd86f7c44c91bbdf60ca6dc1097"
   },
   "devDependencies": {
     "@types/node": "22.20.2",
