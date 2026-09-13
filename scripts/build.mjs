@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// Bundle the entry (cli.cjs) and the K runner (runner.mjs), copy the
-// bootstrap, and write the installer manifest and SHA256SUMS.
+// Build internal bundles for SEA embedding, copy the bootstraps, and write
+// the installer manifest and SHA256SUMS. Portable bundles are never published.
 //
-//   node scripts/build.mjs [dist]            portable: cli.cjs + runner.mjs, needs Node 24
-//   node scripts/build.mjs [dist] --native   also two single executables for this platform:
-//                                            native/<platform-arch>/raft-computer-installer{,-runner}
+//   node scripts/build.mjs [dist]            development build (portable files retained locally)
+//   node scripts/build.mjs [dist] --native   native SEA build for release
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import { mkdir, cp, chmod, writeFile, readFile, stat, rm, copyFile } from 'node:fs/promises';

@@ -54,10 +54,9 @@ receipt under `<home>/computer/installer/receipts/` has the details.
 
 | File | Role |
 |---|---|
-| `install.sh`, `install.ps1` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, exec it. No install logic. `install.sh` prefers the single executable for this machine and falls back to Node 24 and the portable files; `install.ps1` needs the Windows executable. |
+| `install.sh`, `install.ps1` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, and exec the matching native SEA. No Node fallback or portable runtime is published. |
 | `native/<platform>/raft-computer-installer` | The entry as a single executable (Node SEA): presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
 | `native/<platform>/raft-computer-installer-runner` | K plus the Computer adapter as a single executable. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
-| `cli.cjs`, `runner.mjs` | The same two, portable, for machines without a published executable. Need Node 24. |
 
 The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
 `status --json`, whose `attestation` carries `servicePid`,
@@ -90,7 +89,7 @@ installer, and nothing outside `computer/` is touched.
 ```
 npm ci
 npm run typecheck
-npm run build        # dist/cli.cjs, dist/runner.mjs, dist/install.sh, SHA256SUMS
+npm run build        # internal bundle plus dist/install.sh, SHA256SUMS (portable bundle is not published)
 npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
 npm test             # real processes against a fake Computer: unattended, fresh, cold and live
                      # upgrades, replay, downgrade, first setup, adopt, foreign
