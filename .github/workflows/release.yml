@@ -25,6 +25,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build:native
       - run: npm test
+        env:
+          RCI_NATIVE: "1"
       - run: npm run test:native
       - run: npm run test:real
         if: runner.os != 'Windows'
