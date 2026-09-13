@@ -48,18 +48,7 @@ if [ -n "$INSTALL_CHANNEL_DEFAULT" ]; then
   case " $* " in *" --channel"*|*" --version"*) ;; *) set -- "$@" --channel "$INSTALL_CHANNEL_DEFAULT" ;; esac
 fi
 native="native/$plat-$arch/raft-computer-installer"
-if [ -z "${RAFT_COMPUTER_INSTALLER_NODE:-}" ] && grep -q " $native\$" "$tmp/SHA256SUMS"; then
-  # A single executable for this machine: no Node needed.
-  fetch "$native"; fetch "$native-runner"
-  chmod 0755 "$tmp/$native" "$tmp/$native-runner"
-  RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/$native-runner" exec "$tmp/$native" "$cmd" "$@"
-fi
-: "${RAFT_COMPUTER_INSTALLER_NODE:=node}"
-command -v "$RAFT_COMPUTER_INSTALLER_NODE" >/dev/null 2>&1 \
-  || err "no single executable is published for $plat-$arch, and Node 24 or newer is required to run the portable installer (set RAFT_COMPUTER_INSTALLER_NODE)"
-case "$("$RAFT_COMPUTER_INSTALLER_NODE" --version 2>/dev/null)" in
-  v2[4-9].*|v[3-9][0-9].*) ;;
-  *) err "no single executable is published for $plat-$arch, and Node 24 or newer is required to run the portable installer (set RAFT_COMPUTER_INSTALLER_NODE)" ;;
-esac
-fetch cli.cjs; fetch runner.mjs
-RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/runner.mjs" exec "$RAFT_COMPUTER_INSTALLER_NODE" "$tmp/cli.cjs" "$cmd" "$@"
+grep -q " $native\$" "$tmp/SHA256SUMS" || err "no native SEA installer is published for $plat-$arch"
+fetch "$native"; fetch "$native-runner"
+chmod 0755 "$tmp/$native" "$tmp/$native-runner"
+RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/$native-runner" exec "$tmp/$native" "$cmd" "$@"
