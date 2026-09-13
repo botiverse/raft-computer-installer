@@ -52,7 +52,7 @@ jobs:
           path: dist/native/
       - name: Assemble one manifest over portable and native files
         env:
-          K_COMMIT: 04df46ad372a2fd86f7c44c91bbdf60ca6dc1097
+          K_COMMIT: c51651931712ee72189d612704dc37cbf7e0a949
         run: |
           for d in dist/native/native-*; do mv "$d" "dist/native/${d##*/native-}"; done
           chmod 0755 dist/native/*/raft-computer-installer* || true

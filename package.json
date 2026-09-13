@@ -20,7 +20,7 @@
     "test:real": "RCI_REAL=1 node --import tsx --test --test-timeout=900000 test/real.test.ts"
   },
   "dependencies": {
-    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/04df46ad372a2fd86f7c44c91bbdf60ca6dc1097"
+    "@botiverse/k-carrier": "https://codeload.github.com/botiverse/k-carrier/tar.gz/c51651931712ee72189d612704dc37cbf7e0a949"
   },
   "devDependencies": {
     "@types/node": "22.20.2",
