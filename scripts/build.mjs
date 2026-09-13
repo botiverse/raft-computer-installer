@@ -23,7 +23,7 @@ await chmod(join(out, 'runner.mjs'), 0o755);
 await cp('scripts/install.sh', join(out, 'install.sh'));
 await chmod(join(out, 'install.sh'), 0o755);
 await cp('scripts/install.ps1', join(out, 'install.ps1'));
-const files = ['cli.cjs', 'runner.mjs', 'install.sh', 'install.ps1'];
+const files = ['install.sh', 'install.ps1'];
 
 if (native) {
   const platform = `${process.platform}-${process.arch}`;
