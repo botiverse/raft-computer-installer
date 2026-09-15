@@ -129,6 +129,12 @@ export class Machine {
     if (!NATIVE && extra.RAFT_COMPUTER_INSTALLER_NODE === undefined) env.RAFT_COMPUTER_INSTALLER_NODE = process.execPath;
     if (!env.RAFT_COMPUTER_INSTALLER_NODE) delete env.RAFT_COMPUTER_INSTALLER_NODE;
     delete env.RAFT_COMPUTER_INSTALLER_RUNNER;
+    // GitHub's Windows steps run under pwsh, whose PSModulePath names only
+    // PowerShell 7 module roots. Windows PowerShell 5.1 inheriting it cannot
+    // find its own Microsoft.PowerShell.Utility (Get-FileHash: not
+    // recognized). A real user never inherits a pwsh module path into
+    // powershell.exe, so let the child compute its default.
+    if (WINDOWS) delete env.PSModulePath;
     return WINDOWS
       ? run("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(this.h.dist, "install.ps1"), ...args], { env, allowFailure: true })
       : run("/bin/sh", [join(this.h.dist, "install.sh"), ...args], { env, allowFailure: true });

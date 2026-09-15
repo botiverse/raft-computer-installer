@@ -9,6 +9,7 @@ permissions:
 jobs:
   native:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: macos-14, platform: darwin-arm64 }
