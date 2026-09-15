@@ -9,7 +9,7 @@ import { adopt, freshInstall, nextStep, removeScratch, repair } from "./install.
 import { askYesNo, decidePresence, type Presence } from "./presence.js";
 import { failedBefore, held, plain, receipt, refused, writeReceipt, type Outcome } from "./report.js";
 import { compareSemver, isSemver } from "./semver.js";
-import { assertSameIdentity, fetchManifest, resolveChannel, type Manifest } from "./source.js";
+import { assertSameIdentity, fetchManifest, parseChannel, resolveChannel, type Channel, type Manifest } from "./source.js";
 import { runRunner } from "./supervisor.js";
 import { readWorld, type World } from "./worlds.js";
 import { acquireSidecar } from "./artifact.js";
@@ -17,7 +17,7 @@ import { acquireSidecar } from "./artifact.js";
 interface Args {
   command: string;
   version?: string;
-  channel?: "main" | "alpha";
+  channel?: Channel;
   yes: boolean;
   allowDowngrade: boolean;
   rest: string[];
@@ -27,7 +27,7 @@ function usage(): string {
   return [
     `raft-computer-installer ${INSTALLER_VERSION}`,
     "",
-    "  install|upgrade [--version V | --channel main|alpha] [--yes] [--allow-downgrade]",
+    "  install|upgrade [--version V | --channel main|alpha|<feature-channel>] [--yes] [--allow-downgrade]",
     "  repair          [--version V]        quarantine K state and reinstall; held unless the machine is broken",
     "  status                               what is installed, and the last receipt",
     "",
@@ -44,20 +44,14 @@ function parseArgs(argv: string[]): Args {
     const val = (): string => { const v = argv[++i]; if (v === undefined) throw new Error(`${t} needs a value`); return v; };
     if (t === "--version") a.version = val().replace(/^v/, "");
     else if (t.startsWith("--version=")) a.version = t.slice(10).replace(/^v/, "");
-    else if (t === "--channel") a.channel = channelOf(val());
-    else if (t.startsWith("--channel=")) a.channel = channelOf(t.slice(10));
+    else if (t === "--channel") a.channel = parseChannel(val());
+    else if (t.startsWith("--channel=")) a.channel = parseChannel(t.slice(10));
     else if (t === "--yes" || t === "-y") a.yes = true;
     else if (t === "--allow-downgrade") a.allowDowngrade = true;
     else if (t.startsWith("-")) throw new Error(`unknown option ${t}`);
     else a.rest.push(t);
   }
   return a;
-}
-
-function channelOf(v: string): "main" | "alpha" {
-  if (v === "main" || v === "latest" || v === "stable") return "main";
-  if (v === "alpha") return "alpha";
-  throw new Error(`unknown channel ${v}; expected main or alpha`);
 }
 
 function describe(r: RunnerLaunchResult): { outcome: string | null; op: OperationRead | null; error: string | null } {
@@ -127,7 +121,7 @@ async function resolveTarget(cfg: Config, a: Args, presence: Presence): Promise<
     catch (error) { return { outcome: failedBefore(error instanceof Error ? error.message : String(error), null) }; }
   }
   try {
-    const hands = await resolveChannel(cfg, a.channel ?? "main");
+    const hands = await resolveChannel(cfg, a.channel ?? parseChannel("main"));
     const manifest = await fetchManifest(cfg, hands.version);
     assertSameIdentity(hands, manifest);
     return { manifest };

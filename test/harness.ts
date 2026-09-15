@@ -25,7 +25,7 @@ export class Harness {
   server!: Server;
   base = "";
   releases = new Map<string, Buffer>();
-  channel: { main?: string; alpha?: string } = {};
+  channel: Record<string, string | undefined> = {};
   /** Versions whose manifest lies about the bytes, and versions the authority lies about. */
   wrongSha = new Set<string>();
   authorityLies = new Set<string>();
@@ -60,7 +60,7 @@ export class Harness {
       if (url.pathname === "/computer/install.sh") return res.end(readFileSync(join(this.dist, "install.sh")));
       const h = /^\/public\/v2\/apps\/([^/]+)\/latest$/.exec(url.pathname);
       if (h) {
-        const channel = url.searchParams.get("channel") === "alpha" ? "alpha" : "main";
+        const channel = url.searchParams.get("channel") ?? "main";
         const version = this.channel[channel];
         const bytes = version ? this.releases.get(version) : undefined;
         if (!version || !bytes) { res.statusCode = 404; return res.end(); }

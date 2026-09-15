@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import { Harness, NATIVE, WINDOWS, type Machine } from "./harness.ts";
 
 const REAL = process.env.RCI_REAL === "1";
@@ -40,7 +40,11 @@ describe("the real Raft Computer through the real bootstrap", { skip: !REAL && "
     for (let p = pat - 1; p >= Math.max(0, pat - 6) && !older; p--) if (await versionExists(`${maj}.${min}.${p}`)) older = `${maj}.${min}.${p}`;
     assert.ok(older, `an older published version below ${current}`);
   });
-  after(async () => { for (const m of machines) await m.cleanup(); await h.stop(); });
+  // Each machine holds a few hundred megabytes of real releases (K keeps the
+  // previous slot too). Release them per test: the linux-x64 release runner
+  // ran out of disk (ENOSPC) with every machine of the suite kept to the end.
+  afterEach(async () => { while (machines.length) await machines.pop()!.cleanup(); });
+  after(async () => { await h.stop(); });
 
   it("installs the channel's current release from Hands and the CDN", async () => {
     const m = machine();
