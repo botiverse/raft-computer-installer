@@ -13,6 +13,7 @@ import { assertSameIdentity, fetchManifest, parseChannel, resolveChannel, type C
 import { runRunner } from "./supervisor.js";
 import { readWorld, type World } from "./worlds.js";
 import { acquireSidecar } from "./artifact.js";
+import { proxyEnvForChild } from "./net.js";
 
 interface Args {
   command: string;
@@ -205,7 +206,7 @@ async function main(): Promise<number> {
   if (a.command === "--version" || a.command === "version") { console.log(INSTALLER_VERSION); return 0; }
   if (a.command === "help" || a.command === "--help" || a.command === "-h") { console.log(usage()); return 0; }
   const cfg = loadConfig();
-  const env: NodeJS.ProcessEnv = { ...process.env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome };
+  const env: NodeJS.ProcessEnv = proxyEnvForChild({ ...process.env, RAFT_HOME: cfg.stateHome, SLOCK_HOME: cfg.stateHome });
   const presence = decidePresence();
   let outcome: Outcome;
   let settled: string | null = null;

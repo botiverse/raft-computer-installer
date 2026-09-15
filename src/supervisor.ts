@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import type { Release, RunnerLaunchResult, RunnerRequest } from "@botiverse/k-carrier";
 import { superviseRunner } from "@botiverse/k-carrier";
 import { scratchDir, type Config } from "./config.js";
+import { netFetch } from "./net.js";
 
 function isSea(): boolean {
   try { return (require("node:sea") as { isSea(): boolean }).isSea(); } catch { return false; }
@@ -25,7 +26,7 @@ async function runnerRelease(cfg: Config): Promise<Release> {
 /** fetch that also serves file: URLs, so a runner beside the entry needs no network. */
 async function localFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-  if (!url.startsWith("file:")) return fetch(input, init);
+  if (!url.startsWith("file:")) return netFetch(input, init);
   const path = new URL(url);
   const size = (await stat(path)).size;
   const range = /^bytes=(\d+)-$/.exec(String((init?.headers as Record<string, string> | undefined)?.range ?? (init?.headers as Record<string, string> | undefined)?.Range ?? ""));

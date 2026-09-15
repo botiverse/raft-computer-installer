@@ -3,6 +3,7 @@
 // consulted by the entry; the runner only ever asks for an exact version.
 import type { Release, ReleaseSource } from "@botiverse/k-carrier";
 import { platformKey, type Config } from "./config.js";
+import { netFetch } from "./net.js";
 
 export interface ManifestTarget { file: string; sha256: string; size: number; gz?: { file: string; sha256: string; size: number } }
 export interface Manifest { version: string; target: ManifestTarget; sidecar: { file: string; sha256: string; size: number } | null; base: string }
@@ -12,7 +13,7 @@ function size(v: unknown): v is number { return Number.isSafeInteger(v) && (v as
 
 async function fetchJson(url: string, what: string): Promise<Record<string, unknown>> {
   let r: Response;
-  try { r = await fetch(url, { signal: AbortSignal.timeout(30_000) }); }
+  try { r = await netFetch(url, { signal: AbortSignal.timeout(30_000) }); }
   catch (error) { throw new Error(`${what} unreachable: ${error instanceof Error ? error.message : String(error)}`); }
   if (!r.ok) throw new Error(`${what} returned HTTP ${r.status}`);
   return await r.json() as Record<string, unknown>;

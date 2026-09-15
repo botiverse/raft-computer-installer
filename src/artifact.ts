@@ -5,6 +5,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 // K derives download budgets from the artifact size when none are named.
 import { downloadVerified, type Release } from "@botiverse/k-carrier";
+import { netFetch } from "./net.js";
 import { selfVersion } from "./computer.js";
 import { BIN_NAME, SIDECAR_NAME, scratchDir, sidecarDir, type Config } from "./config.js";
 import type { Manifest } from "./source.js";
@@ -41,7 +42,7 @@ export async function acquireRelease(cfg: Config, m: Manifest, env: NodeJS.Proce
   const dir = join(scratchDir(cfg), `release-${m.version}`);
   await mkdir(dir, { recursive: true });
   const release: Release = releaseOf(m);
-  const bytes = await downloadVerified(release, { resumeDir: dir });
+  const bytes = await downloadVerified(release, { resumeDir: dir, fetchImpl: netFetch });
   const mismatch = platformMismatch(bytes);
   if (mismatch) throw new Error(`downloaded ${m.version} is ${mismatch}`);
   const path = join(dir, BIN_NAME);
@@ -65,7 +66,7 @@ export async function acquireSidecar(cfg: Config, m: Manifest): Promise<string |
     if (existing.length === release.size && createHash("sha256").update(existing).digest("hex") === release.sha256) return path;
   } catch { /* not there yet */ }
   await mkdir(dir, { recursive: true });
-  const bytes = await downloadVerified(release, { resumeDir: dir });
+  const bytes = await downloadVerified(release, { resumeDir: dir, fetchImpl: netFetch });
   await writeFile(`${path}.tmp`, bytes, { mode: 0o644 });
   const { rename } = await import("node:fs/promises");
   await rename(`${path}.tmp`, path);
