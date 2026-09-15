@@ -51,4 +51,9 @@ native="native/$plat-$arch/raft-computer-installer"
 grep -q " $native\$" "$tmp/SHA256SUMS" || err "no native SEA installer is published for $plat-$arch"
 fetch "$native"; fetch "$native-runner"
 chmod 0755 "$tmp/$native" "$tmp/$native-runner"
-RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/$native-runner" exec "$tmp/$native" "$cmd" "$@"
+# Not exec: exec would replace this shell and the EXIT trap would never run,
+# leaving ~250 MB of installer bytes in the temp directory after every run
+# (that is what filled CI runners and developer disks). Run the installer as
+# a child, then exit with its status so the trap cleans up.
+RAFT_COMPUTER_INSTALLER_RUNNER="$tmp/$native-runner" "$tmp/$native" "$cmd" "$@"
+exit $?
