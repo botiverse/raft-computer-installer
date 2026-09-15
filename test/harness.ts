@@ -26,6 +26,9 @@ export class Harness {
   base = "";
   releases = new Map<string, Buffer>();
   channel: Record<string, string | undefined> = {};
+  /** The installer app's own Hands channel and current release id (the bootstrap's world). */
+  installerChannel = "main";
+  installerReleaseId = "release-0001";
   /** Versions whose manifest lies about the bytes, and versions the authority lies about. */
   wrongSha = new Set<string>();
   authorityLies = new Set<string>();
@@ -54,6 +57,35 @@ export class Harness {
       const i = /^\/installer\/(.+)$/.exec(url.pathname);
       if (i) {
         const f = join(this.dist, ...i[1].split("/"));
+        if (existsSync(f)) return res.end(readFileSync(f));
+        res.statusCode = 404; return res.end();
+      }
+      // Hands download surface for the installer app (hosted cli-binary):
+      // channel → 302 to the release-bound URL; release-bound serves the
+      // primary binary, ?kind=runner the sidecar, ?kind=sha256sums this
+      // target's checksums; an unknown kind fails, never falls back.
+      const ch = /^\/dl\/raft-computer-installer\/([^/]+)\/([a-z0-9]+-[a-z0-9_]+)$/.exec(url.pathname);
+      if (ch) {
+        const [, channel, target] = ch;
+        if (channel !== this.installerChannel) { res.statusCode = 404; res.setHeader("content-type", "application/json"); return res.end(JSON.stringify({ error: "no active release" })); }
+        res.statusCode = 302; res.setHeader("location", `/dl/raft-computer-installer/releases/${this.installerReleaseId}/${target}`); return res.end();
+      }
+      const rb = /^\/dl\/raft-computer-installer\/releases\/([^/]+)\/([a-z0-9]+-[a-z0-9_]+)$/.exec(url.pathname);
+      if (rb) {
+        const [, releaseId, target] = rb;
+        if (releaseId !== this.installerReleaseId) { res.statusCode = 404; return res.end(); }
+        const kind = url.searchParams.get("kind");
+        const exe = target.startsWith("win32") ? ".exe" : "";
+        const primary = `native/${target}/raft-computer-installer${exe}`;
+        const runner = `native/${target}/raft-computer-installer-runner${exe}`;
+        let file: string | null = null;
+        if (kind === null) file = primary;
+        else if (kind === "runner") file = runner;
+        else if (kind === "sha256sums") {
+          const sums = readFileSync(join(this.dist, "SHA256SUMS"), "utf8").split("\n").filter((l) => l.endsWith(`  ${primary}`) || l.endsWith(`  ${runner}`));
+          return res.end(sums.join("\n") + (sums.length ? "\n" : ""));
+        } else { res.statusCode = 400; res.setHeader("content-type", "application/json"); return res.end(JSON.stringify({ error: "invalid asset kind" })); }
+        const f = join(this.dist, ...file.split("/"));
         if (existsSync(f)) return res.end(readFileSync(f));
         res.statusCode = 404; return res.end();
       }
@@ -125,7 +157,7 @@ export class Machine {
   async bootstrap(args: string[], extra: NodeJS.ProcessEnv = {}): Promise<Result> {
     // Portable mode names the Node to use; native mode and a test that
     // wants "no Node at all" (RAFT_COMPUTER_INSTALLER_NODE: "") leave it unset.
-    const env = { ...this.env(extra), RAFT_COMPUTER_INSTALLER_RELEASE_BASE: `${this.h.base}/installer` };
+    const env = { ...this.env(extra), RAFT_COMPUTER_INSTALLER_DL_BASE: `${this.h.base}/dl/raft-computer-installer` };
     if (!NATIVE && extra.RAFT_COMPUTER_INSTALLER_NODE === undefined) env.RAFT_COMPUTER_INSTALLER_NODE = process.execPath;
     if (!env.RAFT_COMPUTER_INSTALLER_NODE) delete env.RAFT_COMPUTER_INSTALLER_NODE;
     delete env.RAFT_COMPUTER_INSTALLER_RUNNER;

@@ -45,6 +45,27 @@ describe("clean install through the bootstrap", () => {
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Nothing is installed\.$/m);
   });
+  it("a channel with no installer release fails before anything changes", async () => {
+    const m = machine();
+    const r = await m.bootstrap([], { RAFT_COMPUTER_INSTALLER_CHANNEL: "nightly" });
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout + r.stderr, /no installer is published for .* on channel nightly/);
+    assert.equal(existsSync(m.binary), false);
+  });
+  it("checksums that do not list the runner stop the bootstrap before any download of binaries", async () => {
+    const m = machine();
+    const sums = join(h.dist, "SHA256SUMS");
+    const original = readFileSync(sums, "utf8");
+    writeFileSync(sums, original.split("\n").filter((line) => !/raft-computer-installer-runner(\.exe)?$/.test(line)).join("\n"));
+    try {
+      const r = await m.bootstrap([]);
+      assert.notEqual(r.code, 0);
+      assert.match(r.stdout + r.stderr, /no runner is published for/);
+      assert.equal(existsSync(m.binary), false);
+    } finally {
+      writeFileSync(sums, original);
+    }
+  });
   it("refuses a tampered installer before anything changes", async () => {
     const m = machine();
     const sums = join(h.dist, "SHA256SUMS");

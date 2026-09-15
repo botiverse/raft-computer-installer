@@ -89,42 +89,49 @@ jobs:
           '
           npm run verify:release
           (cd dist && sha256sum installer-manifest.json >> SHA256SUMS)
-      - name: Mirror the release to the CDN
-        # cdn.raft.build/installer/<version>/ is where the bootstrap fetches
-        # from. Needs the production R2 credentials as repository secrets;
-        # without them the release is only on GitHub and this step says so.
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_PROD_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_PROD_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: https://a699265b21e68a0071d322cc5051cc4f.r2.cloudflarestorage.com
+      - name: Per-target checksums
+        # Hands serves ?kind=sha256sums per target, so each target gets the
+        # two lines of SHA256SUMS that name its installer and runner. The
+        # bootstrap verifies exactly those two.
         run: |
-          if [ -z "$R2_ACCESS_KEY_ID" ]; then echo "::warning::R2_PROD_* secrets are not set; not mirrored to the CDN"; exit 0; fi
-          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto
+          for d in dist/native/*/; do
+            t="${d#dist/native/}"; t="${t%/}"
+            grep -E "  native/${t}/raft-computer-installer(\.exe)?$|  native/${t}/raft-computer-installer-runner(\.exe)?$" dist/SHA256SUMS > "dist/native/${t}/SHA256SUMS"
+            test "$(wc -l < "dist/native/${t}/SHA256SUMS")" -eq 2
+          done
+      - name: Publish to Hands (hosted cli-binary)
+        # hands.build hosts the installer bytes; the bootstrap fetches
+        # /dl/raft-computer-installer/<channel>/<target>. One call publishes
+        # one build carrying every target's installer, runner and checksums,
+        # and one release on the channel. Pre-release tags (-rc.N) go to
+        # alpha, plain tags to main. Needs HANDS_INSTALLER_DEPLOY_TOKEN.
+        env:
+          HANDS_AUTH_TOKEN: ${{ secrets.HANDS_INSTALLER_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$HANDS_AUTH_TOKEN" ]; then echo "::error::HANDS_INSTALLER_DEPLOY_TOKEN is not set; the release cannot reach Hands"; exit 1; fi
           version="${GITHUB_REF_NAME#v}"
-          dest="s3://slock-cdn/installer/$version"
-          if aws --endpoint-url "$R2_ENDPOINT" s3 ls "$dest/SHA256SUMS" >/dev/null 2>&1; then echo "::error::$dest already exists; releases are immutable"; exit 1; fi
-          aws --endpoint-url "$R2_ENDPOINT" s3 cp dist/ "$dest/" --recursive --no-progress
-          node - <<'NODE'
-          const fs = require('fs');
-          const m = JSON.parse(fs.readFileSync('dist/installer-manifest.json'));
-          for (const f of Object.keys(m.files)) {
-            if (f === 'cli.cjs' || f === 'runner.mjs') throw new Error(`portable release asset: ${f}`);
-          }
-          NODE
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            out="$(mktemp)"
-            aws --endpoint-url "$R2_ENDPOINT" s3 cp "$dest/$f" "$out" --no-progress
-            cmp "dist/$f" "$out"
-            rm -f "$out"
-          done < <(jq -r '.files | keys[]' dist/installer-manifest.json)
-          out="$(mktemp)"
-          aws --endpoint-url "$R2_ENDPOINT" s3 cp "$dest/installer-manifest.json" "$out" --no-progress
-          cmp dist/installer-manifest.json "$out"
-          rm -f "$out"
-          aws --endpoint-url "$R2_ENDPOINT" s3 cp "$dest/SHA256SUMS" "$out" --no-progress
-          cmp dist/SHA256SUMS "$out"
-          rm -f "$out"
+          case "$version" in *-*) channel=alpha ;; *) channel=main ;; esac
+          set -- builds publish-cli-binary raft-computer-installer \
+            --version-name "$version" --channel "$channel" \
+            --source-commit "$GITHUB_SHA" --ci-provider github --ci-run-id "$GITHUB_RUN_ID" \
+            --ci-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          for d in dist/native/*/; do
+            t="${d#dist/native/}"; t="${t%/}"
+            exe=""; case "$t" in win32-*) exe=".exe" ;; esac
+            set -- "$@" --target "$t" \
+              --binary "dist/native/${t}/raft-computer-installer${exe}" \
+              --runner "dist/native/${t}/raft-computer-installer-runner${exe}" \
+              --sha256sums "dist/native/${t}/SHA256SUMS"
+          done
+          npx -y @botiverse/hands-cli@0.5.23 "$@"
+          # Read back through the public surface the bootstrap uses.
+          for d in dist/native/*/; do
+            t="${d#dist/native/}"; t="${t%/}"
+            loc="$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://hands.build/dl/raft-computer-installer/${channel}/${t}")"
+            test -n "$loc" || { echo "::error::no release resolves for ${t} on ${channel}"; exit 1; }
+            case "$loc" in /*) loc="https://hands.build$loc" ;; esac
+            curl -fsSL "$loc?kind=sha256sums" | cmp - "dist/native/${t}/SHA256SUMS"
+          done
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

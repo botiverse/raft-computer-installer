@@ -42,7 +42,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`, which a fresh install adds to `~/.zshrc` or `~/.bashrc` when missing; `RAFT_COMPUTER_NO_MODIFY_PATH=1` leaves profiles alone. |
 | `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |
 | `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | The release authority a channel is resolved through. |
-| `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |
+| `RAFT_COMPUTER_INSTALLER_CHANNEL`, `RAFT_COMPUTER_INSTALLER_DL_BASE` | Which installer the bootstrap fetches: the Hands channel (default `main`) under the download base (default `https://hands.build/dl/raft-computer-installer`). One request resolves the channel's release; checksums, installer and runner are then taken from that release. |
 | `RAFT_COMPUTER_INSTALLER_NODE` | Node 24+ used to run the installer. |
 | `RAFT_COMPUTER_OPERATION_ID` | For launchers only: the operation id, so a repeated request replays its receipt instead of running again. |
 
@@ -113,10 +113,12 @@ downgrade, an intended downgrade, `raft-computer upgrade`, status, and a
 broken machine repaired. Temp homes only.
 
 A tag `v*` runs `.github/workflows/release.yml`: one job per platform builds
-and tests the executables, then one job assembles the portable files and
-every executable under one `SHA256SUMS` and publishes a GitHub prerelease.
-Mirror the assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`, keeping the
-`native/<platform>/` layout; the bootstrap never runs an unverified file.
+and tests the executables, then one job assembles every executable under one
+`SHA256SUMS`, publishes the build to Hands as a hosted `cli-binary` (one build,
+every target's installer + runner + per-target checksums, one release: `-rc.N`
+tags on `alpha`, plain tags on `main`), reads it back through the same
+`/dl/raft-computer-installer/<channel>/<target>` URL the bootstrap uses, and
+publishes a GitHub prerelease. The bootstrap never runs an unverified file.
 
 ## Not yet
 

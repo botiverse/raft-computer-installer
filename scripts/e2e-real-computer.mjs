@@ -74,6 +74,19 @@ const server = createServer((req, res) => {
     const f = join(dist, m[1]);
     if (existsSync(f)) return res.end(readFileSync(f));
   }
+  // Hands download surface for the installer app, as the bootstrap sees it.
+  m = /^\/dl\/raft-computer-installer\/main\/([a-z0-9]+-[a-z0-9_]+)$/.exec(url.pathname);
+  if (m) { res.statusCode = 302; res.setHeader("location", `/dl/raft-computer-installer/releases/e2e/${m[1]}`); return res.end(); }
+  m = /^\/dl\/raft-computer-installer\/releases\/e2e\/([a-z0-9]+-[a-z0-9_]+)$/.exec(url.pathname);
+  if (m) {
+    const exe = m[1].startsWith("win32") ? ".exe" : "";
+    const primary = `native/${m[1]}/raft-computer-installer${exe}`, runner = `${primary.replace(/\.exe$/, "")}-runner${exe}`;
+    const kind = url.searchParams.get("kind");
+    if (kind === "sha256sums") return res.end(readFileSync(join(dist, "SHA256SUMS"), "utf8").split("\n").filter((l) => l.endsWith(`  ${primary}`) || l.endsWith(`  ${runner}`)).join("\n") + "\n");
+    const f = join(dist, kind === null ? primary : kind === "runner" ? runner : "");
+    if (f !== dist && existsSync(f)) return res.end(readFileSync(f));
+    res.statusCode = kind === null || kind === "runner" ? 404 : 400; return res.end();
+  }
   if (url.pathname === "/computer/install.sh") return res.end(readFileSync(join(dist, "install.sh")));
   const h = /^\/public\/v2\/apps\/([^/]+)\/latest$/.exec(url.pathname);
   if (h) {
@@ -92,7 +105,7 @@ const installDir = join(home, "bin");
 const env = {
   ...process.env, HOME: home, RAFT_HOME: home, SLOCK_HOME: home, RAFT_COMPUTER_INSTALL_DIR: installDir,
   RAFT_COMPUTER_RELEASE_BASE: `${base}/computer`, RAFT_COMPUTER_HANDS_ORIGIN: base,
-  RAFT_COMPUTER_INSTALLER_RELEASE_BASE: `${base}/installer`, RAFT_COMPUTER_INSTALLER_NODE: process.execPath,
+  RAFT_COMPUTER_INSTALLER_DL_BASE: `${base}/dl/raft-computer-installer`, RAFT_COMPUTER_INSTALLER_NODE: process.execPath,
   RAFT_COMPUTER_INSTALL_URL: `${base}/computer/install.sh`, RAFT_COMPUTER_NON_INTERACTIVE: "1",
 };
 const bootstrap = (args, extra = {}) => run("/bin/sh", [join(dist, "install.sh"), ...args], { ...env, ...extra });
