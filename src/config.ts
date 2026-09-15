@@ -3,7 +3,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const INSTALLER_VERSION = "0.2.0-rc.1";
+export const INSTALLER_VERSION = "0.2.0-rc.5";
 export const IS_WINDOWS = process.platform === "win32";
 export const BIN_NAME = IS_WINDOWS ? "raft-computer.exe" : "raft-computer";
 export const SIDECAR_NAME = "photon_rs_bg.wasm";

@@ -13,7 +13,7 @@
 $ErrorActionPreference = 'Stop'
 # Publish workflows may patch this for a channel-specific copy of the script.
 $InstallChannelDefault = ''
-$installerVersion = if ($env:RAFT_COMPUTER_INSTALLER_VERSION) { $env:RAFT_COMPUTER_INSTALLER_VERSION } else { '0.2.0-rc.1' }
+$installerVersion = if ($env:RAFT_COMPUTER_INSTALLER_VERSION) { $env:RAFT_COMPUTER_INSTALLER_VERSION } else { '0.2.0-rc.5' }
 $base = if ($env:RAFT_COMPUTER_INSTALLER_RELEASE_BASE) { $env:RAFT_COMPUTER_INSTALLER_RELEASE_BASE.TrimEnd('/') } else { "https://cdn.raft.build/installer/$installerVersion" }
 
 function Fail($message) { Write-Error "Failed before any change: $message. Nothing changed."; exit 1 }
