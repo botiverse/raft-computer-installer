@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches-ignore: ['main']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, platform: darwin-arm64 }
+          - { os: macos-13, platform: darwin-x64 }
+          - { os: ubuntu-24.04, platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { os: windows-latest, platform: win32-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk (Linux)
+        # test:real installs real Computer releases (~160 MB each, K keeps the
+        # previous slot and a quarantined copy); every v0.2.0 release run died
+        # of ENOSPC on linux-x64. Drop the preinstalled toolchains we never use.
+        if: runner.os == 'Linux'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build:native
+      - run: npm test
+        env:
+          RCI_NATIVE: "1"
+      - run: npm run test:native
+      - name: Disk before test:real
+        if: runner.os != 'Windows'
+        run: df -h / | tail -1; du -sh "${TMPDIR:-/tmp}" 2>/dev/null || true
+      - run: npm run test:real
+        if: runner.os != 'Windows'
+        env:
+          RCI_NATIVE: "1"
+      - name: Disk after test:real
+        if: always() && runner.os != 'Windows'
+        run: df -h / | tail -1; du -sh "${TMPDIR:-/tmp}" 2>/dev/null || true
