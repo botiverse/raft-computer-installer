@@ -11,6 +11,9 @@
 # ask: no --version means the channel's current release, and running the
 # installer is the consent, repair included.
 $ErrorActionPreference = 'Stop'
+# Invoke-WebRequest renders a progress bar per chunk; on a 100 MB download that
+# costs minutes. Silence it: the bootstrap prints nothing but failures anyway.
+$ProgressPreference = 'SilentlyContinue'
 # Publish workflows may patch this for a channel-specific copy of the script.
 $InstallChannelDefault = ''
 $installerVersion = if ($env:RAFT_COMPUTER_INSTALLER_VERSION) { $env:RAFT_COMPUTER_INSTALLER_VERSION } else { '0.2.0-rc.5' }
