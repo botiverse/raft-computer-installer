@@ -31,7 +31,7 @@ CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # una
 | Option | Meaning |
 |---|---|
 | `--version V` | The exact version. Default: the channel's current release, resolved through Hands. |
-| `--channel main\|alpha` | Which channel to resolve. Attended, the resolved version is shown and asked about. |
+| `--channel main\|alpha\|<feature-channel>` | Which channel to resolve. A feature channel is the named cohort Computer's release workflow registered in Hands (the `computer-v<base>-<channel>.<n>` tags). Attended, the resolved version is shown and asked about. |
 | `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent, repair included. |
 | `--allow-downgrade` | Intend an older target; otherwise it is held. Going back to a version that worked is this. |
 

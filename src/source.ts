@@ -58,9 +58,30 @@ export function createReleaseSource(cfg: Config): ReleaseSource {
 
 export interface HandsResolution { version: string; sha256: string; size: number }
 
+/**
+ * A Hands release channel: `main`, `alpha`, or a named feature channel that
+ * Computer's own release workflow registered under the same slug (the
+ * `computer-v<base>-<channel>.<n>` feature tags). Hands resolves any slug it
+ * knows; the grammar here only keeps typos and other cohort words (`stable`,
+ * `rc`, `staging`…) from being sent as if they were feature channels.
+ */
+export type Channel = string & { readonly __channel: unique symbol };
+
+const NAMED_CHANNEL_RE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+const RESERVED_CHANNEL_WORDS = new Set(["stable", "latest", "rc", "release", "staging", "production", "prod", "nightly", "preview", "pinned", "default"]);
+
+/** `main` (also spelled latest/stable), `alpha`, or a named feature channel. Throws on anything else. */
+export function parseChannel(v: string): Channel {
+  const t = v.trim();
+  if (t === "main" || t === "latest" || t === "stable") return "main" as Channel;
+  if (t === "alpha") return "alpha" as Channel;
+  if (NAMED_CHANNEL_RE.test(t) && !RESERVED_CHANNEL_WORDS.has(t)) return t as Channel;
+  throw new Error(`unknown channel ${v}; expected main, alpha, or a feature channel name (lowercase letters, digits and hyphens)`);
+}
+
 /** Which version a channel means right now, and the bytes Hands says it is. */
-export async function resolveChannel(cfg: Config, channel: "main" | "alpha"): Promise<HandsResolution> {
-  const url = `${cfg.handsOrigin}/public/v2/apps/${cfg.handsApp}/latest?channel=${channel}&product_type=cli-binary`;
+export async function resolveChannel(cfg: Config, channel: Channel): Promise<HandsResolution> {
+  const url = `${cfg.handsOrigin}/public/v2/apps/${cfg.handsApp}/latest?channel=${encodeURIComponent(channel)}&product_type=cli-binary`;
   const body = await fetchJson(url, "release authority");
   const version = (body.build as Record<string, unknown> | undefined)?.version;
   if (typeof version !== "string" || !version) throw new Error(`release authority named no version for channel ${channel}`);

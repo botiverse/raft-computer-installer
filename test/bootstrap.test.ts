@@ -119,6 +119,22 @@ describe("bytes that do not check out", () => {
     assert.equal(existsSync(m.binary), false);
     assert.equal(existsSync(m.kStateDir), false, "a failed fresh install leaves no state behind");
   });
+  it("installs a named feature channel's current release", async () => {
+    h.publish({ version: "1.2.0-fresh-install-flow.1" });
+    h.channel["fresh-install-flow"] = "1.2.0-fresh-install-flow.1";
+    const m = machine();
+    const r = await m.bootstrap(["--channel", "fresh-install-flow"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^Installed 1\.2\.0-fresh-install-flow\.1\./m);
+    assert.equal(await m.selfVersion(), "1.2.0-fresh-install-flow.1");
+  });
+  it("refuses a channel name that is not main, alpha, or a feature channel", async () => {
+    const m = machine();
+    const r = await m.bootstrap(["--channel", "Stable"]);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout + r.stderr, /unknown channel Stable; expected main, alpha, or a feature channel name/);
+    assert.equal(existsSync(m.binary), false);
+  });
   it("an authority and a byte store that disagree fail before any download", async () => {
     h.publish({ version: "1.3.0" });
     h.authorityLies.add("1.3.0");
