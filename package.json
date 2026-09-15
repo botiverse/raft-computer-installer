@@ -12,10 +12,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-timeout=300000 test/*.test.ts",
     "verify:release": "node -e \"const fs=require('fs');const m=JSON.parse(fs.readFileSync('dist/installer-manifest.json'));const c=require('crypto');for(const [f,x] of Object.entries(m.files)){const b=fs.readFileSync('dist/'+f);if(b.length!==x.size||c.createHash('sha256').update(b).digest('hex')!==x.sha256)throw new Error('release_integrity:'+f)}console.log(JSON.stringify({ok:true,installerVersion:m.installerVersion,files:Object.keys(m.files)}))\"",
     "build:native": "node scripts/build.mjs dist --native",
-    "test:native": "RCI_NATIVE=1 node --import tsx --test test/*.test.ts",
+    "test:native": "RCI_NATIVE=1 node --import tsx --test --test-timeout=300000 test/*.test.ts",
     "e2e": "node scripts/e2e-real-computer.mjs",
     "test:real": "RCI_REAL=1 node --import tsx --test --test-timeout=900000 test/real.test.ts"
   },
