@@ -123,7 +123,7 @@ jobs:
               --runner "dist/native/${t}/raft-computer-installer-runner${exe}" \
               --sha256sums "dist/native/${t}/SHA256SUMS"
           done
-          npx -y @botiverse/hands-cli@0.5.23 "$@"
+          npx -y @botiverse/hands-cli@0.5.24 "$@"
           # Read back through the public surface the bootstrap uses.
           for d in dist/native/*/; do
             t="${d#dist/native/}"; t="${t%/}"
