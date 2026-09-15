@@ -5,6 +5,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createServer, request as httpRequest, type Server } from "node:http";
+import { networkInterfaces } from "node:os";
+import { netFetch } from "../src/net.ts";
 import { after, before, describe, it } from "node:test";
 import { Harness, type Machine } from "./harness.ts";
 
@@ -77,5 +79,46 @@ describe("behind an HTTP proxy", () => {
     const r = await m.installer(["install"], { HTTP_PROXY: DEAD_PROXY, http_proxy: DEAD_PROXY, HTTPS_PROXY: DEAD_PROXY, https_proxy: DEAD_PROXY, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" });
     assert.equal(r.code, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^Installed 1\.1\.0\./m);
+  });
+});
+
+/** A non-loopback address of this machine, so NO_PROXY is what decides, not any loopback special case. */
+function lanAddress(): string | null {
+  for (const list of Object.values(networkInterfaces())) for (const i of list ?? []) if (i.family === "IPv4" && !i.internal) return i.address;
+  return null;
+}
+
+describe("netFetch honours NO_PROXY for a non-loopback host", () => {
+  const lan = lanAddress();
+  let server: Server;
+  let url = "";
+  before(async () => {
+    if (!lan) return;
+    server = createServer((_req, res) => res.end("direct"));
+    await new Promise<void>((r) => server.listen(0, "0.0.0.0", r));
+    const addr = server.address();
+    url = `http://${lan}:${typeof addr === "object" && addr ? addr.port : 0}/`;
+  });
+  after(async () => { if (server) { server.closeAllConnections(); await new Promise<void>((r) => server.close(() => r())); } });
+
+  function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const names = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"];
+    const saved = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+    for (const n of names) delete process.env[n];
+    Object.assign(process.env, env);
+    return fn().finally(() => { for (const n of names) { if (saved[n] === undefined) delete process.env[n]; else process.env[n] = saved[n]; } });
+  }
+
+  it("a dead proxy is used for the host when NO_PROXY does not name it", { skip: !lan && "no non-loopback interface" }, async () => {
+    await withEnv({ HTTP_PROXY: DEAD_PROXY }, async () => {
+      await assert.rejects(netFetch(url, { signal: AbortSignal.timeout(5_000) }), (e: unknown) => (e as { cause?: { code?: string } }).cause?.code === "ECONNREFUSED");
+    });
+  });
+  it("NO_PROXY naming the host bypasses the dead proxy", { skip: !lan && "no non-loopback interface" }, async () => {
+    await withEnv({ HTTP_PROXY: DEAD_PROXY, NO_PROXY: lan! }, async () => {
+      const r = await netFetch(url, { signal: AbortSignal.timeout(5_000) });
+      assert.equal(r.status, 200);
+      assert.equal(await r.text(), "direct");
+    });
   });
 });
