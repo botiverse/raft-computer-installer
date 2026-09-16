@@ -52,6 +52,24 @@ def versions(current, older):
     return current, older
 
 
+
+def assert_stopped(machine, extra):
+    """Older published Computer versions predate status --json."""
+    status = subprocess.run([str(machine.binary), "status", "--json"], env=machine.env(extra),
+        text=True, capture_output=True, timeout=30)
+    if status.returncode == 0:
+        if json.loads(status.stdout).get("attestation"):
+            raise AssertionError("cold installation unexpectedly started a real service")
+        return "json"
+    if "unknown option '--json'" not in status.stderr:
+        raise AssertionError("product status failed; stopped state is unproven")
+    legacy = subprocess.run([str(machine.binary), "status"], env=machine.env(extra),
+        text=True, capture_output=True, timeout=30)
+    if legacy.returncode or not re.search(r"(?m)^Service:\s+stopped(?:\s|$)", legacy.stdout):
+        raise AssertionError("legacy product did not report a stopped service")
+    return "legacy-stopped-status"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--current")
@@ -71,10 +89,11 @@ def main():
         assert reply["exitCode"] == expected
         return reply
 
+    status_evidence = set()
+
     def cold(version):
         assert machine.self_version() == version
-        status = json.loads(machine.product(["status", "--json"]).stdout)
-        assert not status.get("attestation"), "cold installation unexpectedly started a real service"
+        status_evidence.add(assert_stopped(machine, extra))
 
     try:
         run(["install", "--version", older])
@@ -95,16 +114,16 @@ def main():
         assert run(["repair", "--version", current])["receipt"]["outcome"] == "repaired"
         cold(current)
         print(json.dumps({"scope": "published native Computer, cold, isolated home", "older": older, "current": current,
-            "cases": ["install", "upgrade", "up-to-date", "held downgrade", "intended downgrade", "adopt", "repair"]}))
+            "statusEvidence": sorted(status_evidence), "cases": ["install", "upgrade", "up-to-date", "held downgrade", "intended downgrade", "adopt", "repair"]}))
     finally:
         # No login occurs. If a regression did start this isolated product,
         # ask that product to stop before removing its temporary home.
         if machine.binary.exists():
             stopped = subprocess.run([str(machine.binary), "stop"], env=machine.env(extra),
                 text=True, capture_output=True, timeout=60)
-            status = subprocess.run([str(machine.binary), "status", "--json"], env=machine.env(extra),
-                text=True, capture_output=True, timeout=30)
-            if status.returncode or json.loads(status.stdout).get("attestation"):
+            try:
+                assert_stopped(machine, extra)
+            except (AssertionError, ValueError, subprocess.TimeoutExpired):
                 # Preserve evidence instead of deleting state under a service.
                 machine.directory._finalizer.detach()
                 raise RuntimeError(f"isolated product cleanup unresolved; retained {machine.home}; stop exit {stopped.returncode}")
