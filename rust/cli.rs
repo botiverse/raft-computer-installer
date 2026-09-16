@@ -190,9 +190,7 @@ pub async fn run() -> Result<u8> {
         }
         if let Some(parent) = parent {
             let remote = args.request.approved_by.starts_with("remote:");
-            let qualified =
-                marker.is_some() || args.request.presence == crate::presence::Presence::Attended;
-            if !remote && qualified {
+            if !remote && marker.is_some() {
                 let status = computer::status(&cfg).await?;
                 if status
                     .evidence
@@ -204,7 +202,7 @@ pub async fn run() -> Result<u8> {
                 args.request.waiting_caller = Some(parent);
             } else if !remote {
                 return Err(invalid(
-                    "older non-interactive Computer caller cannot be identified safely; run the installer directly",
+                    "Computer caller has no waiting declaration; run the installer directly",
                 ));
             }
         }

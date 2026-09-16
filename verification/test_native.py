@@ -118,7 +118,7 @@ class InstallerContract(unittest.TestCase):
             env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
             text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("cannot be identified safely", result.stderr)
+        self.assertIn("has no waiting declaration", result.stderr)
         self.assertEqual(machine.binary.read_bytes(), before)
         self.assertEqual(self.server.requests, [])
         self.assertFalse((machine.state / "active.json").exists())
@@ -131,8 +131,8 @@ class InstallerContract(unittest.TestCase):
         self.assertIn("not the installed immediate parent", result.stderr)
         self.assertEqual(machine.self_version(), "1.0.0")
 
-    @unittest.skipIf(WINDOWS, "legacy console case uses Unix PTY; Windows future-marker case exercises live PE replacement")
-    def test_legacy_attended_cli_keeps_waiting_until_upgrade_finishes(self):
+    @unittest.skipIf(WINDOWS, "terminal rejection case uses Unix PTY; Windows also tests noninteractive rejection")
+    def test_terminal_does_not_substitute_for_waiting_declaration(self):
         import pty
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])
@@ -156,16 +156,15 @@ class InstallerContract(unittest.TestCase):
                     captured.extend(data)
             else:
                 os.kill(pid, signal.SIGKILL)
-                self.fail("legacy CLI upgrade timed out")
+                self.fail("undeclared CLI rejection timed out")
             _, status = os.waitpid(pid, 0)
-            self.assertEqual(os.waitstatus_to_exitcode(status), 0, captured.decode(errors="replace"))
+            self.assertEqual(os.waitstatus_to_exitcode(status), 1, captured.decode(errors="replace"))
+            self.assertIn("has no waiting declaration", captured.decode(errors="replace"))
         finally:
             os.close(terminal)
-        self.assertEqual(machine.self_version(), "1.1.0")
+        self.assertEqual(machine.self_version(), "1.0.0")
         self.assertIsNone(machine.live())
-        record = json.loads((machine.state / "product-state.json").read_text())
-        self.assertEqual(record["initialProcesses"], [])
-        self.assertEqual(record["forcedStops"], [])
+        self.assertFalse((machine.state / "active.json").exists())
 
     def test_short_lived_protocol_replies_are_flushed(self):
         machine = self.machine()

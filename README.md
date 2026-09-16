@@ -56,11 +56,11 @@ running, and a stopped installation stays stopped.
 A Computer CLI waiting for its installer is not a running service. The installer
 attests that CLI's immediate-parent process identity at entry and retains the
 exclusion only for that operation. Remote service callers remain product processes.
-Older Computer CLIs without the waiting-caller declaration must run from a real
-terminal; an ambiguous non-interactive caller is rejected before installation
-changes. In automation, invoke the standalone installer directly until Computer
-supports the declaration. The calling CLI still receives the final installer exit
-code; this is not a background acceptance response.
+Computer CLIs must explicitly declare that they are waiting. A terminal does not
+establish this role. For older Computer versions, invoke the standalone installer
+directly: upgrading through an older CLI without this declaration is unsupported.
+An undeclared CLI caller is rejected before installation changes. Supported
+calling CLIs receive the final installer exit code, not background acceptance.
 
 Exit codes: **0** succeeded or already up to date; **1** failed or rolled back;
 **2** held; **3** recovery unresolved. Details are recorded under
