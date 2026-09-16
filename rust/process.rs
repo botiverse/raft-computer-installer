@@ -128,6 +128,83 @@ pub async fn terminate(identities: &[Identity]) -> Result<Vec<u32>> {
     Ok(forced)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn unobservable_live_process_does_not_block_inventory_or_prove_exit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("reader.c");
+        let executable = temporary.path().join("reader");
+        fs::write(&source, b"#include <sys/prctl.h>\n#include <unistd.h>\nint main(void) { char b; while (read(0, &b, 1) == 1) { if ((b == '0' || b == '1') && prctl(PR_SET_DUMPABLE, b - '0') != 0) return 1; if (write(1, &b, 1) != 1) return 1; } return 0; }\n").unwrap();
+        let built = Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let mut child = OwnedChild(
+            Command::new(&executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        fn exchange(child: &mut Child, value: u8) {
+            child.stdin.as_mut().unwrap().write_all(&[value]).unwrap();
+            let mut reply = [0];
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut reply)
+                .unwrap();
+            assert_eq!(reply, [value]);
+        }
+        exchange(&mut child.0, b'1');
+        let identity = attest(child.0.id(), &executable).unwrap();
+        exchange(&mut child.0, b'0');
+        // Reproduce a live same-user service whose executable cannot be read.
+        assert_eq!(
+            fs::read_link(format!("/proc/{}/exe", child.0.id()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(observe(identity.pid).unwrap().is_none());
+        assert!(installed(&executable).unwrap().is_empty());
+        assert!(matches!(matches(&identity), Err(Error::Uncertain(_))));
+        assert_eq!(
+            wait_gone(std::slice::from_ref(&identity), Duration::from_millis(50))
+                .await
+                .unwrap(),
+            vec![identity.clone()]
+        );
+        assert!(native::signal(&identity, true).is_err());
+        exchange(&mut child.0, b'1');
+        assert!(matches(&identity).unwrap());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!matches(&identity).unwrap());
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod native {
     use super::*;
