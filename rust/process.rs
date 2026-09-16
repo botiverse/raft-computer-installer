@@ -421,18 +421,13 @@ mod native {
             libc::proc_pidinfo(
                 pid as i32,
                 libc::PROC_PIDTBSDINFO,
-                0,
+                // XNU searches the zombie list only when arg is nonzero.
+                // Require an explicit exited state, independent of parent reap.
+                1,
                 info.as_mut_ptr().cast(),
                 size_of::<libc::proc_bsdinfo>() as i32,
             )
         };
-        // An unreaped zombie can still answer kill(pid, 0), while libproc
-        // reports ESRCH instead of returning BSD info. It cannot run further
-        // effects; waiting for its unrelated parent to reap it blocks recovery.
-        // Permission errors and an unavailable executable path do not prove exit.
-        if count == 0 {
-            return Ok(std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
-        }
         Ok(count as usize == size_of::<libc::proc_bsdinfo>()
             && unsafe { info.assume_init().pbi_status } == 5)
     }
