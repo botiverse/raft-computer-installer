@@ -209,6 +209,56 @@ class InstallerContract(unittest.TestCase):
         machine.json(["repair", "--version", "1.1.0"])
         self.assertEqual(machine.live()["version"], "1.1.0")
 
+    def test_installer_metadata_damage_is_reported_and_preserved_by_repair(self):
+        for damaged in ("active", "plan", "receipt"):
+            with self.subTest(damaged=damaged):
+                machine = self.machine()
+                machine.json(["install", "--version", "1.0.0"],
+                    extra={"RAFT_COMPUTER_OPERATION_ID": "original"})
+                active = machine.state / "active.json"
+                active.write_text(json.dumps({"formatVersion": 1, "id": "original"}))
+                paths = {
+                    "active": active,
+                    "plan": machine.state / "operations" / sha(b"original") / "plan.json",
+                    "receipt": machine.state / "receipts" / (sha(b"original") + ".json"),
+                }
+                broken = b"{damaged installer metadata"
+                paths[damaged].write_bytes(broken)
+                self.server.requests.clear()
+                observed = machine.json(["status"], expected=3)
+                self.assertEqual(observed["world"]["kind"], "broken")
+                self.assertEqual(self.server.requests, [], "status recovery must remain offline")
+                result = machine.json(["repair", "--version", "1.1.0"])
+                self.assertEqual(result["receipt"]["outcome"], "repaired")
+                preserved = Path(result["receipt"]["detail"]["metadataQuarantine"])
+                index = json.loads((preserved / "index.json").read_text())
+                self.assertTrue(any((preserved / name).read_bytes() == broken for name in index))
+                self.assertFalse((machine.state / "metadata-damage.json").exists())
+                self.assertEqual(machine.json(["status"])["world"]["kind"], "managed")
+                self.assertIsNone(machine.live())
+
+    def test_sidecar_damage_is_broken_and_repair_keeps_the_previous_cache(self):
+        for damaged in ("missing", "installed", "identity"):
+            with self.subTest(damaged=damaged):
+                machine = self.machine()
+                machine.json(["install", "--version", "1.0.0"])
+                sidecar = machine.install_dir / "photon_rs_bg.wasm"
+                if damaged == "missing":
+                    sidecar.unlink()
+                elif damaged == "installed":
+                    sidecar.write_bytes(b"damaged sidecar")
+                else:
+                    (machine.state / "sidecars/1.0.0/identity.json").write_bytes(b"{damaged cache")
+                self.assertEqual(machine.json(["status"], expected=3)["world"]["kind"], "broken")
+                result = machine.json(["repair", "--version", "1.0.0"])
+                self.assertEqual(result["receipt"]["outcome"], "repaired")
+                kept = Path(result["receipt"]["detail"]["sidecarQuarantine"])
+                self.assertTrue((kept / "identity.json").exists())
+                if damaged == "identity":
+                    self.assertEqual((kept / "identity.json").read_bytes(), b"{damaged cache")
+                self.assertEqual(sidecar.read_bytes(), self.server.sidecar)
+                self.assertIsNone(machine.live())
+
     def test_bad_sources_fail_before_publication(self):
         cases = (
             ("authority", {"RAFT_COMPUTER_HANDS_ORIGIN": "http://127.0.0.1:9"}),
