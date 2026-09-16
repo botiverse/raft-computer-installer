@@ -73,3 +73,9 @@ one JS product build relabeled as multiple versions is no longer accepted as
 real-product evidence: each candidate must report the version of its actual
 native artifact. Published-product cold paths and the native fault fixture are
 reported separately.
+
+## Manual authenticated acceptance
+
+See [manual-authenticated-upgrade.md](manual-authenticated-upgrade.md) for the
+not-yet-executed real-agent upgrade checklist, including Computer API and
+Electron entry points. Automated cold-path results do not satisfy this checklist.
