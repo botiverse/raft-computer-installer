@@ -38,13 +38,29 @@ prior registry value and restores it afterwards. On other Windows hosts that
 case is explicitly skipped; a local run therefore does not prove it passed.
 macOS fixture binaries are re-signed after their embedded version changes.
 
-`real.py` exercises **actual published Computer binaries**, including their real
-WASM sidecar, from the public authority and CDN. Only the locally built installer
-is served on loopback. It installs an older release, upgrades, checks up-to-date
-and downgrade policy, adopts pre-K bytes and repairs unreadable K state. The
-default chooses the current stable channel and an earlier published patch; use
-`--current X.Y.Z --older X.Y.Z` when those defaults cannot select a pair. Metadata
-and network failures fail the check rather than silently substituting fixtures.
+`matrix.py` freezes fixed historical 1.0.17 / reference 1.0.32 manifests and,
+for full or daily runs, resolves main once for all five platforms. It checks
+Hands metadata against the frozen manifests, downloads and verifies actual
+published binaries, gzip assets and WASM sidecars, then replays those exact bytes
+and metadata over loopback to the real installer. Each scenario gets its own
+isolated home. Channel execution uses frozen main metadata; the public origin
+readback is a separate plan/publication check, not a claim that loopback is live Hands.
+
+```sh
+# Run after scripts/verify.py has built the installer and native fixture.
+python3 verification/matrix.py plan --mode full --output dist/matrix-plan.json
+python3 verification/matrix.py run --plan dist/matrix-plan.json --output dist/matrix-results.json
+# Exact immutable published prerelease candidate, when it exists:
+python3 verification/matrix.py plan --mode candidate --candidate 1.0.33-rc.1 --output dist/candidate-plan.json
+```
+
+The candidate command is a syntax example, not a claim that this version exists.
+`control` runs fixed 1.0.17→1.0.32; `full` adds latest, fresh/repeat, reconstructed
+adoption, damaged-state repair and independent denied/allowed downgrade cases;
+`latest` is the daily drift check; `candidate` checks an explicit new product.
+The legacy `real.py` pair runner remains available for one-off comparison but is
+no longer the CI release gate. There is no silent substitution of older versions
+or fixtures when metadata or platform artifacts are missing.
 
 These product runs never log in and assert that no service starts. They do not
 prove authenticated live-service behavior. Fixture lifecycle tests prove actual
@@ -84,4 +100,6 @@ Electron entry points. Automated cold-path results do not satisfy this checklist
 
 [Version matrix and rationale](version-matrix.md) defines fixed historical
 baselines, candidate/latest targets, platform coverage and execution tiers.
-It is a design; the current CI still uses the adjacent-release default described above.
+The fixed cold matrix is implemented in CI; authenticated execution, original
+historical installer snapshots and the future integrated-Computer baseline remain
+explicitly outside automated coverage.

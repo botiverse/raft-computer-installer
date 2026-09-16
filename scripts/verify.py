@@ -43,7 +43,10 @@ def main():
     if ready:
         check("native contract", [sys.executable, "-m", "unittest", "discover", "-s", "verification", "-p", "test_*.py", "-v"])
         if args.real:
-            check("published Computer", [sys.executable, "verification/real.py"])
+            plan = args.dist / "matrix-plan.json"
+            check("published matrix plan", [sys.executable, "verification/matrix.py", "plan", "--mode", "full", "--output", str(plan)])
+            if "published matrix plan" not in failures:
+                check("published Computer", [sys.executable, "verification/matrix.py", "run", "--plan", str(plan), "--output", str(args.dist / "matrix-results.json")])
     print("\n" + ("Failed: " + ", ".join(failures) if failures else "All requested checks passed."))
     return int(bool(failures))
 

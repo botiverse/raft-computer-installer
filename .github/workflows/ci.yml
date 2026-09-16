@@ -3,21 +3,81 @@ on:
   push:
     branches: ['**']
   pull_request:
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
     inputs:
       real:
-        description: Also verify published Computer releases
+        description: Run the full fixed-baseline published Computer matrix
         type: boolean
         default: false
+      candidate:
+        description: Exact published Computer candidate version (optional, including prerelease)
+        type: string
+        default: ''
   workflow_call:
     inputs:
       real:
         type: boolean
         default: false
+      candidate:
+        type: string
+        default: ''
 permissions:
   contents: read
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: select
+        name: Select coverage from event and changed files
+        env:
+          EVENT: ${{ github.event_name }}
+          FULL: ${{ inputs.real }}
+          CANDIDATE: ${{ inputs.candidate }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: python
+        run: |
+          import os, subprocess
+          event, candidate = os.environ['EVENT'], os.environ['CANDIDATE']
+          mode = 'full' if os.environ['FULL'] == 'true' else 'candidate' if candidate else 'latest' if event == 'schedule' else 'control'
+          if event in ('push', 'pull_request') and mode == 'control':
+              base = os.environ.get('BASE', '')
+              if base and set(base) != {'0'}:
+                  paths = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
+                  if paths and all(p.endswith('.md') for p in paths):
+                      mode = 'none'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('mode=' + mode + '\n')
+      - name: Freeze one plan for all platforms
+        if: steps.select.outputs.mode != 'none'
+        env:
+          MODE: ${{ steps.select.outputs.mode }}
+          CANDIDATE: ${{ inputs.candidate }}
+        shell: python
+        run: |
+          import os, subprocess, sys
+          args = [sys.executable, 'verification/matrix.py', 'plan', '--mode', os.environ['MODE'], '--output', 'matrix-plan.json']
+          if os.environ['CANDIDATE']:
+              args += ['--candidate', os.environ['CANDIDATE']]
+          subprocess.run(args, check=True)
+      - uses: actions/upload-artifact@v4
+        if: steps.select.outputs.mode != 'none'
+        with:
+          name: published-matrix-plan
+          path: matrix-plan.json
+          if-no-files-found: error
   native:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
@@ -39,9 +99,19 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: python scripts/verify.py
-      - name: Published Computer cold paths
-        if: ${{ !cancelled() && inputs.real }}
-        run: python verification/real.py
+      - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() && needs.plan.outputs.mode != 'none' }}
+        with:
+          name: published-matrix-plan
+      - name: Published Computer independent cold scenarios
+        if: ${{ !cancelled() && needs.plan.outputs.mode != 'none' }}
+        run: python verification/matrix.py run --plan matrix-plan.json --output matrix-results/${{ matrix.target }}.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && needs.plan.outputs.mode != 'none' }}
+        with:
+          name: matrix-results-${{ matrix.target }}
+          path: matrix-results/*.json
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.target }}
