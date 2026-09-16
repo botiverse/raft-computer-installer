@@ -79,3 +79,9 @@ reported separately.
 See [manual-authenticated-upgrade.md](manual-authenticated-upgrade.md) for the
 not-yet-executed real-agent upgrade checklist, including Computer API and
 Electron entry points. Automated cold-path results do not satisfy this checklist.
+
+## Version matrix design
+
+[Version matrix and rationale](version-matrix.md) defines fixed historical
+baselines, candidate/latest targets, platform coverage and execution tiers.
+It is a design; the current CI still uses the adjacent-release default described above.

@@ -1,0 +1,82 @@
+{
+  "observedAt": "2026-09-16",
+  "scope": "Manifest metadata readback only; binaries have not been executed by this design step.",
+  "releases": [
+    {
+      "version": "1.0.17",
+      "manifestUrl": "https://cdn.raft.build/computer/1.0.17/manifest.json",
+      "manifestSHA256": "19f8ca2b06faddfbd48c0f029ae6f8ddb28d14dd850fbd9f2b4d940b72b5b428",
+      "sourceTag": "computer-v1.0.17",
+      "targets": {
+        "darwin-arm64": {
+          "file": "raft-computer-darwin-arm64",
+          "sha256": "615469000798367af32308ccbbb07c44cb4d5c4785e147c823f6cbb38fe7250c",
+          "size": 154833680
+        },
+        "darwin-x64": {
+          "file": "raft-computer-darwin-x64",
+          "sha256": "b82757edf57621ad24e5b876b11327d1603bb1f3880e27d2ccf60f6909d41b4c",
+          "size": 157167232
+        },
+        "linux-arm64": {
+          "file": "raft-computer-linux-arm64",
+          "sha256": "1dc518e6a32f8b9e1523736c8860702476ff81dde1a1d26e51c64ee80b4b1aed",
+          "size": 155585664
+        },
+        "linux-x64": {
+          "file": "raft-computer-linux-x64",
+          "sha256": "39f6d7a84d38b2dc1d8b70958bfcecefc0af290b2bfcfc6d8bca197a5b34bb30",
+          "size": 157813952
+        },
+        "win32-x64": {
+          "file": "raft-computer-win32-x64.exe",
+          "sha256": "ce4993bd0d9300d619d2bde13180dac16d235cb8abd11a0fd1cbe9be7014f080",
+          "size": 126630912
+        }
+      },
+      "photonWasm": {
+        "file": "photon_rs_bg.wasm",
+        "sha256": "10468181565c56004c867f3a4af96f89a0ef5a63a72f2b5fb12c1f1992a3615c",
+        "size": 1881634
+      }
+    },
+    {
+      "version": "1.0.32",
+      "manifestUrl": "https://cdn.raft.build/computer/1.0.32/manifest.json",
+      "manifestSHA256": "2503e72b51702e5cb43c78ead5b3006e28ee5f5dcb36686c9c759e88314239ce",
+      "sourceTag": "computer-v1.0.32",
+      "targets": {
+        "darwin-arm64": {
+          "file": "raft-computer-darwin-arm64",
+          "sha256": "0db97964b6f21d500629e14a88fe4d24b94476428d01de997863ad2d7545aec5",
+          "size": 158680976
+        },
+        "darwin-x64": {
+          "file": "raft-computer-darwin-x64",
+          "sha256": "ed3ace1711475f2384fb0b664658f8ef608882c5a1ddf8159a34336607e7d9fe",
+          "size": 161018656
+        },
+        "linux-arm64": {
+          "file": "raft-computer-linux-arm64",
+          "sha256": "3b15341ff28b0feefdd0c0ffcf8abedb3fad88c96527a21a1595623c2b7579c4",
+          "size": 159386752
+        },
+        "linux-x64": {
+          "file": "raft-computer-linux-x64",
+          "sha256": "cfac87591d5032e0001abac7efaf7fa8caaf92f67689742f6c977560c46f679a",
+          "size": 161615040
+        },
+        "win32-x64": {
+          "file": "raft-computer-win32-x64.exe",
+          "sha256": "e1b37c146630baef6a3b251594e7d2cd4978c34e682a429104b04c543d203524",
+          "size": 130405888
+        }
+      },
+      "photonWasm": {
+        "file": "photon_rs_bg.wasm",
+        "sha256": "10468181565c56004c867f3a4af96f89a0ef5a63a72f2b5fb12c1f1992a3615c",
+        "size": 1881634
+      }
+    }
+  ]
+}
