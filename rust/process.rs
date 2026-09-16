@@ -594,6 +594,7 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
 
     struct OwnedChild(Child);
@@ -607,17 +608,39 @@ mod tests {
     #[tokio::test]
     async fn unlinked_live_executable_does_not_block_inventory_or_prove_exit() {
         let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("sleep");
-        fs::copy("/bin/sleep", &executable).unwrap();
+        let executable = temporary.path().join("cat");
+        fs::copy("/bin/cat", &executable).unwrap();
+        // A copied Apple platform binary can be killed when its backing file
+        // disappears. Use the same ad-hoc signature as installer test builds.
+        assert!(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&executable)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         let mut child = OwnedChild(
             Command::new(&executable)
-                .arg("60")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
+        fn exchange(child: &mut Child) {
+            child.stdin.as_mut().unwrap().write_all(b"ready\n").unwrap();
+            let mut output = [0; 6];
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut output)
+                .unwrap();
+            assert_eq!(&output, b"ready\n");
+        }
+        exchange(&mut child.0); // The executable is loaded and accepting input.
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
             if let Ok(identity) = attest(child.0.id(), &executable) {
@@ -644,6 +667,7 @@ mod tests {
             vec![identity.clone()]
         );
         assert!(native::signal(&identity, true).is_err());
+        exchange(&mut child.0);
         assert!(child.0.try_wait().unwrap().is_none());
         child.0.kill().unwrap();
         child.0.wait().unwrap();
