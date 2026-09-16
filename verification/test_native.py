@@ -99,6 +99,8 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         before = machine.login_start()
         first = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "warm"})
+        dead = json.loads(first["receipt"]["detail"]["deadProcessIdentities"])
+        self.assertTrue(any(identity.startswith(f"pid:{before['pid']}:created:") for identity in dead))
         live = machine.live()
         self.assertEqual(live["version"], "1.1.0")
         self.assertNotEqual(live["generation"], before["generation"])
@@ -316,6 +318,7 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result["receipt"]["outcome"], "unresolved")
         self.assertTrue((machine.state / "quarantine").exists())
         self.assertTrue(list((machine.state / "operations").glob("*/artifact.bin")))
+        self.assertTrue(list((machine.state / "scratch/supervisors").glob("operation-*")))
         completed = machine.json(["repair", "--version", "1.1.0", "--allow-downgrade"])
         self.assertEqual(completed["receipt"]["outcome"], "repaired")
         self.assertEqual(machine.live()["version"], "1.1.0")
@@ -323,6 +326,7 @@ class InstallerContract(unittest.TestCase):
         self.assertFalse((machine.state / "operations").exists())
         self.assertFalse((machine.k / "incoming").exists())
         self.assertEqual(sorted(p.name for p in (machine.state / "sidecars").iterdir()), ["1.1.0"])
+        self.assertEqual(list((machine.state / "scratch/supervisors").glob("operation-*")), [])
 
     def test_completed_cleanup_retries_without_installing_again(self):
         machine = self.machine()

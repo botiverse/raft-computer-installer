@@ -462,8 +462,10 @@ mod native {
             return Err(std::io::Error::last_os_error().into());
         }
         let snapshot = Handle(snapshot);
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut result = Vec::new();
         let mut found = unsafe { Process32FirstW(snapshot.0, &mut entry) };
         while found != 0 {

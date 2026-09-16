@@ -418,6 +418,21 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             }
             .into(),
         );
+        if outcome == Outcome::Promoted && state.running {
+            let mut dead = Vec::new();
+            for identity in &state.initial_processes {
+                if crate::process::matches(identity)? {
+                    return Err(Error::Uncertain(
+                        "previous product process is still running".into(),
+                    ));
+                }
+                dead.push(format!("pid:{}:created:{}", identity.pid, identity.created));
+            }
+            plan.detail.insert(
+                "deadProcessIdentities".into(),
+                serde_json::to_string(&dead)?,
+            );
+        }
         plan.next_step = state.next_step;
     }
     let target = &plan.manifest.version;
