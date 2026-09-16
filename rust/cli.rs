@@ -21,7 +21,7 @@ const HELP: &str = "raft-computer-installer
   recover         [--json]
 
 No command means upgrade. Unattended invocations never ask questions.
-Repair is allowed only for a broken installation and preserves its previous state.
+Repair is allowed only for a broken installation and preserves credentials, configuration and user files.
 Exit codes: 0 succeeded, 1 failed or rolled back, 2 held, 3 recovery unresolved.
 ";
 

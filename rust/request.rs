@@ -1,4 +1,10 @@
-use crate::{Result, presence::Presence, report::Receipt, source, version, world::World};
+use crate::{
+    Result,
+    presence::Presence,
+    report::{Outcome, Receipt},
+    source, version,
+    world::World,
+};
 use k_carrier::error::invalid;
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +96,28 @@ impl Reply {
             world: None,
         }
     }
+    fn replay_line(receipt: &Receipt) -> String {
+        let result = match receipt.outcome {
+            Outcome::Installed => "installed",
+            Outcome::Promoted => "upgraded",
+            Outcome::Repaired => "reinstalled",
+            Outcome::UpToDate => "already up to date",
+            Outcome::Failed => "failed",
+            Outcome::RolledBack => "rolled back",
+            Outcome::Held => "held",
+            Outcome::Unresolved => "unresolved",
+        };
+        format!(
+            "Previous operation: {result}. Run raft-computer-installer status for the current installation and service state."
+        )
+    }
+    pub fn replay(receipt: Receipt) -> Self {
+        let line = Self::replay_line(&receipt);
+        Self {
+            line,
+            ..Self::receipt(receipt)
+        }
+    }
     pub fn validate(&self, expected: &str) -> Result<()> {
         if self.protocol_version != 1
             || self.id != expected
@@ -104,7 +132,7 @@ impl Reply {
             receipt.validate()?;
             if receipt.id != self.id
                 || receipt.exit_code != self.exit_code
-                || receipt.line != self.line
+                || (receipt.line != self.line && Self::replay_line(receipt) != self.line)
             {
                 return Err(invalid("installer response receipt mismatch"));
             }

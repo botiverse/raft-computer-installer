@@ -205,6 +205,14 @@ fn active(cfg: &Config) -> Result<Option<Plan>> {
     if active.format_version != 1 {
         return Err(invalid("unsupported installer operation format"));
     }
+    if let Some(receipt) = report::read(cfg, &active.id)?
+        && receipt.outcome != Outcome::Unresolved
+    {
+        // The old plan is no longer recovery input once the result is durable.
+        // Even if housekeeping cannot be written yet, never replay its effects.
+        settle_terminal_metadata(cfg, &receipt);
+        return Ok(None);
+    }
     read_plan(cfg, &active.id).map(Some)
 }
 
@@ -251,12 +259,25 @@ fn finish(
     outcome: Outcome,
     line: impl Into<String>,
 ) -> Result<Reply> {
+    let mut line = line.into();
+    if outcome.exit_code() == 0 || outcome == Outcome::RolledBack {
+        if plan.detail.get("readback").map(String::as_str) == Some("service") {
+            line.push_str(" It is running.");
+        }
+        if let Some(hint) = &plan.next_step {
+            line.push_str(&format!(" Next: {hint}"));
+        }
+        if let Some(hint) = plan.detail.get("pathHint") {
+            line.push(' ');
+            line.push_str(hint);
+        }
+    }
     let mut result = receipt(
         &plan.request,
         Some(plan.manifest.version.clone()),
         plan.from_version.clone(),
         outcome,
-        line.into(),
+        line,
     );
     result.detail = plan.detail.clone();
     result.next_step = plan.next_step.clone();
@@ -417,6 +438,14 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.detail.insert("reason".into(), reason);
     }
     if let Ok(state) = host::read(cfg) {
+        if outcome == Outcome::UpToDate
+            && state.running
+            && host::live_evidence(cfg).await?.version != plan.manifest.version
+        {
+            return Err(Error::Uncertain(
+                "running version does not match installed release".into(),
+            ));
+        }
         plan.detail.insert(
             "readback".into(),
             if state.running {
@@ -653,7 +682,7 @@ async fn install(
         } else {
             Outcome::Installed
         };
-        let mut line = format!(
+        let line = format!(
             "{} {}.",
             if plan.kind == Kind::Repair {
                 "Reinstalled"
@@ -662,13 +691,6 @@ async fn install(
             },
             plan.manifest.version
         );
-        if let Some(hint) = &plan.next_step {
-            line.push_str(&format!(" Next: {hint}"));
-        }
-        if let Some(hint) = plan.detail.get("pathHint") {
-            line.push(' ');
-            line.push_str(hint);
-        }
         return finish(cfg, plan, outcome, line);
     }
     Err(invalid("unexpected installer operation phase"))
@@ -684,7 +706,7 @@ async fn resume(
         && old.outcome != Outcome::Unresolved
     {
         settle_terminal_metadata(cfg, &old);
-        return Ok(Reply::receipt(old));
+        return Ok(Reply::replay(old));
     }
     if recovery {
         host::bind_recovery_caller(cfg, &plan.request.id)?;
@@ -759,15 +781,15 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     let own_receipt = match report::read(cfg, &request.id) {
         Ok(value) => value,
         Err(_) => {
-            mark_damage(cfg)?;
             // Corruption removed the evidence needed to bind this ID to its
-            // original target. Preserve it and require a new repair request;
-            // never repurpose an ID whose result is no longer readable.
-            if !["status", "recover"].contains(&request.command.as_str()) {
+            // original target. Preserve it and refuse to repurpose the ID.
+            // Current recovery inputs are checked below independently; an old
+            // unreadable result alone does not make today's installation broken.
+            if request.command != "status" {
                 return Ok(Reply::plain(
                     &request.id,
                     3,
-                    "This request's result is unreadable. Start a new repair command.",
+                    "This request's result is unreadable. Use status to inspect the current installation.",
                 ));
             }
             None
@@ -789,7 +811,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         }
         if request.command != "status" && old.outcome != Outcome::Unresolved {
             settle_terminal_metadata(cfg, &old);
-            return Ok(Reply::receipt(old));
+            return Ok(Reply::replay(old));
         }
     }
     let settlement = directory(cfg, &request.id).join("settlement-failed.json");

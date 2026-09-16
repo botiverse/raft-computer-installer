@@ -207,7 +207,9 @@ class InstallerContract(unittest.TestCase):
     def test_fresh_and_cold_upgrade_preserve_stopped_state(self):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])
-        machine.json(["upgrade", "--version", "1.1.0"])
+        upgraded = machine.json(["upgrade", "--version", "1.1.0"])
+        self.assertIn("Next:", upgraded["line"])
+        self.assertNotIn("It is running.", upgraded["line"])
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
@@ -220,6 +222,7 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         before = machine.login_start()
         first = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "warm"})
+        self.assertIn("It is running.", first["line"])
         dead = json.loads(first["receipt"]["detail"]["deadProcessIdentities"])
         self.assertTrue(any(identity.startswith(f"pid:{before['pid']}:created:") for identity in dead))
         live = machine.live()
@@ -251,6 +254,8 @@ class InstallerContract(unittest.TestCase):
         machine.product(["stop"])
         repeated = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "history"})
         self.assertEqual(repeated["receipt"], original["receipt"])
+        self.assertIn("Previous operation:", repeated["line"])
+        self.assertIn("status", repeated["line"])
         self.assertIsNone(machine.live())
         status = machine.json(["status"], extra={"RAFT_COMPUTER_OPERATION_ID": "history"})
         self.assertIn("stopped", status["line"])
@@ -398,6 +403,10 @@ class InstallerContract(unittest.TestCase):
                 broken = b"{damaged installer metadata"
                 paths[damaged].parent.mkdir(parents=True, exist_ok=True)
                 paths[damaged].write_bytes(broken)
+                if damaged == "plan":
+                    # This plan still matters: no terminal receipt proves that
+                    # its operation finished. Completed old plans are tested below.
+                    (machine.state / "receipts" / (sha(b"original") + ".json")).unlink()
                 self.server.requests.clear()
                 observed = machine.json(["status"], expected=3)
                 self.assertEqual(observed["world"]["kind"], "broken")
@@ -508,6 +517,46 @@ class InstallerContract(unittest.TestCase):
                 self.assertEqual(self.server.requests, [], "cleanup must not download or reinstall")
                 self.assertFalse(obsolete.exists())
                 self.assertFalse((machine.state / "cleanup.json").exists())
+
+    def test_terminal_receipt_settles_missing_or_bad_plan_before_status(self):
+        for old_plan in (None, "damaged old plan"):
+            with self.subTest(old_plan=old_plan):
+                machine = self.machine()
+                ident = "completed-plan"
+                completed = machine.json(["install", "--version", "1.0.0"], extra={"RAFT_COMPUTER_OPERATION_ID": ident})
+                live = machine.login_start()
+                (machine.state / "active.json").write_text(json.dumps({"formatVersion": 1, "id": ident}))
+                directory = machine.state / "operations" / sha(ident.encode())
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "artifact.bin").write_bytes(b"obsolete download")
+                if old_plan is not None:
+                    (directory / "plan.json").write_text(old_plan)
+                before = (machine.state / "receipts" / (sha(ident.encode()) + ".json")).read_bytes()
+                self.server.requests.clear()
+                status = machine.json(["status"])
+                self.assertEqual(status["world"]["kind"], "managed")
+                self.assertEqual(machine.live(), live)
+                self.assertEqual(self.server.requests, [])
+                self.assertFalse((machine.state / "active.json").exists())
+                self.assertFalse(directory.exists())
+                self.assertFalse((machine.state / "metadata-damage.json").exists())
+                self.assertEqual(machine.receipt(ident), completed["receipt"])
+                self.assertEqual((machine.state / "receipts" / (sha(ident.encode()) + ".json")).read_bytes(), before)
+
+    def test_old_unreadable_receipt_does_not_poison_live_installation(self):
+        machine = self.machine()
+        env = {"RAFT_COMPUTER_OPERATION_ID": "old-unreadable"}
+        machine.json(["install", "--version", "1.0.0"], extra=env)
+        live = machine.login_start()
+        receipt = machine.state / "receipts" / (sha(b"old-unreadable") + ".json")
+        receipt.write_bytes(b"damaged old receipt")
+        self.server.requests.clear()
+        machine.json(["install", "--version", "1.0.0"], expected=3, extra=env)
+        self.assertFalse((machine.state / "metadata-damage.json").exists())
+        self.assertEqual(machine.json(["status"])["world"]["kind"], "managed")
+        self.assertEqual(machine.live(), live)
+        self.assertEqual(receipt.read_bytes(), b"damaged old receipt")
+        self.assertEqual(self.server.requests, [])
 
     def test_bad_sources_fail_before_publication(self):
         cases = (
