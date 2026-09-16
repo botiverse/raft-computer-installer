@@ -164,6 +164,31 @@ pub fn saved_sidecar(cfg: &Config, version: &str) -> Result<Option<PathBuf>> {
     }
 }
 
+/// Observe without adopting or rewriting anything. A missing record is allowed
+/// for installations made before the native installer; once recorded, explicit
+/// absence and the exact saved bytes are part of the managed installation.
+pub fn check_installed_sidecar(cfg: &Config, version: &str) -> Result<()> {
+    let installed = match fs::symlink_metadata(&cfg.sidecar) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            Some(fs::read(&cfg.sidecar)?)
+        }
+        Ok(_) => return Err(invalid("installed sidecar is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let dir = cfg.sidecar_dir(version)?;
+    if !k_carrier::storage::exists(&dir)? {
+        return Ok(());
+    }
+    // An existing cache directory with no identity is interrupted/corrupt
+    // native state, not evidence of a legacy installation without a sidecar.
+    match (saved_sidecar(cfg, version)?, installed) {
+        (None, None) => Ok(()),
+        (Some(saved), Some(installed)) if fs::read(&saved)? == installed => Ok(()),
+        _ => Err(invalid("installed sidecar differs from its saved identity")),
+    }
+}
+
 /// Adopt the sidecar belonging to an existing, self-checked installation before
 /// its first native transaction. Existing records retain their original identity.
 /// Caller holds both product and K gates, and has proved installed == stable
@@ -172,7 +197,7 @@ pub fn adopt_installed_sidecar(cfg: &Config, version: &str) -> Result<()> {
     let dir = cfg.sidecar_dir(version)?;
     let record_path = dir.join("identity.json");
     if k_carrier::storage::exists(&record_path)? {
-        saved_sidecar(cfg, version)?;
+        check_installed_sidecar(cfg, version)?;
         return Ok(());
     }
     let bytes = match fs::symlink_metadata(&cfg.sidecar) {
@@ -252,6 +277,7 @@ pub struct PreparedArtifact {
     _directory: tempfile::TempDir,
     pub path: PathBuf,
     pub version: String,
+    pub sidecar_quarantine: Option<PathBuf>,
 }
 
 pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
@@ -283,6 +309,96 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
         _directory: directory,
         path,
         version: manifest.version.clone(),
+        sidecar_quarantine: None,
+    })
+}
+
+/// Repair prepares a complete candidate independently of a damaged sidecar
+/// cache. Only after download and self-check succeed may the old cache move
+/// aside; product data and the installed binary remain untouched here.
+pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
+    version::exact(&manifest.version)?;
+    ensure_dir(&cfg.scratch())?;
+    let downloader = Downloader::new()?;
+    let bytes = downloader
+        .download(&manifest.release, Some(&cfg.scratch()), None)
+        .await?;
+    check_platform(&bytes)?;
+    let directory = tempfile::Builder::new()
+        .prefix("repair-candidate-")
+        .tempdir_in(cfg.scratch())?;
+    let path = directory.path().join(BIN_NAME);
+    write_durable(&path, &bytes, true)?;
+    let sidecar = match &manifest.sidecar {
+        Some(release) => {
+            let bytes = downloader
+                .download(release, Some(&cfg.scratch()), None)
+                .await?;
+            write_durable(&directory.path().join(SIDECAR_NAME), &bytes, false)?;
+            Some(bytes)
+        }
+        None => None,
+    };
+    if computer::self_report(&path, cfg).await?.version != manifest.version {
+        return Err(invalid("candidate self-report version mismatch"));
+    }
+    let record = SidecarRecord {
+        format_version: 1,
+        version: manifest.version.clone(),
+        sidecar: manifest.sidecar.as_ref().map(|release| SidecarIdentity {
+            sha256: release.sha256.clone(),
+            size: release.size,
+        }),
+    };
+    let cache = cfg.sidecar_dir(&manifest.version)?;
+    if let Ok(bytes) = fs::read(cache.join("identity.json"))
+        && let Ok(old) = serde_json::from_slice::<SidecarRecord>(&bytes)
+        && old.format_version == 1
+        && old.version == manifest.version
+        && old != record
+    {
+        return Err(invalid(
+            "release sidecar identity changed for an immutable version",
+        ));
+    }
+    // Stage the replacement identity and bytes together before either rename.
+    let replacement = directory.path().join("sidecar-cache");
+    ensure_dir(&replacement)?;
+    if let Some(bytes) = &sidecar {
+        write_durable(&replacement.join(SIDECAR_NAME), bytes, false)?;
+    }
+    write_json(&replacement.join("identity.json"), &record)?;
+    let sidecar_quarantine = if k_carrier::storage::exists(&cache)? {
+        let meta = fs::symlink_metadata(&cache)?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(invalid("sidecar cache is not an owned directory"));
+        }
+        let destination = cfg.installer_dir.join("quarantine").join(format!(
+            "sidecar-{}-{}",
+            manifest.version,
+            uuid::Uuid::new_v4()
+        ));
+        ensure_dir(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("sidecar quarantine directory missing"))?,
+        )?;
+        k_carrier::storage::rename_durable(&cache, &destination)?;
+        Some(destination)
+    } else {
+        None
+    };
+    ensure_dir(
+        cache
+            .parent()
+            .ok_or_else(|| invalid("sidecar cache directory missing"))?,
+    )?;
+    k_carrier::storage::rename_durable(&replacement, &cache)?;
+    Ok(PreparedArtifact {
+        _directory: directory,
+        path,
+        version: manifest.version.clone(),
+        sidecar_quarantine,
     })
 }
 

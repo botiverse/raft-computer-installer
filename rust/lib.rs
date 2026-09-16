@@ -1,6 +1,7 @@
 //! Product policy for the native Raft Computer installer. K owns the upgrade
 //! transaction; this crate owns release selection and the Computer adapter.
 pub mod artifact;
+pub mod cleanup;
 pub mod cli;
 pub mod computer;
 pub mod config;

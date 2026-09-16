@@ -87,8 +87,12 @@ bytes run from the installation directory, outside K's slots.
 
 K owns `<RAFT_HOME>/computer/k`. The installer keeps its operation records,
 receipts, cached sidecars and recovery files under `<RAFT_HOME>/computer/installer`.
-Repair retains previous state under `quarantine/` and preserves Computer's user
-data and credentials. Installations owned by another package manager are held.
+Repair temporarily retains recovery inputs under `quarantine/` while the result
+is unresolved. After verification and a durable final receipt, the installer
+removes obsolete recovery payloads, downloads and sidecars, retaining only the
+current sidecar and small receipts. Interrupted cleanup resumes on the next
+command. Computer user data and credentials are preserved. Installations owned
+by another package manager are held.
 
 ## Develop
 
@@ -126,3 +130,13 @@ an archive of the complete release.
 
 The bootstrap resolves the installer channel once and downloads all files from
 that immutable release. Static mirrors use the same `native/<target>/` layout.
+
+### Installer channel promotion
+
+Version tags publish prereleases to `alpha` and stable versions to `main`.
+The default bootstrap always resolves the installer's `main` channel, separately
+from the Computer version/channel it will install. To promote an already verified
+release to another installer channel, run the **Promote installer release**
+workflow with its exact tag and destination channel. It reuses the GitHub release
+archive, checks the tag/commit and every asset hash, and downloads the published
+Hands bytes again; it does not rebuild them or advance the Computer channel.

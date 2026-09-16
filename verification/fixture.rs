@@ -37,6 +37,8 @@ struct Behavior {
     start_fail: bool,
     #[serde(default)]
     stop_broken: bool,
+    #[serde(default)]
+    status_unsupported: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -211,6 +213,10 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             }
         }
         Some("status") if args.get(1).map(String::as_str) == Some("--json") => {
+            if behavior.status_unsupported {
+                eprintln!("error: unknown option '--json'");
+                return Ok(1);
+            }
             let live = exchange(&home, "probe");
             let mut answer = json!({"running":live.is_some(),"nextStep":if home.join("fixture-login").exists() { Value::Null } else { json!("run raft-computer login") }});
             if let Some(live) = live {

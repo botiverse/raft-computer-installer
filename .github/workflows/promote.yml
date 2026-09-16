@@ -1,0 +1,61 @@
+name: Promote installer release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing verified GitHub release tag
+        type: string
+        required: true
+      channel:
+        description: Hands destination channel
+        type: choice
+        options: [main, alpha, preview, nightly]
+        required: true
+permissions:
+  contents: read
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download the already verified release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "raft-computer-installer-${RELEASE_TAG}.tar.gz" --dir fetched
+      - name: Verify release identity before publication
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import tomllib
+          tag = os.environ['RELEASE_TAG']
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          if tag != 'v' + version:
+              raise SystemExit('release tag does not match checked-out package')
+          with tarfile.open(Path('fetched') / ('raft-computer-installer-' + tag + '.tar.gz')) as archive:
+              archive.extractall('dist', filter='data')
+          manifest = json.loads(Path('dist/installer-manifest.json').read_text())
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if manifest['installerVersion'] != version or manifest['gitCommit'] != commit:
+              raise SystemExit('release archive does not match the selected tag')
+      - name: Verify every asset, publish to the selected channel, and read back
+        env:
+          HANDS_AUTH_TOKEN: ${{ secrets.HANDS_INSTALLER_DEPLOY_TOKEN }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+        run: >-
+          python scripts/publish.py --publish --channel "$RELEASE_CHANNEL" --version-code "$GITHUB_RUN_ID"
+          --ci-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

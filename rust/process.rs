@@ -74,8 +74,13 @@ pub async fn wait_gone(identities: &[Identity], budget: Duration) -> Result<Vec<
     loop {
         let mut left = Vec::new();
         for identity in identities {
-            if matches(identity)? {
-                left.push(identity.clone());
+            match matches(identity) {
+                Ok(false) => {}
+                // During exit the OS can remove the executable mapping before
+                // exposing a zombie/exited state. Keep waiting within the
+                // existing budget; unobservable never means gone or safe to kill.
+                Ok(true) | Err(Error::Uncertain(_)) => left.push(identity.clone()),
+                Err(error) => return Err(error),
             }
         }
         if left.is_empty() || Instant::now() >= deadline {
@@ -563,5 +568,13 @@ mod tests {
                 .all(|p| p.pid != child.0.id())
         );
         assert!(matches!(matches(&identity), Err(Error::Uncertain(_))));
+        let remaining = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(wait_gone(
+                std::slice::from_ref(&identity),
+                Duration::from_millis(20),
+            ))
+            .unwrap();
+        assert_eq!(remaining, vec![identity]);
     }
 }

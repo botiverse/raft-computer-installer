@@ -1,3 +1,4 @@
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ class InstallerContract(unittest.TestCase):
     def setUpClass(cls):
         cls.server = ReleaseServer()
         for version, behavior in (
+            ("0.9.0", {"statusUnsupported": True, "stopBroken": True}),
             ("1.0.0", {}), ("1.1.0", {}), ("1.2.0", {"startFail": True}),
             ("1.3.0", {"reportedVersion": "9.9.9"}), ("1.4.0", {"stopBroken": True}),
             ("1.5.0", {"liveVersion": "9.9.9"}), ("1.6.0-fixture.1", {}),
@@ -27,6 +29,8 @@ class InstallerContract(unittest.TestCase):
         cls.server.close()
 
     def setUp(self):
+        faulthandler.dump_traceback_later(60, repeat=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.server.requests.clear()
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
@@ -166,6 +170,28 @@ class InstallerContract(unittest.TestCase):
         reply = same.json(["upgrade", "--version", "1.1.0"])
         self.assertEqual(reply["receipt"]["outcome"], "up-to-date")
 
+    def test_legacy_without_status_is_upgraded_by_process_identity(self):
+        for running in (False, True):
+            with self.subTest(running=running):
+                machine, unrelated = self.machine(), self.machine()
+                machine.preinstall("0.9.0", running=running)
+                unrelated.preinstall("0.9.0", running=True)
+                other = unrelated.live()
+                payload = machine.home / "user-data"
+                payload.write_bytes(b"preserve application data")
+                old = machine.live()
+                result = machine.json(["upgrade", "--version", "1.1.0"])
+                self.assertEqual(result["receipt"]["outcome"], "promoted")
+                self.assertEqual(machine.self_version(), "1.1.0")
+                self.assertEqual(machine.live() is not None, running)
+                if running:
+                    self.assertEqual(machine.live()["version"], "1.1.0")
+                    self.assertNotEqual(machine.live()["generation"], old["generation"])
+                    state = json.loads((machine.state / "product-state.json").read_text())
+                    self.assertIn(old["pid"], state["forcedStops"])
+                self.assertEqual(unrelated.live(), other)
+                self.assertEqual(payload.read_bytes(), b"preserve application data")
+
     def test_forced_stop_records_identity_and_leaves_unrelated_service(self):
         machine, other = self.machine(), self.machine()
         machine.preinstall("1.4.0", running=True)
@@ -186,7 +212,7 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.1.0"], expected=2)
         self.assertEqual(machine.binary.read_bytes(), script)
 
-    def test_broken_states_are_preserved_and_repaired(self):
+    def test_broken_states_are_repaired_then_recovery_payloads_are_removed(self):
         def damage_artifact(machine):
             (machine.k / "slots/stable/artifact.bin").unlink()
 
@@ -206,7 +232,7 @@ class InstallerContract(unittest.TestCase):
                 result = machine.json(["install", "--version", "1.1.0"])
                 self.assertEqual(result["receipt"]["outcome"], "repaired")
                 kept = Path(result["receipt"]["detail"]["quarantine"])
-                self.assertTrue((kept / "slots/stable/VERSION").exists())
+                self.assertFalse(kept.exists(), "verified repair must remove old installation copies")
                 self.assertEqual(user_data.read_bytes(), b"synthetic identity to preserve")
                 self.assertEqual(machine.self_version(), "1.1.0")
                 self.assertIsNone(machine.live())
@@ -232,6 +258,93 @@ class InstallerContract(unittest.TestCase):
         self.server.wrong_hash.clear()
         machine.json(["repair", "--version", "1.1.0"])
         self.assertEqual(machine.live()["version"], "1.1.0")
+
+    def test_installer_metadata_damage_is_reported_then_cleaned_after_repair(self):
+        for damaged in ("active", "plan", "receipt"):
+            with self.subTest(damaged=damaged):
+                machine = self.machine()
+                machine.json(["install", "--version", "1.0.0"],
+                    extra={"RAFT_COMPUTER_OPERATION_ID": "original"})
+                active = machine.state / "active.json"
+                active.write_text(json.dumps({"formatVersion": 1, "id": "original"}))
+                paths = {
+                    "active": active,
+                    "plan": machine.state / "operations" / sha(b"original") / "plan.json",
+                    "receipt": machine.state / "receipts" / (sha(b"original") + ".json"),
+                }
+                broken = b"{damaged installer metadata"
+                paths[damaged].parent.mkdir(parents=True, exist_ok=True)
+                paths[damaged].write_bytes(broken)
+                self.server.requests.clear()
+                observed = machine.json(["status"], expected=3)
+                self.assertEqual(observed["world"]["kind"], "broken")
+                self.assertEqual(self.server.requests, [], "status recovery must remain offline")
+                result = machine.json(["repair", "--version", "1.1.0"])
+                self.assertEqual(result["receipt"]["outcome"], "repaired")
+                preserved = Path(result["receipt"]["detail"]["metadataQuarantine"])
+                self.assertFalse(preserved.exists(), "obsolete metadata backup must not accumulate")
+                self.assertFalse((machine.state / "metadata-damage.json").exists())
+                self.assertEqual(machine.json(["status"])["world"]["kind"], "managed")
+                self.assertIsNone(machine.live())
+
+    def test_sidecar_damage_is_repaired_and_obsolete_cache_is_removed(self):
+        for damaged in ("missing", "installed", "identity"):
+            with self.subTest(damaged=damaged):
+                machine = self.machine()
+                machine.json(["install", "--version", "1.0.0"])
+                sidecar = machine.install_dir / "photon_rs_bg.wasm"
+                if damaged == "missing":
+                    sidecar.unlink()
+                elif damaged == "installed":
+                    sidecar.write_bytes(b"damaged sidecar")
+                else:
+                    (machine.state / "sidecars/1.0.0/identity.json").write_bytes(b"{damaged cache")
+                self.assertEqual(machine.json(["status"], expected=3)["world"]["kind"], "broken")
+                result = machine.json(["repair", "--version", "1.0.0"])
+                self.assertEqual(result["receipt"]["outcome"], "repaired")
+                kept = Path(result["receipt"]["detail"]["sidecarQuarantine"])
+                self.assertFalse(kept.exists())
+                self.assertEqual(sidecar.read_bytes(), self.server.sidecar)
+                self.assertIsNone(machine.live())
+
+    def test_unresolved_repair_keeps_payloads_until_verified_replacement(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        (machine.k / "operation.json").write_text("broken")
+        result = machine.json(["repair", "--version", "1.2.0"], expected=3)
+        self.assertEqual(result["receipt"]["outcome"], "unresolved")
+        self.assertTrue((machine.state / "quarantine").exists())
+        self.assertTrue(list((machine.state / "operations").glob("*/artifact.bin")))
+        completed = machine.json(["repair", "--version", "1.1.0", "--allow-downgrade"])
+        self.assertEqual(completed["receipt"]["outcome"], "repaired")
+        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assertFalse((machine.state / "quarantine").exists())
+        self.assertFalse((machine.state / "operations").exists())
+        self.assertFalse((machine.k / "incoming").exists())
+        self.assertEqual(sorted(p.name for p in (machine.state / "sidecars").iterdir()), ["1.1.0"])
+
+    def test_completed_cleanup_retries_without_installing_again(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "cleanup-retry"})
+        current = machine.binary.read_bytes()
+        user_data = machine.home / "user-data"
+        user_data.write_text("keep me")
+        obsolete = [machine.state / "quarantine/old", machine.state / "operations/old",
+            machine.k / "incoming/old", machine.state / "sidecars/0.9.0"]
+        for directory in obsolete:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "payload").write_bytes(b"obsolete")
+        (machine.state / "cleanup.json").write_text(json.dumps({"formatVersion": 1, "receiptId": "cleanup-retry"}))
+        self.server.requests.clear()
+        machine.json(["status"])
+        self.assertEqual(self.server.requests, [], "cleanup must not need the network")
+        self.assertEqual(machine.binary.read_bytes(), current)
+        self.assertEqual(user_data.read_text(), "keep me")
+        self.assertTrue((machine.state / "sidecars/1.0.0").exists())
+        self.assertFalse((machine.state / "cleanup.json").exists())
+        for directory in obsolete:
+            self.assertFalse(directory.exists())
 
     def test_bad_sources_fail_before_publication(self):
         cases = (

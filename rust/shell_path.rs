@@ -1,6 +1,7 @@
 use crate::{Result, config::Config};
+use std::env;
+#[cfg(not(windows))]
 use std::{
-    env,
     fs::{self, OpenOptions},
     io::Write,
 };

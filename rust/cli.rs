@@ -139,6 +139,11 @@ async fn worker(cfg: &Config) -> Result<u8> {
             )
         }
     };
+    // execute() has released the operation gate. Cleanup reacquires it and
+    // does nothing if another operation has started or recovery is unresolved.
+    if crate::cleanup::run(cfg).await.is_err() {
+        eprintln!("Installer cleanup is pending; it will be retried on the next invocation.");
+    }
     reply.validate(&request.id)?;
     let mut bytes = serde_json::to_vec(&reply)?;
     bytes.push(b'\n');
@@ -149,6 +154,9 @@ async fn worker(cfg: &Config) -> Result<u8> {
 }
 
 pub async fn run() -> Result<u8> {
+    // Isolate the launcher too: otherwise its capture pipes can pass through
+    // the worker as extra inherited handles into a resident Windows service.
+    k_carrier::host::isolate_standard_handles()?;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() == 1 && ["--help", "-h", "help"].contains(&args[0].as_str()) {
         print!("{HELP}");
