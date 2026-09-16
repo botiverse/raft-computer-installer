@@ -609,6 +609,66 @@ class InstallerContract(unittest.TestCase):
         broken.json(["install"], expected=1, extra={**extra, "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"})
         self.assertFalse(broken.binary.exists())
 
+    def test_live_waiting_caller_rejects_recovery_rebind(self):
+        self.new_caller_recovery(check_live=True)
+
+    def test_exited_waiting_caller_allows_persisted_recovery_rebind(self):
+        self.new_caller_recovery(check_live=False)
+
+    def new_caller_recovery(self, check_live):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        effect = machine.home / "caller-effect.gate"
+        caller_exit = machine.home / "caller-exit.gate"
+        shared = {"RAFT_COMPUTER_OPERATION_ID": "caller-recovery",
+            "RCI_FIXTURE_INSTALLER": str(self.server.installer),
+            "RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"}
+        first_env = machine.env({**shared, "RCI_FIXTURE_CALLER_EXIT_GATE": str(caller_exit),
+            "RCI_FIXTURE_PUBLISHED_GATE": str(effect),
+            "RCI_FIXTURE_PUBLISHED_PATH": str(machine.binary), "RCI_FIXTURE_PUBLISHED_VERSION": "1.1.0"})
+        command = [str(machine.binary), "upgrade", "--version", "1.1.0", "--json"]
+        original = subprocess.Popen(command, env=first_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def kill(pid):
+            if WINDOWS:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=True, capture_output=True)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        try:
+            wait_for(effect.exists)
+            worker = json.loads((machine.state / "gate/upgrade.lock").read_text())["pid"]
+            launcher = json.loads((machine.home / "fixture-waiting-installer.json").read_text())["pid"]
+            self.assertNotIn(worker, (original.pid, os.getpid()))
+            self.assertNotIn(launcher, (original.pid, os.getpid()))
+            kill(launcher)  # prevent automatic worker replacement
+            kill(worker)
+            effect.with_suffix(".release").touch()
+            wait_for(caller_exit.exists)
+            self.assertIsNone(original.poll(), "the original attested caller must still be alive")
+            state_path = machine.state / "product-state.json"
+            before = state_path.read_bytes()
+            if check_live:
+                denied = subprocess.run(command, env=machine.env(shared), text=True, capture_output=True, timeout=90)
+                self.assertEqual(denied.returncode, 2, denied.stdout + denied.stderr)
+                self.assertEqual(state_path.read_bytes(), before, "live caller rejection must not rebind state")
+            caller_exit.with_suffix(".release").touch()
+            original.communicate(timeout=20)
+            successor = subprocess.Popen(command, env=machine.env(shared), text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = successor.communicate(timeout=120)
+            self.assertEqual(successor.returncode, 1, stdout + stderr)
+            self.assertEqual(json.loads(stdout)["receipt"]["outcome"], "rolled-back")
+            rebound = json.loads(state_path.read_text())["waitingCaller"]
+            self.assertEqual(rebound["pid"], successor.pid, "recovery must persist its newly attested caller")
+            self.assertNotEqual(rebound["created"], json.loads(before)["waitingCaller"]["created"])
+            self.assertEqual(machine.self_version(), "1.0.0")
+            self.assertIsNone(machine.live())
+        finally:
+            effect.with_suffix(".release").touch()
+            caller_exit.with_suffix(".release").touch()
+            if original.poll() is None:
+                original.kill()
+            original.communicate(timeout=20)
+
     def test_worker_kill_recovers_warm_and_cold_handover(self):
         for running in (False, True):
             with self.subTest(running=running):

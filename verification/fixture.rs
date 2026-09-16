@@ -196,7 +196,12 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         // waits for its installer child, while retaining its own image.
         Some("upgrade") => {
             let installer = env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?;
-            let status = Command::new(installer).args(&args).status()?;
+            let mut child = Command::new(installer).args(&args).spawn()?;
+            let identity = raft_computer_installer::process::observe(child.id())?
+                .ok_or("waiting installer identity unavailable")?;
+            write_json(&home.join("fixture-waiting-installer.json"), &identity)?;
+            let status = child.wait()?;
+            gate("RCI_FIXTURE_CALLER_EXIT_GATE")?;
             return Ok(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1));
         }
         Some("__service") => service(&home, &behavior)?,
