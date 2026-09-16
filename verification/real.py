@@ -15,13 +15,14 @@ import urllib.parse
 import urllib.request
 
 from harness import ReleaseServer
+from http_client import public_request
 
 HANDS = "https://hands.build"
 CDN = "https://cdn.raft.build/computer"
 
 
 def read_json(url):
-    with urllib.request.urlopen(url, timeout=60) as response:
+    with urllib.request.urlopen(public_request(url), timeout=60) as response:
         body = response.read(1_048_577)
     if len(body) > 1_048_576:
         raise ValueError("release metadata exceeds its size limit")

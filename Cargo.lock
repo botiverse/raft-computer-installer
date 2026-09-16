@@ -516,7 +516,7 @@ dependencies = [
 [[package]]
 name = "k-carrier"
 version = "0.3.0"
-source = "git+https://github.com/botiverse/k-carrier?rev=c4c38843882df5d94458e0eb56b67ed5d779cbf2#c4c38843882df5d94458e0eb56b67ed5d779cbf2"
+source = "git+https://github.com/botiverse/k-carrier?rev=ea90de9a862c425365c3e4bd797fe514f1972ccb#ea90de9a862c425365c3e4bd797fe514f1972ccb"
 dependencies = [
  "async-trait",
  "base64",

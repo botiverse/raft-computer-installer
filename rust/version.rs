@@ -10,7 +10,9 @@ pub fn normalize(value: &str) -> Result<String> {
 }
 
 pub fn exact(value: &str) -> Result<semver::Version> {
-    if value.len() > 256 { return Err(invalid("invalid release version")); }
+    if value.len() > 256 {
+        return Err(invalid("invalid release version"));
+    }
     semver::Version::parse(value).map_err(|_| invalid("invalid release version"))
 }
 

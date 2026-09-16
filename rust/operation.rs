@@ -1,21 +1,60 @@
 //! One product writer spans preparation, K, publication and repair. The gate
 //! lives outside the directory repair quarantines, and belongs to the worker,
 //! so losing its CLI supervisor cannot release a still-running transaction.
-use crate::{Error, Result, artifact, computer, config::Config, host, presence::{Interaction, Presence}, report::{self, Outcome, Receipt}, request::{Reply, Request}, runner, shell_path, source::{FrozenSource, Manifest, Source}, version, world::{self, World}};
+use crate::{
+    Error, Result, artifact, computer,
+    config::Config,
+    host,
+    presence::{Interaction, Presence},
+    report::{self, Outcome, Receipt},
+    request::{Reply, Request},
+    runner, shell_path,
+    source::{FrozenSource, Manifest, Source},
+    version,
+    world::{self, World},
+};
 use async_trait::async_trait;
-use k_carrier::{artifact::{Release, ReleaseContext, ReleaseSource, sha256, verify}, error::invalid,
-    lock::UpgradeLock, protocol, state::{OperationRead, Slot},
-    storage::{FileStore, ensure_dir, exists, now_ms, sync_dir, write_durable, write_json}};
+use k_carrier::{
+    artifact::{Release, ReleaseContext, ReleaseSource, sha256, verify},
+    error::invalid,
+    lock::UpgradeLock,
+    protocol,
+    state::{OperationRead, Slot},
+    storage::{FileStore, exists, now_ms, sync_dir, write_durable, write_json},
+};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io::Read, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum Kind { Fresh, Adopt, Upgrade, Repair }
+enum Kind {
+    Fresh,
+    Adopt,
+    Upgrade,
+    Repair,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum Phase { Preparing, Ready, Stopping, Quarantining, Seeding, Publishing, Verifying, Setup, Starting, Upgrading, Finished }
+enum Phase {
+    Preparing,
+    Ready,
+    Stopping,
+    Quarantining,
+    Seeding,
+    Publishing,
+    Verifying,
+    Setup,
+    Starting,
+    Upgrading,
+    Finished,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -35,48 +74,83 @@ struct Plan {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Active { format_version: u32, id: String }
+struct Active {
+    format_version: u32,
+    id: String,
+}
 
 struct OfflineSource;
 #[async_trait]
 impl ReleaseSource for OfflineSource {
-    async fn check(&self, _: &ReleaseContext) -> Result<Option<Release>> { Ok(None) }
-    async fn fetch(&self, _: &str, _: &ReleaseContext) -> Result<Release> { Err(invalid("recovery cannot fetch a release")) }
+    async fn check(&self, _: &ReleaseContext) -> Result<Option<Release>> {
+        Ok(None)
+    }
+    async fn fetch(&self, _: &str, _: &ReleaseContext) -> Result<Release> {
+        Err(invalid("recovery cannot fetch a release"))
+    }
 }
 
-fn directory(cfg: &Config, id: &str) -> PathBuf { cfg.installer_dir.join("operations").join(sha256(id.as_bytes())) }
-fn active_path(cfg: &Config) -> PathBuf { cfg.installer_dir.join("active.json") }
-fn plan_path(cfg: &Config, id: &str) -> PathBuf { directory(cfg, id).join("plan.json") }
+fn directory(cfg: &Config, id: &str) -> PathBuf {
+    cfg.installer_dir
+        .join("operations")
+        .join(sha256(id.as_bytes()))
+}
+fn active_path(cfg: &Config) -> PathBuf {
+    cfg.installer_dir.join("active.json")
+}
+fn plan_path(cfg: &Config, id: &str) -> PathBuf {
+    directory(cfg, id).join("plan.json")
+}
 
 fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let mut bytes = Vec::new();
-    fs::File::open(path)?.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 1024 * 1024 { return Err(invalid("installer operation record too large")); }
+    fs::File::open(path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(invalid("installer operation record too large"));
+    }
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn save(cfg: &Config, plan: &Plan) -> Result<()> { write_json(&plan_path(cfg, &plan.request.id), plan) }
+fn save(cfg: &Config, plan: &Plan) -> Result<()> {
+    write_json(&plan_path(cfg, &plan.request.id), plan)
+}
 
 fn read_plan(cfg: &Config, id: &str) -> Result<Plan> {
     let plan: Plan = json(&plan_path(cfg, id))?;
     plan.request.validate()?;
-    if plan.format_version != 1 || plan.request.id != id || plan.manifest.version != plan.manifest.release.version
-        || plan.request.version.as_ref().is_some_and(|v| v != &plan.manifest.version)
-    { return Err(invalid("installer operation identity mismatch")); }
+    if plan.format_version != 1
+        || plan.request.id != id
+        || plan.manifest.version != plan.manifest.release.version
+        || plan
+            .request
+            .version
+            .as_ref()
+            .is_some_and(|v| v != &plan.manifest.version)
+    {
+        return Err(invalid("installer operation identity mismatch"));
+    }
     version::exact(&plan.manifest.version)?;
     plan.manifest.release.validate()?;
     Ok(plan)
 }
 
 fn active(cfg: &Config) -> Result<Option<Plan>> {
-    if !exists(&active_path(cfg))? { return Ok(None); }
+    if !exists(&active_path(cfg))? {
+        return Ok(None);
+    }
     let active: Active = json(&active_path(cfg))?;
-    if active.format_version != 1 { return Err(invalid("unsupported installer operation format")); }
+    if active.format_version != 1 {
+        return Err(invalid("unsupported installer operation format"));
+    }
     read_plan(cfg, &active.id).map(Some)
 }
 
 fn clear_active(cfg: &Config, id: &str) -> Result<()> {
-    if !exists(&active_path(cfg))? { return Ok(()); }
+    if !exists(&active_path(cfg))? {
+        return Ok(());
+    }
     let current: Active = json(&active_path(cfg))?;
     if current.id == id {
         fs::remove_file(active_path(cfg))?;
@@ -85,17 +159,44 @@ fn clear_active(cfg: &Config, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn receipt(request: &Request, target: Option<String>, from: Option<String>, outcome: Outcome, line: String) -> Receipt {
+fn receipt(
+    request: &Request,
+    target: Option<String>,
+    from: Option<String>,
+    outcome: Outcome,
+    line: String,
+) -> Receipt {
     Receipt {
-        protocol: "raft-computer-installer/v3".into(), installer_version: env!("CARGO_PKG_VERSION").into(),
-        id: request.id.clone(), operation: request.command.clone(), presence: request.presence,
-        target_version: target, from_version: from, approved_by: Some(request.approved_by.clone()),
-        outcome, exit_code: outcome.exit_code(), line, next_step: None, finished_at_ms: 0, detail: BTreeMap::new(),
+        protocol: "raft-computer-installer/v3".into(),
+        installer_version: env!("CARGO_PKG_VERSION").into(),
+        id: request.id.clone(),
+        operation: request.command.clone(),
+        presence: request.presence,
+        target_version: target,
+        from_version: from,
+        approved_by: Some(request.approved_by.clone()),
+        outcome,
+        exit_code: outcome.exit_code(),
+        line,
+        next_step: None,
+        finished_at_ms: 0,
+        detail: BTreeMap::new(),
     }
 }
 
-fn finish(cfg: &Config, plan: &mut Plan, outcome: Outcome, line: impl Into<String>) -> Result<Reply> {
-    let mut result = receipt(&plan.request, Some(plan.manifest.version.clone()), plan.from_version.clone(), outcome, line.into());
+fn finish(
+    cfg: &Config,
+    plan: &mut Plan,
+    outcome: Outcome,
+    line: impl Into<String>,
+) -> Result<Reply> {
+    let mut result = receipt(
+        &plan.request,
+        Some(plan.manifest.version.clone()),
+        plan.from_version.clone(),
+        outcome,
+        line.into(),
+    );
     result.detail = plan.detail.clone();
     result.next_step = plan.next_step.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
@@ -110,10 +211,12 @@ fn finish(cfg: &Config, plan: &mut Plan, outcome: Outcome, line: impl Into<Strin
 
 async fn settle_k(cfg: &Config) -> Result<()> {
     // A settled K receipt must not restart a service the user later stopped.
-    if let OperationRead::Observed { operation } = FileStore::new(&cfg.k_state).read_operation() {
-        if operation.outcome.is_none() {
-            runner::create(cfg.clone(), Arc::new(OfflineSource), false)?.recover(None).await?;
-        }
+    if let OperationRead::Observed { operation } = FileStore::new(&cfg.k_state).read_operation()
+        && operation.outcome.is_none()
+    {
+        runner::create(cfg.clone(), Arc::new(OfflineSource), false)?
+            .recover(None)
+            .await?;
     }
     Ok(())
 }
@@ -121,48 +224,100 @@ async fn settle_k(cfg: &Config) -> Result<()> {
 fn cached_artifact(cfg: &Config, plan: &Plan) -> Result<PathBuf> {
     let path = directory(cfg, &plan.request.id).join("artifact.bin");
     let bytes = fs::read(&path)?;
-    verify(&bytes, plan.manifest.release.size, &plan.manifest.release.sha256)?;
+    verify(
+        &bytes,
+        plan.manifest.release.size,
+        &plan.manifest.release.sha256,
+    )?;
     artifact::check_platform(&bytes)?;
     artifact::saved_sidecar(cfg, &plan.manifest.version)?;
     Ok(path)
 }
 
-fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> { plan.phase = phase; save(cfg, plan) }
+fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
+    plan.phase = phase;
+    save(cfg, plan)
+}
 
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
-        if recovery { return finish(cfg, plan, Outcome::Failed, "Installation was interrupted before the upgrade started. Run the installer again."); }
+        if recovery {
+            return finish(
+                cfg,
+                plan,
+                Outcome::Failed,
+                "Installation was interrupted before the upgrade started. Run the installer again.",
+            );
+        }
         artifact::acquire_sidecar(cfg, &plan.manifest).await?;
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
-        let from = plan.from_version.as_ref().ok_or_else(|| invalid("adoption has no source version"))?;
+        let from = plan
+            .from_version
+            .as_ref()
+            .ok_or_else(|| invalid("adoption has no source version"))?;
         artifact::adopt_installed_sidecar(cfg, from)?;
-        if plan.kind == Kind::Adopt { FileStore::new(&cfg.k_state).bootstrap_locked(from, &cfg.binary)?; }
+        if plan.kind == Kind::Adopt {
+            FileStore::new(&cfg.k_state).bootstrap_locked(from, &cfg.binary)?;
+        }
         transition(cfg, plan, Phase::Upgrading)?;
     }
     let store = FileStore::new(&cfg.k_state);
-    let runner = runner::create(cfg.clone(), Arc::new(FrozenSource(plan.manifest.clone())), plan.request.allow_downgrade)?;
+    let runner = runner::create(
+        cfg.clone(),
+        Arc::new(FrozenSource(plan.manifest.clone())),
+        plan.request.allow_downgrade,
+    )?;
     let response = if recovery {
         match store.read_operation() {
-            OperationRead::Observed { operation } if operation.id == plan.request.id && operation.target_version == plan.manifest.version => {
-                runner.execute(&protocol::Request::Recover { protocol_version: 1,
-                    expected: Some(protocol::Expected { id: plan.request.id.clone(), target_version: plan.manifest.version.clone() }) }).await?
-            },
-            _ => return finish(cfg, plan, Outcome::Failed, "Installation was interrupted before the upgrade transaction started. Run the installer again."),
+            OperationRead::Observed { operation }
+                if operation.id == plan.request.id
+                    && operation.target_version == plan.manifest.version =>
+            {
+                runner
+                    .execute(&protocol::Request::Recover {
+                        protocol_version: 1,
+                        expected: Some(protocol::Expected {
+                            id: plan.request.id.clone(),
+                            target_version: plan.manifest.version.clone(),
+                        }),
+                    })
+                    .await?
+            }
+            _ => {
+                return finish(
+                    cfg,
+                    plan,
+                    Outcome::Failed,
+                    "Installation was interrupted before the upgrade transaction started. Run the installer again.",
+                );
+            }
         }
     } else {
-        runner.execute(&protocol::Request::Upgrade { protocol_version: 1, id: plan.request.id.clone(),
-            target_version: plan.manifest.version.clone(), consented: true }).await?
+        runner
+            .execute(&protocol::Request::Upgrade {
+                protocol_version: 1,
+                id: plan.request.id.clone(),
+                target_version: plan.manifest.version.clone(),
+                consented: true,
+            })
+            .await?
     };
     let OperationRead::Observed { operation } = response.operation else {
-        return Err(Error::Uncertain("upgrade returned no readable operation receipt".into()));
+        return Err(Error::Uncertain(
+            "upgrade returned no readable operation receipt".into(),
+        ));
     };
     if operation.id != plan.request.id || operation.target_version != plan.manifest.version {
-        return Err(Error::Uncertain("upgrade returned a different operation receipt".into()));
+        return Err(Error::Uncertain(
+            "upgrade returned a different operation receipt".into(),
+        ));
     }
-    let Some(outcome) = operation.outcome else { return Err(Error::Uncertain("upgrade still requires recovery".into())); };
+    let Some(outcome) = operation.outcome else {
+        return Err(Error::Uncertain("upgrade still requires recovery".into()));
+    };
     let outcome = match outcome {
         k_carrier::state::Outcome::Promoted => Outcome::Promoted,
         k_carrier::state::Outcome::RolledBack => Outcome::RolledBack,
@@ -170,37 +325,82 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         k_carrier::state::Outcome::Held => Outcome::Held,
         k_carrier::state::Outcome::Failed => Outcome::Failed,
     };
-    if let Some(reason) = operation.reason { plan.detail.insert("reason".into(), reason); }
+    if let Some(reason) = operation.reason {
+        plan.detail.insert("reason".into(), reason);
+    }
     if let Ok(state) = host::read(cfg) {
-        plan.detail.insert("readback".into(), if state.running { "service" } else { "candidate" }.into());
+        plan.detail.insert(
+            "readback".into(),
+            if state.running {
+                "service"
+            } else {
+                "candidate"
+            }
+            .into(),
+        );
         plan.next_step = state.next_step;
     }
     let target = &plan.manifest.version;
     let line = match outcome {
         Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
-        Outcome::RolledBack => format!("{target} failed its checks; {} was restored.", operation.from_version),
+        Outcome::RolledBack => format!(
+            "{target} failed its checks; {} was restored.",
+            operation.from_version
+        ),
         Outcome::UpToDate => format!("{target} is already installed."),
-        Outcome::Held => "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into(),
-        _ => format!("Could not upgrade to {target}. Run raft-computer-installer status for the current state."),
+        Outcome::Held => {
+            "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
+        }
+        _ => format!(
+            "Could not upgrade to {target}. Run raft-computer-installer status for the current state."
+        ),
     };
     finish(cfg, plan, outcome, line)
 }
 
-async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &Interaction) -> Result<Reply> {
+async fn install(
+    cfg: &Config,
+    plan: &mut Plan,
+    recovery: bool,
+    interaction: &Interaction,
+) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
-        if recovery { return finish(cfg, plan, Outcome::Failed, "Installation was interrupted before changing installed files. Run the installer again."); }
+        if recovery {
+            return finish(
+                cfg,
+                plan,
+                Outcome::Failed,
+                "Installation was interrupted before changing installed files. Run the installer again.",
+            );
+        }
         let candidate = artifact::acquire(cfg, &plan.manifest).await?;
-        write_durable(&directory(cfg, &plan.request.id).join("artifact.bin"), &fs::read(candidate.path)?, true)?;
+        write_durable(
+            &directory(cfg, &plan.request.id).join("artifact.bin"),
+            &fs::read(candidate.path)?,
+            true,
+        )?;
         transition(cfg, plan, Phase::Ready)?;
     }
     // All later phases can finish using local, verified bytes only.
     let candidate = cached_artifact(cfg, plan)?;
     if plan.phase == Phase::Ready {
         let answer = host::answer(cfg).await?;
-        let prior = if plan.inherited_unresolved { host::read(cfg).ok() } else { None };
+        let prior = if plan.inherited_unresolved {
+            host::read(cfg).ok()
+        } else {
+            None
+        };
         plan.running = Some(prior.map_or(answer.running, |state| state.running));
         plan.next_step = answer.next_step;
-        transition(cfg, plan, if plan.kind == Kind::Repair { Phase::Stopping } else { Phase::Seeding })?;
+        transition(
+            cfg,
+            plan,
+            if plan.kind == Kind::Repair {
+                Phase::Stopping
+            } else {
+                Phase::Seeding
+            },
+        )?;
     }
     if plan.phase == Phase::Stopping {
         // The K writer lock is held while the old controller and product effects
@@ -212,26 +412,45 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &In
             // A crashed helper might have left its native CLI child behind.
             // Explicit repair stops these verified product instances before
             // issuing a new graceful service-manager stop command.
-            forced.extend(crate::process::terminate(&crate::process::installed(&cfg.binary)?).await?);
+            forced
+                .extend(crate::process::terminate(&crate::process::installed(&cfg.binary)?).await?);
         }
         forced.extend(host::stop_product(cfg).await?);
         if let Some(path) = computer::preserve_commands_after_stop(cfg, &plan.request.id).await? {
-            plan.detail.insert("commandQuarantine".into(), path.to_string_lossy().into_owned());
+            plan.detail.insert(
+                "commandQuarantine".into(),
+                path.to_string_lossy().into_owned(),
+            );
         }
-        plan.detail.insert("forcedStops".into(), serde_json::to_string(&forced)?);
+        plan.detail
+            .insert("forcedStops".into(), serde_json::to_string(&forced)?);
         transition(cfg, plan, Phase::Quarantining)?;
     }
     if plan.phase == Phase::Quarantining {
-        let destination = cfg.installer_dir.join("quarantine").join(sha256(plan.request.id.as_bytes()));
+        let destination = cfg
+            .installer_dir
+            .join("quarantine")
+            .join(sha256(plan.request.id.as_bytes()));
         let proof = || -> Result<()> {
             if !crate::process::installed(&cfg.binary)?.is_empty() {
-                return Err(Error::Uncertain("product is still active before quarantine".into()));
+                return Err(Error::Uncertain(
+                    "product is still active before quarantine".into(),
+                ));
             }
             Ok(())
         };
         proof()?;
-        let kept = k_carrier::quarantine::quarantine_state(&cfg.k_state, &destination, now_ms(), true, Some(&proof))?;
-        plan.detail.insert("quarantine".into(), kept.receipt.quarantine_path.to_string_lossy().into_owned());
+        let kept = k_carrier::quarantine::quarantine_state(
+            &cfg.k_state,
+            &destination,
+            now_ms(),
+            true,
+            Some(&proof),
+        )?;
+        plan.detail.insert(
+            "quarantine".into(),
+            kept.receipt.quarantine_path.to_string_lossy().into_owned(),
+        );
         transition(cfg, plan, Phase::Seeding)?;
     }
     if plan.phase == Phase::Seeding {
@@ -240,34 +459,54 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &In
         store.bootstrap_locked(&plan.manifest.version, &candidate)?;
         if store.version(Slot::Stable)?.as_deref() != Some(plan.manifest.version.as_str())
             || sha256(&fs::read(store.artifact(Slot::Stable))?) != plan.manifest.release.sha256
-        { return Err(Error::Uncertain("bootstrap stable does not match the selected release".into())); }
+        {
+            return Err(Error::Uncertain(
+                "bootstrap stable does not match the selected release".into(),
+            ));
+        }
         transition(cfg, plan, Phase::Publishing)?;
     }
     if plan.phase == Phase::Publishing {
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
         if !crate::process::installed(&cfg.binary)?.is_empty() {
-            return Err(Error::Uncertain("product became active before publication".into()));
+            return Err(Error::Uncertain(
+                "product became active before publication".into(),
+            ));
         }
         host::publish(cfg, Slot::Stable)?;
         transition(cfg, plan, Phase::Verifying)?;
     }
     if plan.phase == Phase::Verifying {
         if computer::self_report(&cfg.binary, cfg).await?.version != plan.manifest.version {
-            return Err(Error::Uncertain("published program did not report the selected version".into()));
+            return Err(Error::Uncertain(
+                "published program did not report the selected version".into(),
+            ));
         }
-        if let Some(hint) = shell_path::ensure(cfg).await? { plan.detail.insert("pathHint".into(), hint); }
+        if let Some(hint) = shell_path::ensure(cfg).await? {
+            plan.detail.insert("pathHint".into(), hint);
+        }
         let status = computer::status(cfg).await.ok();
         plan.next_step = status.as_ref().and_then(|s| s.next_step.clone());
-        if status.is_none() { plan.next_step = Some("Run raft-computer status to check first setup.".into()); }
-        if plan.next_step.is_some() && status.is_some() && plan.request.presence == Presence::Attended && !recovery {
+        if status.is_none() {
+            plan.next_step = Some("Run raft-computer status to check first setup.".into());
+        }
+        if plan.next_step.is_some()
+            && status.is_some()
+            && plan.request.presence == Presence::Attended
+            && !recovery
+        {
             transition(cfg, plan, Phase::Setup)?;
             plan.setup_succeeded = computer::first_setup(cfg, interaction).await?;
             // Setup is intentionally not retried after a worker crash.
             transition(cfg, plan, Phase::Starting)?;
-        } else { transition(cfg, plan, Phase::Starting)?; }
+        } else {
+            transition(cfg, plan, Phase::Starting)?;
+        }
     }
     if plan.phase == Phase::Setup {
-        plan.setup_succeeded = computer::status(cfg).await.is_ok_and(|s| s.next_step.is_none());
+        plan.setup_succeeded = computer::status(cfg)
+            .await
+            .is_ok_and(|s| s.next_step.is_none());
         transition(cfg, plan, Phase::Starting)?;
     }
     if plan.phase == Phase::Starting {
@@ -276,30 +515,65 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &In
                 Ok(evidence) => evidence,
                 Err(_) => host::start_product(cfg).await?,
             };
-            if evidence.version != plan.manifest.version { return Err(Error::Uncertain("installed service reports a different version".into())); }
+            if evidence.version != plan.manifest.version {
+                return Err(Error::Uncertain(
+                    "installed service reports a different version".into(),
+                ));
+            }
             plan.detail.insert("readback".into(), "service".into());
         } else {
             if !crate::process::installed(&cfg.binary)?.is_empty() {
-                return Err(Error::Uncertain("a stopped installation unexpectedly started".into()));
+                return Err(Error::Uncertain(
+                    "a stopped installation unexpectedly started".into(),
+                ));
             }
             plan.detail.insert("readback".into(), "candidate".into());
         }
-        if let Ok(status) = computer::status(cfg).await { plan.next_step = status.next_step; }
-        let outcome = if plan.kind == Kind::Repair { Outcome::Repaired } else { Outcome::Installed };
-        let mut line = format!("{} {}.", if plan.kind == Kind::Repair { "Reinstalled" } else { "Installed" }, plan.manifest.version);
-        if let Some(hint) = &plan.next_step { line.push_str(&format!(" Next: {hint}")); }
-        if let Some(hint) = plan.detail.get("pathHint") { line.push(' '); line.push_str(hint); }
+        if let Ok(status) = computer::status(cfg).await {
+            plan.next_step = status.next_step;
+        }
+        let outcome = if plan.kind == Kind::Repair {
+            Outcome::Repaired
+        } else {
+            Outcome::Installed
+        };
+        let mut line = format!(
+            "{} {}.",
+            if plan.kind == Kind::Repair {
+                "Reinstalled"
+            } else {
+                "Installed"
+            },
+            plan.manifest.version
+        );
+        if let Some(hint) = &plan.next_step {
+            line.push_str(&format!(" Next: {hint}"));
+        }
+        if let Some(hint) = plan.detail.get("pathHint") {
+            line.push(' ');
+            line.push_str(hint);
+        }
         return finish(cfg, plan, outcome, line);
     }
     Err(invalid("unexpected installer operation phase"))
 }
 
-async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &Interaction) -> Result<Reply> {
-    if let Some(old) = report::read(cfg, &plan.request.id)? {
-        if old.outcome != Outcome::Unresolved { clear_active(cfg, &plan.request.id)?; return Ok(Reply::receipt(old)); }
+async fn resume(
+    cfg: &Config,
+    plan: &mut Plan,
+    recovery: bool,
+    interaction: &Interaction,
+) -> Result<Reply> {
+    if let Some(old) = report::read(cfg, &plan.request.id)?
+        && old.outcome != Outcome::Unresolved
+    {
+        clear_active(cfg, &plan.request.id)?;
+        return Ok(Reply::receipt(old));
     }
     // Every recovery waits for product commands that outlived its predecessor.
-    if recovery && !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping)) {
+    if recovery
+        && !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping))
+    {
         computer::fence(cfg).await?;
     }
     let result = match plan.kind {
@@ -311,14 +585,32 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &Int
         Err(error) => {
             plan.detail.insert("error".into(), error.to_string());
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
-            finish(cfg, plan, if untouched { Outcome::Failed } else { Outcome::Unresolved },
-                if untouched { "Could not prepare the installation. Installed files were not changed." }
-                else { "Installation requires recovery. Run raft-computer-installer recover or status." })
-        },
+            finish(
+                cfg,
+                plan,
+                if untouched {
+                    Outcome::Failed
+                } else {
+                    Outcome::Unresolved
+                },
+                if untouched {
+                    "Could not prepare the installation. Installed files were not changed."
+                } else {
+                    "Installation requires recovery. Run raft-computer-installer recover or status."
+                },
+            )
+        }
     }
 }
 
-fn reject(cfg: &Config, request: &Request, target: Option<String>, from: Option<String>, unresolved: bool, line: &str) -> Result<Reply> {
+fn reject(
+    cfg: &Config,
+    request: &Request,
+    target: Option<String>,
+    from: Option<String>,
+    unresolved: bool,
+    line: &str,
+) -> Result<Reply> {
     let mut result = receipt(request, target, from, Outcome::Held, line.into());
     result.preserve_unresolved(unresolved);
     Ok(Reply::receipt(result.finish(cfg)?))
@@ -328,26 +620,59 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     request.validate()?;
     let _gate = match UpgradeLock::acquire(&cfg.installer_dir.join("gate")) {
         Ok(gate) => gate,
-        Err(Error::Locked(_)) => return Ok(Reply::plain(&request.id, 2, "Another installer is running on this machine.")),
+        Err(Error::Locked(_)) => {
+            return Ok(Reply::plain(
+                &request.id,
+                2,
+                "Another installer is running on this machine.",
+            ));
+        }
         Err(error) => return Err(error),
     };
-    let mut interaction = Interaction::for_presence(if request.recovery_only { Presence::Unattended } else { request.presence })?;
+    let mut interaction = Interaction::for_presence(if request.recovery_only {
+        Presence::Unattended
+    } else {
+        request.presence
+    })?;
     if let Some(old) = report::read(cfg, &request.id)? {
-        if request.command != "status" && (request.version.as_ref().is_some_and(|v| Some(v) != old.target_version.as_ref())
-            || (request.command != "recover" && request.command != old.operation)) {
-            return Ok(Reply::plain(&request.id, 2, "This request ID already belongs to a different operation."));
+        if request.command != "status"
+            && (request
+                .version
+                .as_ref()
+                .is_some_and(|v| Some(v) != old.target_version.as_ref())
+                || (request.command != "recover" && request.command != old.operation))
+        {
+            return Ok(Reply::plain(
+                &request.id,
+                2,
+                "This request ID already belongs to a different operation.",
+            ));
         }
-        if request.command != "status" && old.outcome != Outcome::Unresolved { return Ok(Reply::receipt(old)); }
+        if request.command != "status" && old.outcome != Outcome::Unresolved {
+            return Ok(Reply::receipt(old));
+        }
     }
     let mut unresolved = false;
     if let Some(mut previous) = active(cfg)? {
         let same = previous.request.id == request.id;
-        if same && !["status", "recover"].contains(&request.command.as_str())
-            && (previous.request.command != request.command || request.version.as_ref().is_some_and(|v| v != &previous.manifest.version)) {
-            return Ok(Reply::plain(&request.id, 2, "This request ID already belongs to a different operation."));
+        if same
+            && !["status", "recover"].contains(&request.command.as_str())
+            && (previous.request.command != request.command
+                || request
+                    .version
+                    .as_ref()
+                    .is_some_and(|v| v != &previous.manifest.version))
+        {
+            return Ok(Reply::plain(
+                &request.id,
+                2,
+                "This request ID already belongs to a different operation.",
+            ));
         }
         let resumed = resume(cfg, &mut previous, true, &interaction).await;
-        if same && request.command != "status" { return resumed; }
+        if same && request.command != "status" {
+            return resumed;
+        }
         unresolved = resumed.as_ref().map_or(true, |reply| reply.exit_code == 3);
     }
     // A failed recovery may retain K's claim until worker exit. Record that it
@@ -356,18 +681,30 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     let settlement = directory(cfg, &request.id).join("settlement-failed.json");
     if exists(&settlement)? {
         let saved: Request = json(&settlement)?;
-        if saved.id != request.id || saved.command != request.command || saved.version != request.version || saved.channel != request.channel {
+        if saved.id != request.id
+            || saved.command != request.command
+            || saved.version != request.version
+            || saved.channel != request.channel
+        {
             return Err(invalid("settlement request identity conflict"));
         }
         unresolved = true;
-    } else if !unresolved {
-        if let Err(error) = settle_k(cfg).await {
-            if let Error::Locked(_) = error { return Ok(Reply::plain(&request.id, 2, "Another upgrade is running on this machine.")); }
-            unresolved = true;
-            write_json(&settlement, request)?;
-            if error.is_uncertain() {
-                return Ok(Reply::plain(&request.id, 3, "An earlier upgrade could not be recovered yet."));
-            }
+    } else if !unresolved && let Err(error) = settle_k(cfg).await {
+        if let Error::Locked(_) = error {
+            return Ok(Reply::plain(
+                &request.id,
+                2,
+                "Another upgrade is running on this machine.",
+            ));
+        }
+        unresolved = true;
+        write_json(&settlement, request)?;
+        if error.is_uncertain() {
+            return Ok(Reply::plain(
+                &request.id,
+                3,
+                "An earlier upgrade could not be recovered yet.",
+            ));
         }
     }
     let observed = world::read(cfg).await?;
@@ -376,57 +713,142 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         let answer = host::answer(cfg).await?;
         let (code, line) = match &observed {
             World::Fresh => (0, "Nothing is installed.".into()),
-            World::Managed { version } | World::Adopted { version } if !unresolved => (0, format!("{version} is installed and {}.", if answer.running { "running" } else { "stopped" })),
+            World::Managed { version } | World::Adopted { version } if !unresolved => (
+                0,
+                format!(
+                    "{version} is installed and {}.",
+                    if answer.running { "running" } else { "stopped" }
+                ),
+            ),
             World::Held { reason } => (2, format!("Not done: {reason}.")),
-            _ => (3, "Installation requires repair. Run raft-computer-installer install.".into()),
+            _ => (
+                3,
+                "Installation requires repair. Run raft-computer-installer install.".into(),
+            ),
         };
         let mut reply = Reply::plain(&request.id, code, line);
         reply.world = Some(observed);
         return Ok(reply);
     }
     if let World::Held { .. } = &observed {
-        return reject(cfg, request, request.version.clone(), None, unresolved, "This installation belongs to another manager. Use that manager or a different install directory.");
+        return reject(
+            cfg,
+            request,
+            request.version.clone(),
+            None,
+            unresolved,
+            "This installation belongs to another manager. Use that manager or a different install directory.",
+        );
     }
     let broken = unresolved || matches!(observed, World::Broken { .. } | World::Upgrading { .. });
     if request.command == "repair" && !broken {
-        return reject(cfg, request, request.version.clone(), observed.version().map(str::to_owned), false, "This installation does not need repair. Use install or upgrade.");
+        return reject(
+            cfg,
+            request,
+            request.version.clone(),
+            observed.version().map(str::to_owned),
+            false,
+            "This installation does not need repair. Use install or upgrade.",
+        );
     }
     if request.recovery_only && !exists(&settlement)? {
-        return Ok(Reply::plain(&request.id, if unresolved { 3 } else { 1 }, "The request was interrupted before a recoverable installation started. Run the installer again."));
+        return Ok(Reply::plain(
+            &request.id,
+            if unresolved { 3 } else { 1 },
+            "The request was interrupted before a recoverable installation started. Run the installer again.",
+        ));
     }
     let source = Source::new(cfg)?;
     let manifest = match &request.version {
         Some(version) => source.manifest(version).await,
-        None => source.resolve(request.channel.as_deref().unwrap_or("main")).await,
+        None => {
+            source
+                .resolve(request.channel.as_deref().unwrap_or("main"))
+                .await
+        }
     };
     let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(error) => {
-            let mut result = receipt(request, request.version.clone(), observed.version().map(str::to_owned), Outcome::Failed, "Could not resolve the requested release. Run the installer again.".into());
+            let mut result = receipt(
+                request,
+                request.version.clone(),
+                observed.version().map(str::to_owned),
+                Outcome::Failed,
+                "Could not resolve the requested release. Run the installer again.".into(),
+            );
             result.detail.insert("error".into(), error.to_string());
             result.preserve_unresolved(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));
-        },
+        }
     };
     let from = observed.version().map(str::to_owned);
-    if !request.allow_downgrade && from.as_ref().is_some_and(|v| version::compare(&manifest.version, v).is_ok_and(|order| order.is_lt())) {
-        return reject(cfg, request, Some(manifest.version), from, unresolved, "The selected version is older. Add --allow-downgrade to install it.");
+    if !request.allow_downgrade
+        && from.as_ref().is_some_and(|v| {
+            version::compare(&manifest.version, v).is_ok_and(|order| order.is_lt())
+        })
+    {
+        return reject(
+            cfg,
+            request,
+            Some(manifest.version),
+            from,
+            unresolved,
+            "The selected version is older. Add --allow-downgrade to install it.",
+        );
     }
     if request.presence == Presence::Attended && !request.yes {
-        if request.recovery_only { interaction = Interaction::for_presence(Presence::Attended)?; }
-        let question = if broken { format!("Reinstall {}? The previous installation will be kept aside; repair cannot be rolled back.", manifest.version) }
-            else { format!("Install {} on this machine?", manifest.version) };
+        if request.recovery_only {
+            interaction = Interaction::for_presence(Presence::Attended)?;
+        }
+        let question = if broken {
+            format!(
+                "Reinstall {}? The previous installation will be kept aside; repair cannot be rolled back.",
+                manifest.version
+            )
+        } else {
+            format!("Install {} on this machine?", manifest.version)
+        };
         if !interaction.ask(&question)? {
-            return reject(cfg, request, Some(manifest.version), from, unresolved, "Installation declined.");
+            return reject(
+                cfg,
+                request,
+                Some(manifest.version),
+                from,
+                unresolved,
+                "Installation declined.",
+            );
         }
     }
-    let kind = if broken { Kind::Repair } else {
-        match observed { World::Fresh => Kind::Fresh, World::Adopted { .. } => Kind::Adopt, _ => Kind::Upgrade }
+    let kind = if broken {
+        Kind::Repair
+    } else {
+        match observed {
+            World::Fresh => Kind::Fresh,
+            World::Adopted { .. } => Kind::Adopt,
+            _ => Kind::Upgrade,
+        }
     };
-    let mut plan = Plan { format_version: 1, request: request.clone(), manifest, kind, phase: Phase::Preparing,
-        from_version: from, inherited_unresolved: unresolved, running: None, setup_succeeded: false,
-        next_step: None, detail: BTreeMap::new() };
+    let mut plan = Plan {
+        format_version: 1,
+        request: request.clone(),
+        manifest,
+        kind,
+        phase: Phase::Preparing,
+        from_version: from,
+        inherited_unresolved: unresolved,
+        running: None,
+        setup_succeeded: false,
+        next_step: None,
+        detail: BTreeMap::new(),
+    };
     save(cfg, &plan)?;
-    write_json(&active_path(cfg), &Active { format_version: 1, id: request.id.clone() })?;
+    write_json(
+        &active_path(cfg),
+        &Active {
+            format_version: 1,
+            id: request.id.clone(),
+        },
+    )?;
     resume(cfg, &mut plan, false, &interaction).await
 }

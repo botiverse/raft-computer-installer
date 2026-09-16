@@ -2,18 +2,15 @@
 
 The drivers use Python's standard library and real Rust executables. There is no
 Node runtime, package install, JS wrapper or source-text assertion in the core
-verification path. These are implementation entry points, **not passing evidence**:
-the migration has not reached its consolidated build/test phase yet.
-
-After the overall three-party implementation is complete, run against the
-committed `Cargo.lock`:
+verification path. Run against the committed `Cargo.lock`; source entry points
+alone do not prove a platform passed:
 
 ```sh
 python3 scripts/verify.py
 python3 scripts/verify.py --real
 ```
 
-The driver collects formatting, Clippy and Python syntax failures, builds the
+The driver collects formatting, Clippy, Rust behavior and Python syntax failures, builds the
 installer and fixture, then runs every runnable native scenario. A failed build
 blocks process scenarios and is reported as such. Consolidate failures by root
 cause, finish the whole repair batch, then rerun failed and affected checks. Do
@@ -54,6 +51,13 @@ prove authenticated live-service behavior. Fixture lifecycle tests prove actual
 process behavior against the fixture contract; they do not replace real product
 or target-platform verification. A failed real-product cleanup retains its own
 temporary home for inspection instead of deleting state underneath a service.
+
+Linux's Rust process test creates a same-user non-dumpable child. Inventory must
+skip its inaccessible executable while a previously recorded identity remains
+unresolved, never falsely declared exited. Native protocol tests repeatedly
+exercise short-lived worker/controller responses and preserve uncertain host
+results. Publisher tests verify immutable redirects, byte identity and separate
+public requests from authenticated API calls.
 
 ## Evidence and cleanup
 

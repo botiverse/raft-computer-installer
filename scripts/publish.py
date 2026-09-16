@@ -18,6 +18,8 @@ import uuid
 
 from build import ROOT, TARGETS, identity
 
+from http_client import USER_AGENT, public_request
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, newurl):
@@ -38,7 +40,7 @@ class Hands:
             raise ValueError("invalid API path")
         data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
         request = urllib.request.Request(self.origin + path, data=data,
-            headers={"Authorization": "Bearer " + self.token, "Content-Type": content_type, "Accept": "application/json"})
+            headers={"User-Agent": USER_AGENT, "Authorization": "Bearer " + self.token, "Content-Type": content_type, "Accept": "application/json"})
         try:
             with self.opener.open(request, timeout=180) as response:
                 return json.load(response)
@@ -89,7 +91,7 @@ def readback(origin, app, channel, release_id, files):
         target = metadata["metadata_json"]["target"]
         url = f"{origin}/dl/{app}/{urllib.parse.quote(channel, safe='')}/{target}"
         try:
-            urllib.request.build_opener(NoRedirect()).open(url, timeout=30)
+            urllib.request.build_opener(NoRedirect()).open(public_request(url), timeout=30)
             raise RuntimeError("public channel did not redirect to an immutable release")
         except urllib.error.HTTPError as error:
             if error.code not in (301, 302, 303, 307, 308):
@@ -102,7 +104,7 @@ def readback(origin, app, channel, release_id, files):
         for suffix, local in (("", path), ("?kind=sha256sums", path.parent / "SHA256SUMS")):
             expected = identity(local)
             digest, size = hashlib.sha256(), 0
-            with urllib.request.urlopen(release_url + suffix, timeout=180) as response:
+            with urllib.request.urlopen(public_request(release_url + suffix), timeout=180) as response:
                 for block in iter(lambda: response.read(1024 * 1024), b""):
                     digest.update(block)
                     size += len(block)

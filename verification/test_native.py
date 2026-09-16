@@ -42,6 +42,30 @@ class InstallerContract(unittest.TestCase):
         self.addCleanup(machine.close)
         return machine
 
+    def test_short_lived_protocol_replies_are_flushed(self):
+        machine = self.machine()
+        for _ in range(20):
+            # These tiny responses race process::exit unless the same stdout
+            # instance is flushed before the worker/controller exits.
+            reply = machine.json(["status"])
+            self.assertEqual(reply["exitCode"], 0)
+            controller = subprocess.run([str(self.server.installer), "--host-controller"],
+                input=json.dumps({"protocolVersion": 1, "action": "fence"}),
+                env=machine.env(), text=True, capture_output=True, timeout=20)
+            self.assertEqual(controller.returncode, 0, controller.stderr)
+            self.assertEqual(json.loads(controller.stdout), {"protocolVersion": 1, "ok": True})
+
+    def test_controller_keeps_missing_transaction_state_uncertain(self):
+        machine = self.machine()
+        response = subprocess.run([str(self.server.installer), "--host-controller"],
+            input=json.dumps({"protocolVersion": 1, "action": "probe"}),
+            env=machine.env(), text=True, capture_output=True, timeout=20)
+        self.assertEqual(response.returncode, 1)
+        reply = json.loads(response.stdout)
+        self.assertFalse(reply["ok"])
+        self.assertTrue(reply["uncertain"])
+        self.assertFalse(machine.binary.exists())
+
     def test_unattended_channel_and_explicit_consent_receipt(self):
         machine = self.machine()
         reply = machine.json(["install"], extra={"RAFT_COMPUTER_OPERATION_ID": "channel-consent"})
@@ -321,11 +345,16 @@ class InstallerContract(unittest.TestCase):
                 if running:
                     extra["RCI_FIXTURE_STOP_GATE"] = str(gate)
                 else:
-                    extra.update(RCI_FIXTURE_PUBLISHED_GATE=str(gate), RCI_FIXTURE_PUBLISHED_PATH=str(machine.binary))
+                    extra.update(RCI_FIXTURE_PUBLISHED_GATE=str(gate), RCI_FIXTURE_PUBLISHED_PATH=str(machine.binary), RCI_FIXTURE_PUBLISHED_VERSION="1.1.0")
                 parent = subprocess.Popen(machine.command(["upgrade", "--version", "1.1.0", "--json"]),
                     env=machine.env(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     wait_for(gate.exists)
+                    if not running:
+                        operation = json.loads((machine.k / "operation.json").read_text())
+                        self.assertEqual(operation["targetVersion"], "1.1.0")
+                        self.assertIsNone(operation["outcome"])
+                        self.assertEqual(machine.binary.read_bytes(), self.server.releases["1.1.0"])
                     owner = json.loads((machine.state / "gate/upgrade.lock").read_text())["pid"]
                     self.assertNotIn(owner, (os.getpid(), parent.pid, 0, 1))
                     busy = machine.run(["status"])

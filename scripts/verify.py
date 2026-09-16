@@ -30,6 +30,7 @@ def main():
 
     check("Rust formatting", ["cargo", "fmt", "--all", "--check"])
     check("Rust diagnostics", ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"])
+    check("Rust behavior", ["cargo", "test", "--locked", "--lib"])
     check("Python syntax", [sys.executable, "-m", "compileall", "-q", "scripts", "verification"])
     ready = True
     if not args.no_build:
