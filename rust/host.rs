@@ -28,6 +28,8 @@ pub struct ProductState {
     pub initial_processes: Vec<process::Identity>,
     pub forced_stops: Vec<u32>,
     pub last_start: Option<Start>,
+    #[serde(default)]
+    pub waiting_caller: Option<process::Identity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,13 +47,21 @@ pub struct Answer {
     pub processes: Vec<process::Identity>,
 }
 
+pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity>> {
+    let caller = cfg.waiting_caller.as_ref();
+    Ok(process::installed(&cfg.binary)?
+        .into_iter()
+        .filter(|p| !caller.is_some_and(|c| process::same_instance(c, p)))
+        .collect())
+}
+
 pub async fn answer(cfg: &Config) -> Result<Answer> {
     let status = match computer::status(cfg).await {
         Ok(status) => Some(status),
         Err(error) if error.is_uncertain() => return Err(error),
         Err(_) => None,
     };
-    let mut processes = process::installed(&cfg.binary)?;
+    let mut processes = installed_product_processes(cfg)?;
     if let Some(evidence) = status.as_ref().and_then(|s| s.evidence.as_ref()) {
         let identity = process::attest(evidence.pid, &cfg.binary)?;
         if !processes.contains(&identity) {
@@ -105,6 +115,7 @@ pub async fn prepare(
             initial_processes: answer.processes,
             forced_stops: vec![],
             last_start: None,
+            waiting_caller: cfg.waiting_caller.clone(),
         },
     )
 }
@@ -147,10 +158,10 @@ pub async fn stop_product(cfg: &Config) -> Result<Vec<u32>> {
     // The product gets the first opportunity to unregister or stop its service.
     // The bounded fallback acts only on OS-identified instances of this binary.
     let _ = computer::lifecycle(cfg, "stop").await?;
-    let processes = process::installed(&cfg.binary)?;
+    let processes = installed_product_processes(cfg)?;
     let remaining = process::wait_gone(&processes, Duration::from_secs(3)).await?;
     let forced = process::terminate(&remaining).await?;
-    if !process::installed(&cfg.binary)?.is_empty() {
+    if !installed_product_processes(cfg)?.is_empty() {
         return Err(Error::Uncertain(
             "product service restarted while stopping".into(),
         ));
@@ -271,7 +282,7 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
     let attempt = async {
         // A newly appeared process must be settled before replacing bytes. A
         // stopped installation does not authorize stopping a user-started one.
-        if !process::installed(&cfg.binary)?.is_empty() {
+        if !installed_product_processes(cfg)?.is_empty() {
             return Err(Error::Uncertain(
                 "product became active before publication".into(),
             ));
@@ -318,7 +329,7 @@ async fn probe(cfg: &Config) -> Result<Evidence> {
     if record.running {
         live_evidence(cfg).await
     } else {
-        if !process::installed(&cfg.binary)?.is_empty() {
+        if !installed_product_processes(cfg)?.is_empty() {
             return Err(Error::Uncertain(
                 "unexpected service on a stopped installation".into(),
             ));
@@ -340,6 +351,11 @@ async fn dispatch(cfg: &Config, request: Request) -> Result<Value> {
     if request.protocol_version != 1 {
         return Err(invalid("unsupported controller protocol"));
     }
+    let mut scoped = cfg.clone();
+    if request.action != "fence" {
+        scoped.waiting_caller = read(cfg)?.waiting_caller;
+    }
+    let cfg = &scoped;
     let slot_action = matches!(request.action.as_str(), "start" | "stop");
     if slot_action {
         let slot = request
@@ -361,7 +377,7 @@ async fn dispatch(cfg: &Config, request: Request) -> Result<Value> {
             if record.running {
                 record.forced_stops.extend(stop_product(cfg).await?);
                 save(cfg, &record)?;
-            } else if !process::installed(&cfg.binary)?.is_empty() {
+            } else if !installed_product_processes(cfg)?.is_empty() {
                 return Err(Error::Uncertain(
                     "unexpected service on a stopped installation".into(),
                 ));

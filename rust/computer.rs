@@ -484,7 +484,7 @@ pub async fn preserve_commands_after_stop(
     id: &str,
 ) -> Result<Option<std::path::PathBuf>> {
     wait_for_repair(cfg).await?;
-    if !process::installed(&cfg.binary)?.is_empty() {
+    if !crate::host::installed_product_processes(cfg)?.is_empty() {
         return Err(Error::Uncertain(
             "product remains active while preserving command records".into(),
         ));

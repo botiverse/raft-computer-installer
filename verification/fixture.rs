@@ -123,6 +123,21 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
             "{}",
             json!({"generation":state.generation,"pid":state.pid,"version":state.version})
         )?;
+        if request["action"] == "upgrade" {
+            Command::new(env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?)
+                .args(["upgrade", "--version", "1.1.0", "--json"])
+                .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
+                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                .env("RAFT_COMPUTER_OPERATION_ID", "remote-caller-regression")
+                .env(
+                    "RAFT_COMPUTER_APPROVED_BY",
+                    "remote:remote-caller-regression",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
         if request["action"] == "stop" {
             break;
         }
@@ -162,6 +177,13 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     );
     ensure_dir(&home)?;
     match args.first().map(String::as_str) {
+        // Exercise the real Computer adapter shape: the installed executable
+        // waits for its installer child, while retaining its own image.
+        Some("upgrade") => {
+            let installer = env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?;
+            let status = Command::new(installer).args(&args).status()?;
+            return Ok(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1));
+        }
         Some("__service") => service(&home, &behavior)?,
         Some("login") => {
             fs::write(home.join("fixture-login"), b"configured")?;

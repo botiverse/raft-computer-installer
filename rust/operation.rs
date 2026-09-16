@@ -527,8 +527,9 @@ async fn install(
             // A crashed helper might have left its native CLI child behind.
             // Explicit repair stops these verified product instances before
             // issuing a new graceful service-manager stop command.
-            forced
-                .extend(crate::process::terminate(&crate::process::installed(&cfg.binary)?).await?);
+            forced.extend(
+                crate::process::terminate(&crate::host::installed_product_processes(cfg)?).await?,
+            );
         }
         forced.extend(host::stop_product(cfg).await?);
         if let Some(path) = computer::preserve_commands_after_stop(cfg, &plan.request.id).await? {
@@ -547,7 +548,7 @@ async fn install(
             .join("quarantine")
             .join(sha256(plan.request.id.as_bytes()));
         let proof = || -> Result<()> {
-            if !crate::process::installed(&cfg.binary)?.is_empty() {
+            if !crate::host::installed_product_processes(cfg)?.is_empty() {
                 return Err(Error::Uncertain(
                     "product is still active before quarantine".into(),
                 ));
@@ -583,7 +584,7 @@ async fn install(
     }
     if plan.phase == Phase::Publishing {
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
-        if !crate::process::installed(&cfg.binary)?.is_empty() {
+        if !crate::host::installed_product_processes(cfg)?.is_empty() {
             return Err(Error::Uncertain(
                 "product became active before publication".into(),
             ));
@@ -637,7 +638,7 @@ async fn install(
             }
             plan.detail.insert("readback".into(), "service".into());
         } else {
-            if !crate::process::installed(&cfg.binary)?.is_empty() {
+            if !crate::host::installed_product_processes(cfg)?.is_empty() {
                 return Err(Error::Uncertain(
                     "a stopped installation unexpectedly started".into(),
                 ));
@@ -733,6 +734,9 @@ fn reject(
 
 pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     request.validate()?;
+    let mut scoped = cfg.clone();
+    scoped.waiting_caller = request.waiting_caller.clone();
+    let cfg = &scoped;
     let _gate = match UpgradeLock::acquire(&cfg.installer_dir.join("gate")) {
         Ok(gate) => gate,
         Err(Error::Locked(_)) => {

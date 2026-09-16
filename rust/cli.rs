@@ -53,6 +53,7 @@ fn parse(args: &[String]) -> Result<Args> {
         presence,
         approved_by,
         recovery_only: false,
+        waiting_caller: None,
     };
     let mut json = false;
     let mut position = 0;
@@ -175,7 +176,39 @@ pub async fn run() -> Result<u8> {
             _ => {}
         }
     }
-    let args = parse(&args)?;
+    let mut args = parse(&args)?;
+    if ["install", "upgrade", "repair"].contains(&args.request.command.as_str()) {
+        let marker = env::var("RAFT_COMPUTER_INSTALLER_CALLER").ok();
+        if marker.as_deref().is_some_and(|v| v != "waiting-cli-v1") {
+            return Err(invalid("invalid installer caller declaration"));
+        }
+        let parent = crate::process::immediate_parent(&cfg.binary)?;
+        if marker.is_some() && parent.is_none() {
+            return Err(invalid(
+                "waiting caller is not the installed immediate parent",
+            ));
+        }
+        if let Some(parent) = parent {
+            let remote = args.request.approved_by.starts_with("remote:");
+            let qualified =
+                marker.is_some() || args.request.presence == crate::presence::Presence::Attended;
+            if !remote && qualified {
+                let status = computer::status(&cfg).await?;
+                if status
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|e| e.pid == parent.pid)
+                {
+                    return Err(invalid("a service cannot declare itself a waiting CLI"));
+                }
+                args.request.waiting_caller = Some(parent);
+            } else if !remote {
+                return Err(invalid(
+                    "older non-interactive Computer caller cannot be identified safely; run the installer directly",
+                ));
+            }
+        }
+    }
     let reply = supervisor::run(&cfg, &args.request).await?;
     if args.json {
         println!("{}", serde_json::to_string(&reply)?);

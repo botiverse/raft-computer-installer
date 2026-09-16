@@ -15,6 +15,8 @@ pub struct Request {
     pub presence: Presence,
     pub approved_by: String,
     pub recovery_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_caller: Option<crate::process::Identity>,
 }
 
 impl Request {
@@ -32,6 +34,14 @@ impl Request {
             || (self.version.is_some() && self.channel.is_some())
         {
             return Err(invalid("invalid installer request"));
+        }
+        if let Some(caller) = &self.waiting_caller
+            && (caller.pid <= 1
+                || caller.created.is_empty()
+                || caller.created.len() > 256
+                || !caller.executable.is_absolute())
+        {
+            return Err(invalid("invalid waiting caller identity"));
         }
         if let Some(version) = &self.version {
             version::exact(version)?;

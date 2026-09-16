@@ -26,6 +26,7 @@ pub struct Config {
     pub release_base: String,
     pub hands_origin: String,
     pub hands_app: String,
+    pub waiting_caller: Option<crate::process::Identity>,
 }
 
 fn absolute(value: &Path, home: &Path) -> Result<PathBuf> {
@@ -84,6 +85,7 @@ impl Config {
             .ok_or_else(|| invalid("invalid binary path"))?
             .join(SIDECAR_NAME);
         Ok(Self {
+            waiting_caller: None,
             k_state: state_home.join("computer/k"),
             installer_dir: state_home.join("computer/installer"),
             user_home,

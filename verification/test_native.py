@@ -46,6 +46,122 @@ class InstallerContract(unittest.TestCase):
         self.addCleanup(machine.close)
         return machine
 
+    def test_installed_cli_waiting_for_upgrade_is_not_a_running_service(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        self.assertIsNone(exchange(machine.home, "probe"))
+        result = subprocess.run([str(machine.binary), "upgrade", "--version", "1.1.0", "--json"],
+            env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer),
+                "RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"}),
+            text=True, capture_output=True, timeout=180)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout)["receipt"]["outcome"], "promoted")
+        self.assertEqual(machine.product(["--version"]).stdout.strip(), "1.1.0")
+        self.assertIsNone(exchange(machine.home, "probe"))
+
+    def test_waiting_cli_preserves_real_service_on_upgrade_and_rollback(self):
+        for target, expected_exit, expected_outcome, expected_version in (
+            ("1.1.0", 0, "promoted", "1.1.0"),
+            ("1.2.0", 1, "rolled-back", "1.0.0"),
+        ):
+            with self.subTest(target=target):
+                machine = self.machine()
+                machine.json(["install", "--version", "1.0.0"])
+                machine.product(["login"])
+                machine.product(["start"])
+                before = machine.live()
+                parent = subprocess.Popen([str(machine.binary), "upgrade", "--version", target, "--json"],
+                    env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer),
+                        "RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"}),
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = parent.communicate(timeout=120)
+                self.assertEqual(parent.returncode, expected_exit, stdout + stderr)
+                self.assertEqual(json.loads(stdout)["receipt"]["outcome"], expected_outcome)
+                record = json.loads((machine.state / "product-state.json").read_text())
+                self.assertEqual([p["pid"] for p in record["initialProcesses"]], [before["pid"]])
+                self.assertNotIn(parent.pid, record["forcedStops"])
+                self.assertEqual(machine.live()["version"], expected_version)
+                self.assertNotEqual(machine.live()["pid"], before["pid"])
+
+    def test_remote_service_parent_is_still_stopped_and_replaced(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.product(["login"])
+        start = subprocess.run([str(machine.binary), "start"],
+            env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+            text=True, capture_output=True, timeout=20)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        before = machine.live()
+        self.assertIsNotNone(before)
+        exchange(machine.home, "upgrade")
+        receipt_path = machine.state / "receipts" / (sha(b"remote-caller-regression") + ".json")
+        wait_for(lambda: receipt_path.exists(), timeout=90)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["outcome"], "promoted", receipt)
+        record = json.loads((machine.state / "product-state.json").read_text())
+        self.assertIsNone(record["waitingCaller"])
+        self.assertIn(before["pid"], [p["pid"] for p in record["initialProcesses"]])
+        self.assertNotEqual(machine.live()["pid"], before["pid"])
+        self.assertEqual(machine.live()["version"], "1.1.0")
+
+    def test_old_noninteractive_cli_is_rejected_without_stopping_it(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        before = machine.binary.read_bytes()
+        self.server.requests.clear()
+        result = subprocess.run([str(machine.binary), "upgrade", "--version", "1.1.0"],
+            env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+            text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cannot be identified safely", result.stderr)
+        self.assertEqual(machine.binary.read_bytes(), before)
+        self.assertEqual(self.server.requests, [])
+        self.assertFalse((machine.state / "active.json").exists())
+
+    def test_waiting_marker_from_non_product_parent_is_rejected(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        result = machine.run(["upgrade"], extra={"RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not the installed immediate parent", result.stderr)
+        self.assertEqual(machine.self_version(), "1.0.0")
+
+    @unittest.skipIf(WINDOWS, "legacy console case uses Unix PTY; Windows future-marker case exercises live PE replacement")
+    def test_legacy_attended_cli_keeps_waiting_until_upgrade_finishes(self):
+        import pty
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        environment = machine.env({"CI": "", "RAFT_COMPUTER_NON_INTERACTIVE": "0",
+            "RCI_FIXTURE_INSTALLER": str(self.server.installer)})
+        command = [str(machine.binary), "upgrade", "--version", "1.1.0", "--yes", "--json"]
+        pid, terminal = pty.fork()
+        if pid == 0:
+            os.execve(command[0], command, environment)
+        captured = bytearray()
+        deadline = time.monotonic() + 120
+        try:
+            while time.monotonic() < deadline:
+                if select.select([terminal], [], [], 0.1)[0]:
+                    try:
+                        data = os.read(terminal, 8192)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    captured.extend(data)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                self.fail("legacy CLI upgrade timed out")
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0, captured.decode(errors="replace"))
+        finally:
+            os.close(terminal)
+        self.assertEqual(machine.self_version(), "1.1.0")
+        self.assertIsNone(machine.live())
+        record = json.loads((machine.state / "product-state.json").read_text())
+        self.assertEqual(record["initialProcesses"], [])
+        self.assertEqual(record["forcedStops"], [])
+
     def test_short_lived_protocol_replies_are_flushed(self):
         machine = self.machine()
         for _ in range(20):

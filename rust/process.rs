@@ -18,6 +18,10 @@ pub struct Identity {
     pub created: String,
 }
 
+pub fn same_instance(left: &Identity, right: &Identity) -> bool {
+    left.pid == right.pid && left.created == right.created
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -30,6 +34,17 @@ fn same_path(left: &Path, right: &Path) -> bool {
     {
         left == right
     }
+}
+
+pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
+    let first = native::parent()?;
+    let identity = observe(first)?;
+    if first != native::parent()? {
+        return Err(Error::Uncertain(
+            "installer parent changed during attestation".into(),
+        ));
+    }
+    Ok(identity.filter(|p| same_path(&p.executable, binary)))
 }
 
 pub fn observe(pid: u32) -> Result<Option<Identity>> {
@@ -152,6 +167,10 @@ mod native {
         // a record safe to inspect after reboot as well as PID reuse.
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
         Ok(Some(format!("{}:{start}", boot.trim())))
+    }
+
+    pub fn parent() -> Result<u32> {
+        Ok(unsafe { libc::getppid() } as u32)
     }
 
     pub fn definitely_exited(pid: u32) -> Result<bool> {
@@ -280,6 +299,10 @@ mod native {
             return Ok(None);
         }
         Ok(Some(info))
+    }
+
+    pub fn parent() -> Result<u32> {
+        Ok(unsafe { libc::getppid() } as u32)
     }
 
     pub fn definitely_exited(pid: u32) -> Result<bool> {
@@ -464,6 +487,24 @@ mod native {
             Err(Error::Io(error)) if matches!(error.raw_os_error(), Some(5 | 31)) => Ok(None),
             result => result,
         }
+    }
+
+    pub fn parent() -> Result<u32> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let snapshot = Handle(snapshot);
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+        while found != 0 {
+            if entry.th32ProcessID == std::process::id() {
+                return Ok(entry.th32ParentProcessID);
+            }
+            found = unsafe { Process32NextW(snapshot.0, &mut entry) };
+        }
+        Err(Error::Uncertain("installer parent unavailable".into()))
     }
 
     pub fn pids() -> Result<Vec<u32>> {
@@ -689,5 +730,31 @@ mod tests {
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         assert!(!matches(&identity).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    #[test]
+    fn caller_instance_survives_rename_but_not_pid_reuse() {
+        let original = Identity {
+            pid: 42,
+            created: "boot:100".into(),
+            executable: "/bin/raft-computer".into(),
+        };
+        let renamed = Identity {
+            executable: "/bin/.k-image-old".into(),
+            ..original.clone()
+        };
+        assert!(same_instance(&original, &renamed));
+        assert!(!same_instance(
+            &original,
+            &Identity {
+                created: "boot:101".into(),
+                ..renamed.clone()
+            }
+        ));
+        assert!(!same_instance(&original, &Identity { pid: 43, ..renamed }));
     }
 }
