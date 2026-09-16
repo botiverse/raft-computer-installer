@@ -608,10 +608,22 @@ mod tests {
     #[tokio::test]
     async fn unlinked_live_executable_does_not_block_inventory_or_prove_exit() {
         let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("cat");
-        fs::copy("/bin/cat", &executable).unwrap();
-        // A copied Apple platform binary can be killed when its backing file
-        // disappears. Use the same ad-hoc signature as installer test builds.
+        let executable = temporary.path().join("reader");
+        let source = temporary.path().join("reader.c");
+        fs::write(&source, b"#include <unistd.h>\nint main(void) { char b[64]; ssize_t n; while ((n = read(0, b, sizeof b)) > 0) { if (write(1, b, n) != n) return 1; } return n < 0; }\n").unwrap();
+        // Build an ordinary owned executable: resigning a copied Apple system
+        // binary is not portable across supported macOS runner versions.
+        let build = Command::new("/usr/bin/cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
         assert!(
             Command::new("/usr/bin/codesign")
                 .args(["--force", "--sign", "-"])
@@ -637,7 +649,12 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .read_exact(&mut output)
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "fixture stopped responding: {error}; exit: {:?}",
+                        child.try_wait()
+                    )
+                });
             assert_eq!(&output, b"ready\n");
         }
         exchange(&mut child.0); // The executable is loaded and accepting input.
