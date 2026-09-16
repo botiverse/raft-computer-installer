@@ -700,7 +700,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raft-computer-installer"
-version = "0.2.0-rc.6"
+version = "0.2.0-rc.7"
 dependencies = [
  "async-trait",
  "k-carrier",
