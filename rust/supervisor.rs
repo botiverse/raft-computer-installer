@@ -99,11 +99,10 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                         "Recovery is blocked by another installer. Run raft-computer-installer recover after it exits.",
                     );
                 } else if reply.exit_code != 3 {
-                    if reply.exit_code <= 1
-                        && reply.receipt.is_some()
-                        && remove_finished_supervisors(cfg, directory.path()).is_err()
-                    {
-                        eprintln!("Installer recovery-file cleanup is pending.");
+                    if reply.exit_code <= 1 && reply.receipt.is_some() {
+                        // Housekeeping does not change the durable result or
+                        // need intervention; retry on the next invocation.
+                        let _ = remove_finished_supervisors(cfg, directory.path());
                     }
                     return Ok(reply);
                 } else {
