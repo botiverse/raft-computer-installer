@@ -96,6 +96,11 @@ class InstallerContract(unittest.TestCase):
         exchange(machine.home, "upgrade")
         receipt_path = machine.state / "receipts" / (sha(b"remote-caller-regression") + ".json")
         wait_for(lambda: receipt_path.exists(), timeout=90)
+        # A durable receipt precedes worker cleanup and launcher exit. Reap the
+        # exact detached instance before teardown can delete its state home.
+        settled = subprocess.run([str(machine.binary), "__wait-remote-installer"],
+            env=machine.env(), text=True, capture_output=True, timeout=70)
+        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
         receipt = json.loads(receipt_path.read_text())
         self.assertEqual(receipt["outcome"], "promoted", receipt)
         record = json.loads((machine.state / "product-state.json").read_text())

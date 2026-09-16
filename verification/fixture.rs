@@ -124,19 +124,23 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
             json!({"generation":state.generation,"pid":state.pid,"version":state.version})
         )?;
         if request["action"] == "upgrade" {
-            Command::new(env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?)
-                .args(["upgrade", "--version", "1.1.0", "--json"])
-                .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
-                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
-                .env("RAFT_COMPUTER_OPERATION_ID", "remote-caller-regression")
-                .env(
-                    "RAFT_COMPUTER_APPROVED_BY",
-                    "remote:remote-caller-regression",
-                )
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
+            let child =
+                Command::new(env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?)
+                    .args(["upgrade", "--version", "1.1.0", "--json"])
+                    .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
+                    .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                    .env("RAFT_COMPUTER_OPERATION_ID", "remote-caller-regression")
+                    .env(
+                        "RAFT_COMPUTER_APPROVED_BY",
+                        "remote:remote-caller-regression",
+                    )
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+            let identity = raft_computer_installer::process::observe(child.id())?
+                .ok_or("remote installer identity unavailable")?;
+            write_json(&home.join("fixture-remote-installer.json"), &identity)?;
         }
         if request["action"] == "stop" {
             break;
@@ -177,6 +181,17 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     );
     ensure_dir(&home)?;
     match args.first().map(String::as_str) {
+        Some("__wait-remote-installer") => {
+            let identity =
+                serde_json::from_slice(&fs::read(home.join("fixture-remote-installer.json"))?)?;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while raft_computer_installer::process::instance_matches(&identity)? {
+                if Instant::now() >= deadline {
+                    return Err("remote installer did not exit".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         // Exercise the real Computer adapter shape: the installed executable
         // waits for its installer child, while retaining its own image.
         Some("upgrade") => {
