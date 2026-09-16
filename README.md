@@ -34,7 +34,7 @@ use the native executable produced by the build command below.
 | Command | Behavior |
 | --- | --- |
 | `install`, `upgrade` | Bring the machine to the selected version: install if fresh, adopt a pre-K installation, upgrade a managed installation, or repair a broken one. No command means `upgrade` in the native CLI and `install` in the bootstrap; both choose the path from the machine's state. |
-| `repair` | Reinstall a broken installation, retaining its previous state. Held when the installation is healthy. |
+| `repair` | Reinstall a broken installation, preserving credentials, configuration and user files. Held when the installation is healthy. |
 | `status` | Settle interrupted work and report the current installation. Does not reinstall. |
 | `recover` | Recover interrupted work from local state, without selecting a new release. |
 
@@ -65,7 +65,10 @@ code; this is not a background acceptance response.
 Exit codes: **0** succeeded or already up to date; **1** failed or rolled back;
 **2** held; **3** recovery unresolved. Details are recorded under
 `<RAFT_HOME>/computer/installer/receipts/`. Repeating a completed operation ID
-returns its receipt; use `status` to observe the machine now.
+returns its unchanged receipt with a historical-result label; use `status` to
+observe the machine now. An unreadable old receipt prevents reusing that request
+ID, but does not by itself mark the current installation broken. Active recovery
+records remain authoritative until their operation is confirmed finished.
 
 ## Configuration
 
