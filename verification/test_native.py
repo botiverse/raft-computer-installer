@@ -657,13 +657,16 @@ class InstallerContract(unittest.TestCase):
         broken.json(["install"], expected=1, extra={**extra, "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"})
         self.assertFalse(broken.binary.exists())
 
-    def test_live_waiting_caller_rejects_recovery_rebind(self):
+    def test_orphaned_waiting_caller_does_not_block_recovery(self):
         self.new_caller_recovery(check_live=True)
 
     def test_exited_waiting_caller_allows_persisted_recovery_rebind(self):
         self.new_caller_recovery(check_live=False)
 
-    def new_caller_recovery(self, check_live):
+    def test_standalone_recovery_cleans_orphaned_waiter(self):
+        self.new_caller_recovery(check_live=True, standalone=True)
+
+    def new_caller_recovery(self, check_live, standalone=False):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])
         effect = machine.home / "caller-effect.gate"
@@ -687,6 +690,13 @@ class InstallerContract(unittest.TestCase):
             launcher = json.loads((machine.home / "fixture-waiting-installer.json").read_text())["pid"]
             self.assertNotIn(worker, (original.pid, os.getpid()))
             self.assertNotIn(launcher, (original.pid, os.getpid()))
+            # A live installer, unlike an orphaned CLI, still owns the gate.
+            if check_live:
+                state_before = (machine.state / "product-state.json").read_bytes()
+                busy = subprocess.run(command, env=machine.env(shared), text=True, capture_output=True, timeout=30)
+                self.assertEqual(busy.returncode, 2, busy.stdout + busy.stderr)
+                self.assertIsNone(original.poll())
+                self.assertEqual((machine.state / "product-state.json").read_bytes(), state_before)
             kill(launcher)  # prevent automatic worker replacement
             kill(worker)
             effect.with_suffix(".release").touch()
@@ -694,20 +704,26 @@ class InstallerContract(unittest.TestCase):
             self.assertIsNone(original.poll(), "the original attested caller must still be alive")
             state_path = machine.state / "product-state.json"
             before = state_path.read_bytes()
-            if check_live:
-                denied = subprocess.run(command, env=machine.env(shared), text=True, capture_output=True, timeout=90)
-                self.assertEqual(denied.returncode, 2, denied.stdout + denied.stderr)
-                self.assertEqual(state_path.read_bytes(), before, "live caller rejection must not rebind state")
-            caller_exit.with_suffix(".release").touch()
-            original.communicate(timeout=20)
-            successor = subprocess.Popen(command, env=machine.env(shared), text=True,
+            if not check_live:
+                caller_exit.with_suffix(".release").touch()
+                original.communicate(timeout=20)
+            recovery_command = [str(self.server.installer), "recover", "--json"] if standalone else command
+            recovery_env = {} if standalone else shared
+            successor = subprocess.Popen(recovery_command, env=machine.env(recovery_env), text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = successor.communicate(timeout=120)
-            self.assertEqual(successor.returncode, 1, stdout + stderr)
-            self.assertEqual(json.loads(stdout)["receipt"]["outcome"], "rolled-back")
+            self.assertEqual(successor.returncode, 0 if standalone else 1, stdout + stderr)
+            if not standalone:
+                self.assertEqual(json.loads(stdout)["receipt"]["outcome"], "rolled-back")
+            if check_live:
+                original.communicate(timeout=20)
+                self.assertNotEqual(original.returncode, 0, "the orphaned waiter is not preserved")
             rebound = json.loads(state_path.read_text())["waitingCaller"]
-            self.assertEqual(rebound["pid"], successor.pid, "recovery must persist its newly attested caller")
-            self.assertNotEqual(rebound["created"], json.loads(before)["waitingCaller"]["created"])
+            if standalone:
+                self.assertIsNone(rebound)
+            else:
+                self.assertEqual(rebound["pid"], successor.pid, "recovery must persist its newly attested caller")
+                self.assertNotEqual(rebound["created"], json.loads(before)["waitingCaller"]["created"])
             self.assertEqual(machine.self_version(), "1.0.0")
             self.assertIsNone(machine.live())
         finally:

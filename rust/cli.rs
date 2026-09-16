@@ -191,14 +191,9 @@ pub async fn run() -> Result<u8> {
         if let Some(parent) = parent {
             let remote = args.request.approved_by.starts_with("remote:");
             if !remote && marker.is_some() {
-                let status = computer::status(&cfg).await?;
-                if status
-                    .evidence
-                    .as_ref()
-                    .is_some_and(|e| e.pid == parent.pid)
-                {
-                    return Err(invalid("a service cannot declare itself a waiting CLI"));
-                }
+                // The supported CLI declares its role. Terminal presence and a
+                // separate status snapshot cannot establish who is waiting.
+                // OS parent identity limits the exemption to this invocation.
                 args.request.waiting_caller = Some(parent);
             } else if !remote {
                 return Err(invalid(

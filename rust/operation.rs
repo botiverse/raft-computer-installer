@@ -709,7 +709,7 @@ async fn resume(
         return Ok(Reply::replay(old));
     }
     if recovery {
-        host::bind_recovery_caller(cfg, &plan.request.id)?;
+        host::bind_recovery_caller(cfg, &plan.request.id).await?;
     }
     // Every recovery waits for product commands that outlived its predecessor.
     if recovery

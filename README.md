@@ -61,6 +61,9 @@ establish this role. For older Computer versions, invoke the standalone installe
 directly: upgrading through an older CLI without this declaration is unsupported.
 An undeclared CLI caller is rejected before installation changes. Supported
 calling CLIs receive the final installer exit code, not background acceptance.
+The installer lock serializes installation and recovery. If an installer dies
+but leaves its calling CLI behind, a later recovery may terminate that orphaned
+CLI; it does not block recovery or count as a service that must be restarted.
 
 Exit codes: **0** succeeded or already up to date; **1** failed or rolled back;
 **2** held; **3** recovery unresolved. Details are recorded under

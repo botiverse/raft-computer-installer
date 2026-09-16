@@ -47,25 +47,31 @@ pub struct Answer {
     pub processes: Vec<process::Identity>,
 }
 
-pub fn bind_recovery_caller(cfg: &Config, operation_id: &str) -> Result<()> {
-    let Some(caller) = &cfg.waiting_caller else {
-        return Ok(());
-    };
-    // The normal recovery path still diagnoses missing/corrupt transaction
-    // state. Only rebind an already valid operation record here.
+pub async fn bind_recovery_caller(cfg: &Config, operation_id: &str) -> Result<()> {
+    // The normal recovery path diagnoses missing/corrupt transaction state.
     let Ok(mut record) = read(cfg) else {
         return Ok(());
     };
     if record.operation_id != operation_id {
         return Ok(());
     }
+    // execute() already holds the installer gate: a live CLI is not another
+    // active installer. A predecessor's orphaned waiter may be terminated;
+    // only this invocation's waiting caller must survive. Reuse OS-attested
+    // termination, never a persisted PID alone, including after image rename.
     if let Some(previous) = &record.waiting_caller
-        && !process::same_instance(previous, caller)
-        && process::instance_matches(previous)?
+        && !cfg
+            .waiting_caller
+            .as_ref()
+            .is_some_and(|caller| process::same_instance(previous, caller))
+        && let Some(live) = process::observe(previous.pid)?
+        && process::same_instance(previous, &live)
     {
-        return Err(Error::Locked(previous.pid));
+        process::terminate(&[live]).await?;
     }
-    record.waiting_caller = Some(caller.clone());
+    // Preserve the original running/stopped intent. The old waiter is not a
+    // service to restart. A standalone recovery has no replacement caller.
+    record.waiting_caller = cfg.waiting_caller.clone();
     save(cfg, &record)
 }
 
