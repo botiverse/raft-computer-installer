@@ -311,10 +311,20 @@ mod native {
         let count =
             unsafe { libc::proc_pidpath(pid as i32, path.as_mut_ptr().cast(), path.len() as u32) };
         if count <= 0 {
+            let error = std::io::Error::last_os_error();
+            // An unlinked executable or an inaccessible unrelated process is
+            // not an identifiable candidate. For recorded identities matches()
+            // still requires independent proof of exit, so it stays uncertain.
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::ESRCH | libc::EPERM | libc::EACCES)
+            ) {
+                return Ok(None);
+            }
             if info(pid)?.is_none() {
                 return Ok(None);
             }
-            return Err(invalid("cannot read product executable identity"));
+            return Err(error.into());
         }
         path.truncate(path.iter().position(|c| *c == 0).unwrap_or(path.len()));
         let Some(last) = info(pid)? else {
@@ -578,5 +588,106 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(remaining, vec![identity]);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn unlinked_live_executable_does_not_block_inventory_or_prove_exit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("reader");
+        let source = temporary.path().join("reader.c");
+        fs::write(&source, b"#include <unistd.h>\nint main(void) { char b[64]; ssize_t n; while ((n = read(0, b, sizeof b)) > 0) { if (write(1, b, n) != n) return 1; } return n < 0; }\n").unwrap();
+        // Build an ordinary owned executable: resigning a copied Apple system
+        // binary is not portable across supported macOS runner versions.
+        let build = Command::new("/usr/bin/cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&executable)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let mut child = OwnedChild(
+            Command::new(&executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        fn exchange(child: &mut Child) {
+            child.stdin.as_mut().unwrap().write_all(b"ready\n").unwrap();
+            let mut output = [0; 6];
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut output)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "fixture stopped responding: {error}; exit: {:?}",
+                        child.try_wait()
+                    )
+                });
+            assert_eq!(&output, b"ready\n");
+        }
+        exchange(&mut child.0); // The executable is loaded and accepting input.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let identity = loop {
+            if let Ok(identity) = attest(child.0.id(), &executable) {
+                break identity;
+            }
+            assert!(Instant::now() < deadline, "child did not become observable");
+            sleep(Duration::from_millis(20)).await;
+        };
+        assert!(installed(&executable).unwrap().contains(&identity));
+        fs::remove_file(&executable).unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(
+            observe(identity.pid).unwrap().is_none(),
+            "macOS loses the unlinked executable path"
+        );
+        // The same live, unobservable process must not stop unrelated scans,
+        // or allow a saved identity to be considered exited or safe to signal.
+        installed(&std::env::current_exe().unwrap()).unwrap();
+        assert!(matches!(matches(&identity), Err(Error::Uncertain(_))));
+        assert_eq!(
+            wait_gone(std::slice::from_ref(&identity), Duration::from_millis(50))
+                .await
+                .unwrap(),
+            vec![identity.clone()]
+        );
+        assert!(native::signal(&identity, true).is_err());
+        exchange(&mut child.0);
+        assert!(child.0.try_wait().unwrap().is_none());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!matches(&identity).unwrap());
     }
 }
