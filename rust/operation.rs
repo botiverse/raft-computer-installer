@@ -709,13 +709,14 @@ async fn resume(
         return Ok(Reply::replay(old));
     }
     if recovery {
+        // A previous controller may still write its captured ProductState.
+        // K's existing fence settles both controller and product-command
+        // lifetimes before rebinding. Explicit repair retains its separate
+        // handling for abandoned command records.
+        if !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping)) {
+            runner::fence(cfg).await?;
+        }
         host::bind_recovery_caller(cfg, &plan.request.id).await?;
-    }
-    // Every recovery waits for product commands that outlived its predecessor.
-    if recovery
-        && !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping))
-    {
-        computer::fence(cfg).await?;
     }
     let result = match plan.kind {
         Kind::Fresh | Kind::Repair => install(cfg, plan, recovery, interaction).await,

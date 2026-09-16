@@ -699,7 +699,8 @@ class InstallerContract(unittest.TestCase):
                 self.assertEqual((machine.state / "product-state.json").read_bytes(), state_before)
             kill(launcher)  # prevent automatic worker replacement
             kill(worker)
-            effect.with_suffix(".release").touch()
+            if not standalone:
+                effect.with_suffix(".release").touch()
             wait_for(caller_exit.exists)
             self.assertIsNone(original.poll(), "the original attested caller must still be alive")
             state_path = machine.state / "product-state.json"
@@ -711,6 +712,20 @@ class InstallerContract(unittest.TestCase):
             recovery_env = {} if standalone else shared
             successor = subprocess.Popen(recovery_command, env=machine.env(recovery_env), text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if standalone:
+                # Keep the previous controller inside self_report while the
+                # new worker acquires the gate. Rebinding must wait for it.
+                def successor_owns_gate():
+                    try:
+                        return json.loads((machine.state / "gate/upgrade.lock").read_text())["pid"] != worker
+                    except FileNotFoundError:
+                        return False
+                wait_for(successor_owns_gate)
+                time.sleep(0.5)
+                self.assertIsNone(successor.poll())
+                self.assertIsNone(original.poll(), "controller fence must precede orphan cleanup")
+                self.assertEqual(json.loads(state_path.read_text())["waitingCaller"]["pid"], original.pid)
+                effect.with_suffix(".release").touch()
             stdout, stderr = successor.communicate(timeout=120)
             self.assertEqual(successor.returncode, 0 if standalone else 1, stdout + stderr)
             if not standalone:
