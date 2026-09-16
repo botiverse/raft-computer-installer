@@ -426,6 +426,13 @@ mod native {
                 size_of::<libc::proc_bsdinfo>() as i32,
             )
         };
+        // An unreaped zombie can still answer kill(pid, 0), while libproc
+        // reports ESRCH instead of returning BSD info. It cannot run further
+        // effects; waiting for its unrelated parent to reap it blocks recovery.
+        // Permission errors and an unavailable executable path do not prove exit.
+        if count == 0 {
+            return Ok(std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+        }
         Ok(count as usize == size_of::<libc::proc_bsdinfo>()
             && unsafe { info.assume_init().pbi_status } == 5)
     }
@@ -751,6 +758,23 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[tokio::test]
+    async fn terminated_child_need_not_be_reaped_to_prove_exit() {
+        let child = OwnedChild(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let identity = loop {
+            if let Ok(identity) = attest(child.0.id(), Path::new("/bin/sleep")) {
+                break identity;
+            }
+            assert!(Instant::now() < deadline, "child did not become observable");
+            sleep(Duration::from_millis(20)).await;
+        };
+        // Keep the Child unreaped until Drop, as a waiting CLI owned by another
+        // process would be. terminate() must finish without that parent's help.
+        terminate(std::slice::from_ref(&identity)).await.unwrap();
+        assert!(!matches(&identity).unwrap());
     }
 
     #[tokio::test]
