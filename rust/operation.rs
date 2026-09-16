@@ -47,6 +47,50 @@ impl ReleaseSource for OfflineSource {
 fn directory(cfg: &Config, id: &str) -> PathBuf { cfg.installer_dir.join("operations").join(sha256(id.as_bytes())) }
 fn active_path(cfg: &Config) -> PathBuf { cfg.installer_dir.join("active.json") }
 fn plan_path(cfg: &Config, id: &str) -> PathBuf { directory(cfg, id).join("plan.json") }
+fn damage_path(cfg: &Config) -> PathBuf { cfg.installer_dir.join("metadata-damage.json") }
+
+fn mark_damage(cfg: &Config) -> Result<()> {
+    if !exists(&damage_path(cfg))? {
+        write_json(&damage_path(cfg), &serde_json::json!({"formatVersion":1,"requiresRepair":true}))?;
+    }
+    Ok(())
+}
+
+fn clear_damage(cfg: &Config) -> Result<()> {
+    match fs::remove_file(damage_path(cfg)) {
+        Ok(()) => sync_dir(&cfg.installer_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Keep the old pointer and its referenced metadata before publishing a repair
+/// plan. Only installer-owned metadata paths are considered, never product data.
+/// The original files remain until the replacement plan is durable.
+fn preserve_metadata(cfg: &Config, request: &Request) -> Result<PathBuf> {
+    let destination = cfg.installer_dir.join("quarantine")
+        .join(format!("metadata-{}-{}", sha256(request.id.as_bytes()), uuid::Uuid::new_v4()));
+    ensure_dir(&destination)?;
+    let mut paths = vec![active_path(cfg), damage_path(cfg), plan_path(cfg, &request.id), cfg.receipt_path(&request.id)];
+    if let Ok(previous) = json::<Active>(&active_path(cfg)) {
+        paths.extend([plan_path(cfg, &previous.id), cfg.receipt_path(&previous.id)]);
+    }
+    paths.sort();
+    paths.dedup();
+    let mut index = BTreeMap::new();
+    for (i, path) in paths.iter().enumerate() {
+        if !exists(path)? { continue; }
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 1024 * 1024 {
+            return Err(Error::Uncertain("installer metadata cannot be preserved safely".into()));
+        }
+        let name = format!("{i}.json");
+        write_durable(&destination.join(&name), &fs::read(path)?, false)?;
+        index.insert(name, path.to_string_lossy().into_owned());
+    }
+    write_json(&destination.join("index.json"), &index)?;
+    Ok(destination)
+}
 
 fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let mut bytes = Vec::new();
@@ -100,6 +144,7 @@ fn finish(cfg: &Config, plan: &mut Plan, outcome: Outcome, line: impl Into<Strin
     result.next_step = plan.next_step.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
     let result = result.finish(cfg)?;
+    if result.outcome == Outcome::Repaired { clear_damage(cfg)?; }
     if result.outcome != Outcome::Unresolved {
         plan.phase = Phase::Finished;
         save(cfg, plan)?;
@@ -156,6 +201,9 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         runner.execute(&protocol::Request::Upgrade { protocol_version: 1, id: plan.request.id.clone(),
             target_version: plan.manifest.version.clone(), consented: true }).await?
     };
+    if response.exit_code == 2 && response.result == "busy" {
+        return finish(cfg, plan, Outcome::Held, "Another upgrade is running on this machine.");
+    }
     let OperationRead::Observed { operation } = response.operation else {
         return Err(Error::Uncertain("upgrade returned no readable operation receipt".into()));
     };
@@ -189,7 +237,12 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
 async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &Interaction) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
         if recovery { return finish(cfg, plan, Outcome::Failed, "Installation was interrupted before changing installed files. Run the installer again."); }
-        let candidate = artifact::acquire(cfg, &plan.manifest).await?;
+        let candidate = if plan.kind == Kind::Repair {
+            artifact::acquire_repair(cfg, &plan.manifest).await?
+        } else { artifact::acquire(cfg, &plan.manifest).await? };
+        if let Some(path) = &candidate.sidecar_quarantine {
+            plan.detail.insert("sidecarQuarantine".into(), path.to_string_lossy().into_owned());
+        }
         write_durable(&directory(cfg, &plan.request.id).join("artifact.bin"), &fs::read(candidate.path)?, true)?;
         transition(cfg, plan, Phase::Ready)?;
     }
@@ -296,7 +349,11 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &In
 
 async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool, interaction: &Interaction) -> Result<Reply> {
     if let Some(old) = report::read(cfg, &plan.request.id)? {
-        if old.outcome != Outcome::Unresolved { clear_active(cfg, &plan.request.id)?; return Ok(Reply::receipt(old)); }
+        if old.outcome != Outcome::Unresolved {
+            if old.outcome == Outcome::Repaired { clear_damage(cfg)?; }
+            clear_active(cfg, &plan.request.id)?;
+            return Ok(Reply::receipt(old));
+        }
     }
     // Every recovery waits for product commands that outlived its predecessor.
     if recovery && !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping)) {
@@ -332,35 +389,72 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         Err(error) => return Err(error),
     };
     let mut interaction = Interaction::for_presence(if request.recovery_only { Presence::Unattended } else { request.presence })?;
-    if let Some(old) = report::read(cfg, &request.id)? {
+    let own_receipt = match report::read(cfg, &request.id) {
+        Ok(value) => value,
+        Err(_) => {
+            mark_damage(cfg)?;
+            // Corruption removed the evidence needed to bind this ID to its
+            // original target. Preserve it and require a new repair request;
+            // never repurpose an ID whose result is no longer readable.
+            if !["status", "recover"].contains(&request.command.as_str()) {
+                return Ok(Reply::plain(&request.id, 3,
+                    "This request's result is unreadable. Start a new repair command."));
+            }
+            None
+        },
+    };
+    if let Some(old) = own_receipt {
         if request.command != "status" && (request.version.as_ref().is_some_and(|v| Some(v) != old.target_version.as_ref())
             || (request.command != "recover" && request.command != old.operation)) {
             return Ok(Reply::plain(&request.id, 2, "This request ID already belongs to a different operation."));
         }
         if request.command != "status" && old.outcome != Outcome::Unresolved { return Ok(Reply::receipt(old)); }
     }
-    let mut unresolved = false;
-    if let Some(mut previous) = active(cfg)? {
+    let settlement = directory(cfg, &request.id).join("settlement-failed.json");
+    let deferred = exists(&settlement)?;
+    let mut unresolved = exists(&damage_path(cfg))?;
+    let previous = match active(cfg) {
+        Ok(previous) => previous,
+        Err(_) => {
+            mark_damage(cfg)?;
+            unresolved = true;
+            None
+        },
+    };
+    if let Some(mut previous) = previous.filter(|previous| !deferred || previous.request.id == request.id) {
         let same = previous.request.id == request.id;
         if same && !["status", "recover"].contains(&request.command.as_str())
             && (previous.request.command != request.command || request.version.as_ref().is_some_and(|v| v != &previous.manifest.version)) {
             return Ok(Reply::plain(&request.id, 2, "This request ID already belongs to a different operation."));
         }
         let resumed = resume(cfg, &mut previous, true, &interaction).await;
+        if matches!(&resumed, Err(Error::Locked(_))) { return resumed; }
         if same && request.command != "status" { return resumed; }
-        unresolved = resumed.as_ref().map_or(true, |reply| reply.exit_code == 3);
+        unresolved = exists(&damage_path(cfg))? || resumed.as_ref().map_or(true, |reply| reply.exit_code == 3);
+        if resumed.is_err() { mark_damage(cfg)?; }
+        if unresolved {
+            // K may have retained its claim in this worker. The next worker
+            // must enter the repair decision, not repeat the same failed
+            // recovery and then compete with its own retained claim again.
+            write_json(&settlement, request)?;
+            return Ok(Reply::plain(&request.id, 3, "An earlier installation could not be recovered yet."));
+        }
     }
     // A failed recovery may retain K's claim until worker exit. Record that it
     // was attempted, then let the supervisor's next worker enter the repair
     // decision with that claim's owner gone; do not spin on our own retained lock.
-    let settlement = directory(cfg, &request.id).join("settlement-failed.json");
     if exists(&settlement)? {
-        let saved: Request = json(&settlement)?;
-        if saved.id != request.id || saved.command != request.command || saved.version != request.version || saved.channel != request.channel {
-            return Err(invalid("settlement request identity conflict"));
+        match json::<Request>(&settlement) {
+            Ok(saved) if saved.id == request.id && saved.command == request.command
+                && saved.version == request.version && saved.channel == request.channel => {},
+            _ => {
+                mark_damage(cfg)?;
+                return Ok(Reply::plain(&request.id, 3,
+                    "Recovery records are unreadable. Start a new repair command."));
+            },
         }
         unresolved = true;
-    } else if !unresolved {
+    } else {
         if let Err(error) = settle_k(cfg).await {
             if let Error::Locked(_) = error { return Ok(Reply::plain(&request.id, 2, "Another upgrade is running on this machine.")); }
             unresolved = true;
@@ -426,6 +520,13 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     let mut plan = Plan { format_version: 1, request: request.clone(), manifest, kind, phase: Phase::Preparing,
         from_version: from, inherited_unresolved: unresolved, running: None, setup_succeeded: false,
         next_step: None, detail: BTreeMap::new() };
+    if plan.kind == Kind::Repair && exists(&active_path(cfg))? {
+        mark_damage(cfg)?;
+    }
+    if exists(&damage_path(cfg))? {
+        let kept = preserve_metadata(cfg, request)?;
+        plan.detail.insert("metadataQuarantine".into(), kept.to_string_lossy().into_owned());
+    }
     save(cfg, &plan)?;
     write_json(&active_path(cfg), &Active { format_version: 1, id: request.id.clone() })?;
     resume(cfg, &mut plan, false, &interaction).await

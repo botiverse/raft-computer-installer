@@ -277,7 +277,7 @@ pub async fn serve(cfg: &Config) -> Result<u8> {
     }.await;
     let (code, value) = match result {
         Ok(value) => (0, value),
-        Err(error) => (1, json!({"protocolVersion":1,"ok":false,"error":error.to_string()})),
+        Err(error) => (1, json!({"protocolVersion":1,"ok":false,"uncertain":error.is_uncertain(),"error":error.to_string()})),
     };
     let mut bytes = serde_json::to_vec(&value)?;
     bytes.push(b'\n');

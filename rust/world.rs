@@ -69,6 +69,12 @@ pub async fn read(cfg: &Config) -> Result<World> {
     if fs::symlink_metadata(&cfg.binary).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held { reason: "the installed path is a symlink owned outside this installer".into() });
     }
+    if fs::symlink_metadata(&cfg.sidecar).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(World::Held { reason: "the installed sidecar is a symlink owned outside this installer".into() });
+    }
+    if exists(&cfg.installer_dir.join("metadata-damage.json"))? {
+        return Ok(World::Broken { reason: "installer records require repair".into() });
+    }
     let store = FileStore::new(&cfg.k_state);
     let operation = store.read_operation();
     match &operation {
@@ -96,8 +102,12 @@ pub async fn read(cfg: &Config) -> Result<World> {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(World::Broken { reason: "installed executable is missing or unreadable".into() }),
             };
-            if artifact::check_platform(&installed).is_err() || sha256(&installed) != sha256(&fs::read(store.artifact(Slot::Stable))?) {
+            if artifact::check_platform(&installed).is_err()
+                || !fs::read(store.artifact(Slot::Stable)).is_ok_and(|bytes| sha256(&installed) == sha256(&bytes)) {
                 return Ok(World::Broken { reason: "installed executable differs from the stable slot".into() });
+            }
+            if artifact::check_installed_sidecar(cfg, &stable).is_err() {
+                return Ok(World::Broken { reason: "installed sidecar differs from its saved identity".into() });
             }
             match computer::self_report(&cfg.binary, cfg).await {
                 Ok(evidence) if evidence.version == stable => Ok(World::Managed { version: stable }),
@@ -113,7 +123,8 @@ pub async fn read(cfg: &Config) -> Result<World> {
             let bytes = fs::read(&cfg.binary)?;
             if artifact::check_platform(&bytes).is_err() { return Ok(World::Broken { reason: "installed program is not a compatible native executable".into() }); }
             match computer::self_report(&cfg.binary, cfg).await {
-                Ok(evidence) => Ok(World::Adopted { version: evidence.version }),
+                Ok(evidence) if artifact::check_installed_sidecar(cfg, &evidence.version).is_ok() => Ok(World::Adopted { version: evidence.version }),
+                Ok(_) => Ok(World::Broken { reason: "installed sidecar is incomplete".into() }),
                 Err(error) if error.is_uncertain() => Err(error),
                 Err(_) => Ok(World::Broken { reason: "installed program does not answer".into() }),
             }

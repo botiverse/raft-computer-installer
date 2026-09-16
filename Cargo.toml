@@ -21,7 +21,7 @@ required-features = ["verification-fixture"]
 verification-fixture = []
 
 [dependencies]
-k-carrier = { git = "https://github.com/botiverse/k-carrier", rev = "c4c38843882df5d94458e0eb56b67ed5d779cbf2" }
+k-carrier = { git = "https://github.com/botiverse/k-carrier", rev = "ea90de9a862c425365c3e4bd797fe514f1972ccb" }
 async-trait = "0.1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
