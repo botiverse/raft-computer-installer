@@ -141,9 +141,9 @@ async fn worker(cfg: &Config) -> Result<u8> {
     };
     // execute() has released the operation gate. Cleanup reacquires it and
     // does nothing if another operation has started or recovery is unresolved.
-    if crate::cleanup::run(cfg).await.is_err() {
-        eprintln!("Installer cleanup is pending; it will be retried on the next invocation.");
-    }
+    // Housekeeping does not change the installation result or require user
+    // intervention. Its durable request remains available for a later retry.
+    let _ = crate::cleanup::run(cfg).await;
     reply.validate(&request.id)?;
     let mut bytes = serde_json::to_vec(&reply)?;
     bytes.push(b'\n');

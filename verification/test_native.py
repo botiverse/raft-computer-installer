@@ -350,6 +350,44 @@ class InstallerContract(unittest.TestCase):
         for directory in obsolete:
             self.assertFalse(directory.exists())
 
+    def test_terminal_cleanup_write_failure_does_not_fail_or_restart_installation(self):
+        machine = self.machine()
+        blocked = machine.state / "cleanup.json"
+        blocked.mkdir(parents=True)
+        completed = machine.json(["install", "--version", "1.0.0"])
+        self.assertEqual(completed["receipt"]["outcome"], "installed")
+        self.assertTrue((machine.state / "active.json").exists(), "retain recovery pointer until housekeeping is scheduled")
+        live = machine.login_start()
+        blocked.rmdir()
+        self.server.requests.clear()
+        machine.json(["status"])
+        self.assertEqual(machine.live(), live, "terminal recovery must not restart a user-started service")
+        self.assertEqual(self.server.requests, [])
+        self.assertFalse((machine.state / "active.json").exists())
+        self.assertFalse((machine.state / "operations").exists())
+        self.assertFalse(blocked.exists())
+
+    def test_terminal_replay_rebuilds_missing_or_bad_cleanup_request(self):
+        for pending in (None, "broken cleanup request"):
+            with self.subTest(pending=pending):
+                machine = self.machine()
+                args = ["install", "--version", "1.0.0"]
+                env = {"RAFT_COMPUTER_OPERATION_ID": "terminal-cleanup"}
+                completed = machine.json(args, extra=env)
+                live = machine.login_start()
+                obsolete = machine.state / "operations/abandoned"
+                obsolete.mkdir(parents=True)
+                (obsolete / "payload").write_bytes(b"old download")
+                if pending is not None:
+                    (machine.state / "cleanup.json").write_text(pending)
+                self.server.requests.clear()
+                replay = machine.json(args, extra=env)
+                self.assertEqual(replay["receipt"], completed["receipt"])
+                self.assertEqual(machine.live(), live, "cleanup must not restart the service")
+                self.assertEqual(self.server.requests, [], "cleanup must not download or reinstall")
+                self.assertFalse(obsolete.exists())
+                self.assertFalse((machine.state / "cleanup.json").exists())
+
     def test_bad_sources_fail_before_publication(self):
         cases = (
             ("authority", {"RAFT_COMPUTER_HANDS_ORIGIN": "http://127.0.0.1:9"}),

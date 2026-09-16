@@ -262,16 +262,24 @@ fn finish(
     result.next_step = plan.next_step.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
     let result = result.finish(cfg)?;
-    if result.outcome == Outcome::Repaired {
-        clear_damage(cfg)?;
-    }
     if result.outcome != Outcome::Unresolved {
-        crate::cleanup::request(cfg, &plan.request.id)?;
-        plan.phase = Phase::Finished;
-        save(cfg, plan)?;
-        clear_active(cfg, &plan.request.id)?;
+        settle_terminal_metadata(cfg, &result);
     }
     Ok(Reply::receipt(result))
+}
+
+// A durable terminal result is authoritative. Failure to retire housekeeping
+// metadata must preserve the active pointer for the next invocation, not turn
+// an already successful installation into a failed lifecycle operation.
+fn settle_terminal_metadata(cfg: &Config, receipt: &report::Receipt) {
+    let settle = || -> Result<()> {
+        crate::cleanup::request(cfg, &receipt.id)?;
+        if receipt.outcome == Outcome::Repaired {
+            clear_damage(cfg)?;
+        }
+        clear_active(cfg, &receipt.id)
+    };
+    let _ = settle();
 }
 
 async fn settle_k(cfg: &Config) -> Result<()> {
@@ -674,10 +682,7 @@ async fn resume(
     if let Some(old) = report::read(cfg, &plan.request.id)?
         && old.outcome != Outcome::Unresolved
     {
-        if old.outcome == Outcome::Repaired {
-            clear_damage(cfg)?;
-        }
-        clear_active(cfg, &plan.request.id)?;
+        settle_terminal_metadata(cfg, &old);
         return Ok(Reply::receipt(old));
     }
     // Every recovery waits for product commands that outlived its predecessor.
@@ -776,7 +781,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             ));
         }
         if request.command != "status" && old.outcome != Outcome::Unresolved {
-            clear_active(cfg, &request.id)?;
+            settle_terminal_metadata(cfg, &old);
             return Ok(Reply::receipt(old));
         }
     }
