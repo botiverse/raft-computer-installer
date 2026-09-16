@@ -1,131 +1,128 @@
 # Raft Computer Installer
 
-An independent installer, upgrader and repair tool for Raft Computer, built
-on [K](https://github.com/botiverse/k-carrier). It is released on its own
-schedule and works when Computer cannot start.
+An independent installer, upgrader and repair tool for Raft Computer, written in
+Rust and built on [K](https://github.com/botiverse/k-carrier). It is released
+separately from Computer and can repair an installation that cannot start.
 
-It is the reference implementation of K's
-[installer contract](https://botiverse.github.io/k-carrier/installer.html):
-what an installer does for every way a request can arrive, every machine it
-can land on, and every way it can end. K supplies the transaction; this
-project supplies everything around it. Read the contract first; this README
-only says what is specific to Computer.
+It implements K's [installer contract](https://botiverse.github.io/k-carrier/installer.html).
+K supplies the transaction; this project supplies Computer's release source,
+installation paths, service commands and first setup. The contract defines the
+shared behavior; this README covers how to use and develop the Computer adapter.
 
-## Interface
+## Install and use
 
-```
+```sh
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh
-irm https://cdn.raft.build/computer/install.ps1 | iex                       # Windows
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --version 1.0.31 --yes
 curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- repair --version 1.0.31 --yes
-CI=1 curl -fsSL https://cdn.raft.build/computer/install.sh | sh            # unattended: current release, no questions
+curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- status
+curl -fsSL https://cdn.raft.build/computer/install.sh | CI=1 sh
 ```
 
-| Command | Does |
-|---|---|
-| `install`, `upgrade` (default) | Bring this machine to one exact version: install if fresh, adopt then upgrade if installed before K, upgrade through K if managed, repair if broken. A fresh install ends with first setup (`raft-computer login`) when someone is there, then starts Computer; unattended it stays installed and says what to do next. |
-| `repair` | Ask for repair explicitly: quarantine K's state and reinstall. Held unless the machine is broken. |
-| `status` | What is installed and what is running. The receipt is not a live observation. |
+On Windows:
+
+```powershell
+irm https://cdn.raft.build/computer/install.ps1 | iex
+& ([scriptblock]::Create((irm https://cdn.raft.build/computer/install.ps1))) --channel alpha
+```
+
+The bootstrap downloads and verifies the installer, runs it, and cleans up its
+temporary files. It uses a published release. To run code from this checkout,
+use the native executable produced by the build command below.
+
+| Command | Behavior |
+| --- | --- |
+| `install`, `upgrade` | Bring the machine to the selected version: install if fresh, adopt a pre-K installation, upgrade a managed installation, or repair a broken one. No command means `upgrade` in the native CLI and `install` in the bootstrap; both choose the path from the machine's state. |
+| `repair` | Reinstall a broken installation, retaining its previous state. Held when the installation is healthy. |
+| `status` | Settle interrupted work and report the current installation. Does not reinstall. |
+| `recover` | Recover interrupted work from local state, without selecting a new release. |
 
 | Option | Meaning |
-|---|---|
-| `--version V` | The exact version. Default: the channel's current release, resolved through Hands. |
-| `--channel main\|alpha\|<feature-channel>` | Which channel to resolve. A feature channel is the named cohort Computer's release workflow registered in Hands (the `computer-v<base>-<channel>.<n>` tags). Attended, the resolved version is shown and asked about. |
-| `--yes` | Skip the question when attended. Unattended runs never ask; running one is the consent, repair included. |
-| `--allow-downgrade` | Intend an older target; otherwise it is held. Going back to a version that worked is this. |
+| --- | --- |
+| `--version V` | Select an exact Computer version. |
+| `--channel NAME` | Select `main` (default), `alpha`, or a named feature channel. Resolved once through Hands; mutually exclusive with `--version`. |
+| `--yes`, `-y` | Accept the selected version without an attended confirmation. Unattended runs never ask; invocation is consent. |
+| `--allow-downgrade` | Explicitly allow an older target. Otherwise the request is held. |
+| `--json` | Print a structured result instead of the human result line. |
+
+`raft-computer-installer --version` alone prints the installer's own version.
+
+First setup uses `raft-computer login` when someone is at the terminal. After a
+successful login, Computer starts. An unattended fresh install stays stopped and
+reports the next step. Upgrades do not repeat login: a running service comes back
+running, and a stopped installation stays stopped.
+
+Exit codes: **0** succeeded or already up to date; **1** failed or rolled back;
+**2** held; **3** recovery unresolved. Details are recorded under
+`<RAFT_HOME>/computer/installer/receipts/`. Repeating a completed operation ID
+returns its receipt; use `status` to observe the machine now.
+
+## Configuration
 
 | Environment | Meaning |
-|---|---|
-| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Unattended: no questions. Otherwise a terminal decides. |
-| `RAFT_HOME` (or `SLOCK_HOME`) | Computer's state root; K state lives at `<home>/computer/k`. Default `~/.slock`. |
-| `RAFT_COMPUTER_INSTALL_DIR` | Where `raft-computer` and its sidecar are published. Default `~/.local/bin`, which a fresh install adds to `~/.zshrc` or `~/.bashrc` when missing; `RAFT_COMPUTER_NO_MODIFY_PATH=1` leaves profiles alone. |
-| `RAFT_COMPUTER_RELEASE_BASE` | CDN holding `<version>/manifest.json` and artifacts. |
-| `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | The release authority a channel is resolved through. |
-| `RAFT_COMPUTER_INSTALLER_VERSION`, `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Which installer the bootstrap fetches and from where. |
-| `RAFT_COMPUTER_INSTALLER_NODE` | Node 24+ used to run the installer. |
-| `RAFT_COMPUTER_OPERATION_ID` | For launchers only: the operation id, so a repeated request replays its receipt instead of running again. |
+| --- | --- |
+| `CI`, `RAFT_COMPUTER_NON_INTERACTIVE=1` | Run unattended. Otherwise terminal availability determines whether to ask. |
+| `RAFT_HOME`, fallback `SLOCK_HOME` | Computer's state root; default `~/.slock`. |
+| `RAFT_COMPUTER_INSTALL_DIR` | Directory for `raft-computer` and its sidecar; default `~/.local/bin`. For that default, update a supported shell profile or Windows user PATH when needed. Custom directories produce a PATH hint. |
+| `RAFT_COMPUTER_NO_MODIFY_PATH=1` | Leave PATH configuration unchanged. |
+| `RAFT_COMPUTER_RELEASE_BASE` | Product CDN holding `<version>/manifest.json` and artifacts; default `https://cdn.raft.build/computer`. |
+| `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | Product release authority; defaults `https://hands.build` and `raft-computer-cli`. |
+| `RAFT_COMPUTER_INSTALLER_CHANNEL` | Installer release channel; default `main`. Separate from Computer's `--channel`. |
+| `RAFT_COMPUTER_INSTALLER_DL_BASE` | Installer download authority; default `https://hands.build/dl/raft-computer-installer`. |
+| `RAFT_COMPUTER_INSTALLER_RELEASE_BASE` | Exact static installer release directory containing `SHA256SUMS` and `native/<target>/…`; overrides installer channel resolution. |
+| `RAFT_COMPUTER_OPERATION_ID` | Launcher-supplied request ID for replay; generated when omitted. |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` | Download proxy settings. |
 
-Exit codes: 0 upgraded, up to date or installed; 1 failed or rolled back;
-2 not done. Every run prints one line, in plain words; the
-receipt under `<home>/computer/installer/receipts/` has the details.
+## Computer adapter
 
-## Pieces
+The adapter uses Computer's `start`, `stop`, `status --json` and `--version`
+commands. A live status attestation supplies `servicePid`, `computerVersion` and
+`serviceGeneration`; the installer also checks OS process identity. Stopped
+installations are checked through a short-lived `--version` process.
 
-| File | Role |
-|---|---|
-| `install.sh`, `install.ps1` | Bootstrap: download one pinned installer release, verify `SHA256SUMS`, and exec the matching native SEA. No Node fallback or portable runtime is published. |
-| `native/<platform>/raft-computer-installer` | The entry as a single executable (Node SEA): presence, version resolution and Hands/CDN identity check, consent, settle, read the world, install/adopt/repair, one line and one exit code. Supervises the runner through K's launcher. |
-| `native/<platform>/raft-computer-installer-runner` | K plus the Computer adapter as a single executable. Serves one request on stdin under K's lock; verified and retained by the supervisor for recovery. |
+`photon_rs_bg.wasm` is verified against the release manifest, cached per version,
+and published beside its matching binary, including during rollback. Product
+bytes run from the installation directory, outside K's slots.
 
-The adapter drives Computer through its CLI on `PATH`: `stop`, `start`, and
-`status --json`, whose `attestation` carries `servicePid`,
-`computerVersion` and `serviceGeneration`, the start id K compares across the
-handover. Slot bytes are published onto `PATH` atomically before `start`;
-nothing runs from inside a slot.
-
-Computer needs a login before it can start, so the adapter has two modes,
-decided at `quiesce` and remembered in `<home>/computer/installer/host-mode.json`
-for recovery. If a service was running, it is stopped and the candidate must
-come back as a live service. If nothing was running, the candidate is run
-for its `--version` and that process is the readback: a new pid and start id
-every time. A fresh install never starts Computer by itself: it publishes,
-self-checks, then runs `raft-computer login` on the terminal when someone
-is there, and only after a successful login starts Computer and reads it
-back. `status --json` must work without a service and may carry a top-level
-`nextStep` string ("run raft-computer login"), which the installer repeats. The `photon_rs_bg.wasm` sidecar is verified
-against the release manifest, kept per version under the installer's state,
-and published beside the binary with the slot it belongs to.
-
-State: K owns `<home>/computer/k`. The installer owns
-`<home>/computer/installer/{receipts,scratch,sidecars,quarantine}`. K's
-records are its working memory for one transaction; anything there the
-installer or K cannot read is moved to `quarantine/` and the machine is
-reinstalled in the same run. Nothing under `<home>` is ever deleted by the
-installer, and nothing outside `computer/` is touched.
+K owns `<RAFT_HOME>/computer/k`. The installer keeps its operation records,
+receipts, cached sidecars and recovery files under `<RAFT_HOME>/computer/installer`.
+Repair retains previous state under `quarantine/` and preserves Computer's user
+data and credentials. Installations owned by another package manager are held.
 
 ## Develop
 
-```
-npm ci
-npm run typecheck
-npm run build        # internal bundle plus dist/install.sh, SHA256SUMS (portable bundle is not published)
-npm run build:native # plus dist/native/<this platform>/raft-computer-installer{,-runner}
-npm test             # real processes against a fake Computer: unattended, fresh, cold and live
-                     # upgrades, replay, downgrade, first setup, adopt, foreign
-                     # manager, broken and repair; and through the bootstrap: clean
-                     # install of the current release and of one version, a machine
-                     # without Node, a tampered installer, and the dirty K state an
-                     # earlier K may have left (all reinstalled over, nothing deleted)
-npm run test:native  # the same suites driving the single executables
+Use Rust 1.89 (pinned in `rust-toolchain.toml`), Python 3.11 or newer, and the
+platform's native linker. Node is not required for building, running or core
+verification. On Windows, use `python` in place of `python3`.
+
+```sh
+python3 scripts/build.py           # native executable, bootstrap and manifests
+python3 scripts/verify.py          # static checks, build and native process scenarios
+python3 scripts/verify.py --real   # also exercise actual published Computer binaries
 ```
 
-Against a real Computer build, everything but a live-service upgrade (that
-needs a login):
+The executable is `dist/native/<target>/raft-computer-installer` (`.exe` on
+Windows). Targets are `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` and
+`win32-x64`. macOS builds are ad-hoc signed by default; set
+`RAFT_CODESIGN_IDENTITY` to use a Developer ID identity.
 
-```
-node scripts/e2e-real-computer.mjs ../slock/packages/computer/dist/raft-computer.js
-```
+See [verification/README.md](verification/README.md) for scenarios, isolated test
+resources and the distinction between fixture and real-product coverage.
+Implementation progress and verification results are tracked in the
+[alignment document](https://github.com/botiverse/elephant/blob/rust-native/docs/installer-alignment.zh-CN.md).
 
-It serves that build as two versions from a local release base and drives
-the bootstrap through fresh install, cold upgrade, up to date, held
-downgrade, an intended downgrade, `raft-computer upgrade`, status, and a
-broken machine repaired. Temp homes only.
+## Release
 
-A tag `v*` runs `.github/workflows/release.yml`: one job per platform builds
-and tests the executables, then one job assembles the portable files and
-every executable under one `SHA256SUMS` and publishes a GitHub prerelease.
-Mirror the assets under `RAFT_COMPUTER_INSTALLER_RELEASE_BASE`, keeping the
-`native/<platform>/` layout; the bootstrap never runs an unverified file.
+A `v<version>` tag matching `Cargo.toml` runs the five-platform build and validation
+workflow. Each platform produces one native installer executable, which includes
+its supervisor and worker.
 
-## Not yet
+`scripts/publish.py` publishes through the Hands HTTP API: one build containing
+all platform binaries and checksums, followed by one release and public download
+readback. CI uses `HANDS_INSTALLER_DEPLOY_TOKEN`; prereleases go to `alpha`, stable
+versions to `main`. GitHub receives the bootstrap scripts, manifest, checksums and
+an archive of the complete release.
 
-- `raft-computer upgrade` in Computer itself: it should ask, then run this
-  bootstrap unattended with `--version`.
-- Windows is ported (console instead of `/dev/tty`, processes through
-  CIM, the running exe renamed aside before the new one is published, the
-  user PATH in the registry, `win32-x64` in the release matrix, the test
-  fake built as a single executable) but has not yet run on a Windows
-  machine; CI's `windows-latest` job is the first check.
-- macOS executables are ad-hoc signed; set `RAFT_CODESIGN_IDENTITY` in the
-  build for a Developer ID signature.
+The bootstrap resolves the installer channel once and downloads all files from
+that immutable release. Static mirrors use the same `native/<target>/` layout.

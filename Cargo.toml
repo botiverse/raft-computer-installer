@@ -1,0 +1,42 @@
+[package]
+name = "raft-computer-installer"
+version = "0.2.0-rc.5"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[lib]
+path = "rust/lib.rs"
+
+[[bin]]
+name = "raft-computer-installer"
+path = "rust/main.rs"
+
+[[bin]]
+name = "raft-computer-fixture"
+path = "verification/fixture.rs"
+required-features = ["verification-fixture"]
+
+[features]
+verification-fixture = []
+
+[dependencies]
+k-carrier = { git = "https://github.com/botiverse/k-carrier", rev = "c4c38843882df5d94458e0eb56b67ed5d779cbf2" }
+async-trait = "0.1"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"

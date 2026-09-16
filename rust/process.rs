@@ -1,0 +1,297 @@
+//! Process identity comes from the OS executable path and creation identity,
+//! never a name, command-line substring, or an unqualified persisted PID.
+use crate::{Error, Result};
+use k_carrier::error::invalid;
+use serde::{Deserialize, Serialize};
+use std::{fs, path::{Path, PathBuf}, time::Duration};
+use tokio::time::{Instant, sleep};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Identity {
+    pub pid: u32,
+    pub executable: PathBuf,
+    pub created: String,
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    #[cfg(windows)]
+    { left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()) }
+    #[cfg(not(windows))]
+    { left == right }
+}
+
+pub fn observe(pid: u32) -> Result<Option<Identity>> {
+    if pid <= 1 { return Ok(None); }
+    native::observe(pid)
+}
+
+pub fn matches(identity: &Identity) -> Result<bool> {
+    match observe(identity.pid)? {
+        Some(current) => Ok(current.created == identity.created && same_path(&current.executable, &identity.executable)),
+        None if native::definitely_exited(identity.pid)? => Ok(false),
+        None => Err(Error::Uncertain("recorded process identity is no longer observable".into())),
+    }
+}
+
+pub fn attest(pid: u32, binary: &Path) -> Result<Identity> {
+    observe(pid)?.filter(|p| same_path(&p.executable, binary))
+        .ok_or_else(|| invalid("product attestation does not identify a live installed executable"))
+}
+
+pub fn installed(binary: &Path) -> Result<Vec<Identity>> {
+    let mut identities = Vec::new();
+    for pid in native::pids()? {
+        if let Some(identity) = observe(pid)? {
+            if same_path(&identity.executable, binary) { identities.push(identity); }
+        }
+    }
+    identities.sort_by_key(|p| p.pid);
+    Ok(identities)
+}
+
+pub async fn wait_gone(identities: &[Identity], budget: Duration) -> Result<Vec<Identity>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let mut left = Vec::new();
+        for identity in identities {
+            if matches(identity)? { left.push(identity.clone()); }
+        }
+        if left.is_empty() || Instant::now() >= deadline { return Ok(left); }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub async fn terminate(identities: &[Identity]) -> Result<Vec<u32>> {
+    let mut forced = Vec::new();
+    for identity in identities {
+        if matches(identity)? { native::signal(identity, false)?; forced.push(identity.pid); }
+    }
+    let remaining = wait_gone(identities, Duration::from_secs(15)).await?;
+    for identity in &remaining { native::signal(identity, true)?; }
+    if !wait_gone(&remaining, Duration::from_secs(5)).await?.is_empty() {
+        return Err(Error::Uncertain("product processes survived termination".into()));
+    }
+    Ok(forced)
+}
+
+#[cfg(target_os = "linux")]
+mod native {
+    use super::*;
+    use std::{ffi::OsString, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::{ffi::{OsStrExt, OsStringExt}, fs::MetadataExt}}};
+
+    fn read_stat(pid: u32) -> Result<Option<String>> {
+        let text = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let fields = text.rsplit_once(") ").ok_or_else(|| invalid("invalid process identity"))?.1
+            .split_whitespace().collect::<Vec<_>>();
+        if matches!(fields.first(), Some(&"Z" | &"X")) { return Ok(None); }
+        let start = fields.get(19).ok_or_else(|| invalid("missing process creation identity"))?;
+        if !start.bytes().all(|c| c.is_ascii_digit()) { return Err(invalid("invalid process creation identity")); }
+        // /proc start ticks are scoped to the current boot; the boot UUID makes
+        // a record safe to inspect after reboot as well as PID reuse.
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        Ok(Some(format!("{}:{start}", boot.trim())))
+    }
+
+    pub fn definitely_exited(pid: u32) -> Result<bool> { Ok(read_stat(pid)?.is_none()) }
+
+    pub fn observe(pid: u32) -> Result<Option<Identity>> {
+        let root = PathBuf::from(format!("/proc/{pid}"));
+        match fs::metadata(&root) {
+            Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => return Ok(None),
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let Some(created) = read_stat(pid)? else { return Ok(None); };
+        let executable = match fs::read_link(root.join("exe")) {
+            Ok(path) => {
+                let raw = path.as_os_str().as_bytes();
+                PathBuf::from(OsString::from_vec(raw.strip_suffix(b" (deleted)").unwrap_or(raw).to_vec()))
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if read_stat(pid)?.as_ref() != Some(&created) { return Ok(None); }
+        Ok(Some(Identity { pid, executable, created }))
+    }
+
+    pub fn pids() -> Result<Vec<u32>> {
+        let mut pids = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            if let Some(pid) = entry?.file_name().to_str().and_then(|s| s.parse().ok()) { pids.push(pid); }
+        }
+        Ok(pids)
+    }
+
+    pub fn signal(identity: &Identity, force: bool) -> Result<()> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) { return Ok(()); }
+            return Err(Error::Uncertain("cannot retain product process identity for termination".into()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        if !matches(identity)? { return Ok(()); }
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) { return Err(error.into()); }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod native {
+    use super::*;
+    use std::{ffi::OsString, mem::{MaybeUninit, size_of}, os::unix::ffi::OsStringExt};
+
+    fn info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let count = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0,
+            info.as_mut_ptr().cast(), size_of::<libc::proc_bsdinfo>() as i32) };
+        if count == 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) { return Ok(None); }
+            return Err(error.into());
+        }
+        if count as usize != size_of::<libc::proc_bsdinfo>() { return Err(invalid("incomplete process identity")); }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_uid != unsafe { libc::geteuid() } || info.pbi_status == 5 { return Ok(None); }
+        Ok(Some(info))
+    }
+
+    pub fn definitely_exited(pid: u32) -> Result<bool> {
+        if !k_carrier::lock::process_alive(pid) { return Ok(true); }
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let count = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0,
+            info.as_mut_ptr().cast(), size_of::<libc::proc_bsdinfo>() as i32) };
+        Ok(count as usize == size_of::<libc::proc_bsdinfo>() && unsafe { info.assume_init().pbi_status } == 5)
+    }
+
+    pub fn observe(pid: u32) -> Result<Option<Identity>> {
+        if pid > i32::MAX as u32 { return Ok(None); }
+        let Some(first) = info(pid)? else { return Ok(None); };
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let count = unsafe { libc::proc_pidpath(pid as i32, path.as_mut_ptr().cast(), path.len() as u32) };
+        if count <= 0 {
+            if info(pid)?.is_none() { return Ok(None); }
+            return Err(invalid("cannot read product executable identity"));
+        }
+        path.truncate(path.iter().position(|c| *c == 0).unwrap_or(path.len()));
+        let Some(last) = info(pid)? else { return Ok(None); };
+        if first.pbi_start_tvsec != last.pbi_start_tvsec || first.pbi_start_tvusec != last.pbi_start_tvusec { return Ok(None); }
+        Ok(Some(Identity { pid, executable: PathBuf::from(OsString::from_vec(path)),
+            created: format!("{}:{}", first.pbi_start_tvsec, first.pbi_start_tvusec) }))
+    }
+
+    pub fn pids() -> Result<Vec<u32>> {
+        // libproc's PROC_ALL_PIDS enumerates identities, not command-line text.
+        let needed = unsafe { libc::proc_listpids(1, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 { return Err(std::io::Error::last_os_error().into()); }
+        let mut pids = vec![0i32; needed as usize / size_of::<i32>() + 1024];
+        loop {
+            let capacity = pids.len() * size_of::<i32>();
+            let count = unsafe { libc::proc_listpids(1, 0, pids.as_mut_ptr().cast(), capacity as i32) };
+            if count < 0 { return Err(std::io::Error::last_os_error().into()); }
+            if count as usize >= capacity {
+                if pids.len() > 1_000_000 { return Err(invalid("process listing too large")); }
+                pids.resize(pids.len() * 2, 0);
+                continue;
+            }
+            pids.truncate(count as usize / size_of::<i32>());
+            return Ok(pids.into_iter().filter(|p| *p > 1).map(|p| p as u32).collect());
+        }
+    }
+
+    pub fn signal(identity: &Identity, force: bool) -> Result<()> {
+        // macOS has no pidfd: recheck OS start time and executable immediately
+        // before each signal. A stale persisted PID alone never authorizes it.
+        if !matches(identity)? { return Ok(()); }
+        if unsafe { libc::kill(identity.pid as i32, if force { libc::SIGKILL } else { libc::SIGTERM }) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) { return Err(error.into()); }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    use std::{ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::{Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{Diagnostics::ToolHelp::*, Threading::*}};
+
+    struct Handle(HANDLE);
+    impl Drop for Handle { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+
+    pub fn definitely_exited(pid: u32) -> Result<bool> { Ok(!k_carrier::lock::process_alive(pid)) }
+
+    fn identity(handle: HANDLE, pid: u32) -> Result<Option<Identity>> {
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => return Ok(None),
+            WAIT_TIMEOUT => {},
+            _ => return Err(std::io::Error::last_os_error().into()),
+        }
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut length) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        path.truncate(length as usize);
+        let mut created = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Some(Identity { pid, executable: PathBuf::from(OsString::from_wide(&path)),
+            created: format!("{}:{}", created.dwHighDateTime, created.dwLowDateTime) }))
+    }
+
+    pub fn observe(pid: u32) -> Result<Option<Identity>> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() { return Ok(None); } // Exited or outside this user's permissions.
+        let handle = Handle(handle);
+        identity(handle.0, pid)
+    }
+
+    pub fn pids() -> Result<Vec<u32>> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE { return Err(std::io::Error::last_os_error().into()); }
+        let snapshot = Handle(snapshot);
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut result = Vec::new();
+        let mut found = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+        while found != 0 {
+            result.push(entry.th32ProcessID);
+            found = unsafe { Process32NextW(snapshot.0, &mut entry) };
+        }
+        Ok(result)
+    }
+
+    pub fn signal(expected: &Identity, _force: bool) -> Result<()> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, expected.pid) };
+        if handle.is_null() {
+            if !matches(expected)? { return Ok(()); }
+            return Err(Error::Uncertain("cannot retain product process handle".into()));
+        }
+        let handle = Handle(handle);
+        let Some(current) = identity(handle.0, expected.pid)? else { return Ok(()); };
+        if current.created != expected.created || !same_path(&current.executable, &expected.executable) { return Ok(()); }
+        // Windows has no SIGTERM equivalent for a detached native service.
+        // The graceful product stop command has already run before this fallback.
+        if unsafe { TerminateProcess(handle.0, 1) } == 0 { return Err(std::io::Error::last_os_error().into()); }
+        Ok(())
+    }
+}

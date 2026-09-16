@@ -1,0 +1,63 @@
+//! Supervise the complete product operation, including fresh install and
+//! repair, rather than only the K upgrade portion. Retry only after worker exit.
+use crate::{Error, Result, config::Config, request::{Reply, Request}};
+use k_carrier::{artifact::sha256, error::invalid, storage::{ensure_dir, write_durable, write_json}};
+use std::{fs, process::Stdio, time::Duration};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command, time::timeout};
+
+pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
+    request.validate()?;
+    let root = cfg.scratch().join("supervisors");
+    ensure_dir(&root)?;
+    let directory = tempfile::Builder::new().prefix("operation-").tempdir_in(root)?;
+    let executable = directory.path().join(if cfg!(windows) { "installer.exe" } else { "installer" });
+    let bytes = fs::read(std::env::current_exe()?)?;
+    write_durable(&executable, &bytes, true)?;
+    let digest = sha256(&bytes);
+    write_json(&directory.path().join("recovery.json"), &serde_json::json!({
+        "formatVersion":1,"sha256":digest,"size":bytes.len(),"request":request
+    }))?;
+    let mut last = Reply::plain(&request.id, 3, "Installation could not be settled. Run raft-computer-installer recover.");
+    for attempt in 0..3 {
+        // Verify every execution, including retries of the retained copy.
+        if sha256(&fs::read(&executable)?) != digest { return Err(invalid("supervisor executable identity changed")); }
+        let mut next = request.clone();
+        next.recovery_only |= attempt != 0;
+        let mut child = Command::new(&executable).arg("--operation-worker")
+            .envs(cfg.environment()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let mut input = child.stdin.take().ok_or_else(|| invalid("worker stdin missing"))?;
+        let output = child.stdout.take().ok_or_else(|| invalid("worker stdout missing"))?;
+        // The first operation may include interactive login. Recovery never
+        // repeats login and receives a shorter, independent deadline.
+        let budget = Duration::from_secs(if attempt == 0 { 1200 } else { 360 });
+        let result = timeout(budget, async {
+            input.write_all(&serde_json::to_vec(&next)?).await?;
+            input.shutdown().await?;
+            drop(input);
+            let mut bytes = Vec::new();
+            output.take(65537).read_to_end(&mut bytes).await?;
+            let status = child.wait().await?;
+            if bytes.len() > 65536 { return Err(invalid("worker response too large")); }
+            let reply: Reply = serde_json::from_slice(&bytes)?;
+            reply.validate(&request.id)?;
+            if status.code() != Some(i32::from(reply.exit_code)) { return Err(invalid("worker exit does not match its response")); }
+            Ok::<_, Error>(reply)
+        }).await;
+        match result {
+            Ok(Ok(reply)) => {
+                if reply.exit_code != 3 { return Ok(reply); }
+                last = reply;
+            },
+            _ => {
+                let _ = child.start_kill();
+                if !matches!(timeout(Duration::from_secs(5), child.wait()).await, Ok(Ok(_))) {
+                    let _retained = directory.keep();
+                    return Ok(Reply::plain(&request.id, 3, "The installer worker has not exited. Recovery must wait for it."));
+                }
+            },
+        }
+    }
+    // Preserve the exact executable and request when automatic recovery stops.
+    let _retained = directory.keep();
+    Ok(last)
+}
