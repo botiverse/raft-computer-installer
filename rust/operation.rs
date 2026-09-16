@@ -930,14 +930,14 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         reply.world = Some(observed);
         return Ok(reply);
     }
-    if let World::Held { .. } = &observed {
+    if let World::Held { reason } = &observed {
         return reject(
             cfg,
             request,
             request.version.clone(),
             None,
             unresolved,
-            "This installation belongs to another manager. Use that manager or a different install directory.",
+            &format!("Not done: {reason}."),
         );
     }
     let broken = unresolved || matches!(observed, World::Broken { .. } | World::Upgrading { .. });

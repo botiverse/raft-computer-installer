@@ -336,8 +336,13 @@ class InstallerContract(unittest.TestCase):
         script = b"#!/usr/bin/env node\n// historical package-manager shim; never executed\n"
         machine.binary.write_bytes(script)
         machine.binary.chmod(0o755)
-        machine.json(["install", "--version", "1.1.0"], expected=2)
-        self.assertEqual(machine.binary.read_bytes(), script)
+        self.server.requests.clear()
+        for action in (["status"], ["install", "--version", "1.1.0"], ["repair", "--version", "1.1.0"]):
+            result = machine.json(action, expected=2)
+            self.assertEqual(machine.binary.read_bytes(), script)
+            self.assertIn(str(machine.binary), result["line"])
+            self.assertIn("remove", result["line"])
+        self.assertEqual(self.server.requests, [])
 
     def test_broken_states_are_repaired_then_recovery_payloads_are_removed(self):
         def damage_artifact(machine):

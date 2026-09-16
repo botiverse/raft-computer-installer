@@ -87,17 +87,26 @@ pub async fn read(cfg: &Config) -> Result<World> {
     // Foreign ownership wins even when old or corrupt K records also exist.
     if let Some(manager) = foreign_manager(&cfg.binary)? {
         return Ok(World::Held {
-            reason: format!("the installed program belongs to {manager}"),
+            reason: format!(
+                "{} belongs to {manager}; remove it with that manager before retrying",
+                cfg.binary.display()
+            ),
         });
     }
     if fs::symlink_metadata(&cfg.binary).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
-            reason: "the installed path is a symlink owned outside this installer".into(),
+            reason: format!(
+                "{} is a link owned outside this installer; remove it with its owning manager before retrying",
+                cfg.binary.display()
+            ),
         });
     }
     if fs::symlink_metadata(&cfg.sidecar).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
-            reason: "the installed sidecar is a symlink owned outside this installer".into(),
+            reason: format!(
+                "{} is a link owned outside this installer; remove it with its owning manager before retrying",
+                cfg.sidecar.display()
+            ),
         });
     }
     if exists(&cfg.installer_dir.join("metadata-damage.json"))? {
