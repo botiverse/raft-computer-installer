@@ -612,12 +612,14 @@ class InstallerContract(unittest.TestCase):
                 if running:
                     machine.login_start()
                 gate = machine.home / "effect.gate"
-                extra = {"RAFT_COMPUTER_OPERATION_ID": "interrupted"}
+                extra = {"RAFT_COMPUTER_OPERATION_ID": "interrupted",
+                    "RCI_FIXTURE_INSTALLER": str(self.server.installer),
+                    "RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"}
                 if running:
                     extra["RCI_FIXTURE_STOP_GATE"] = str(gate)
                 else:
                     extra.update(RCI_FIXTURE_PUBLISHED_GATE=str(gate), RCI_FIXTURE_PUBLISHED_PATH=str(machine.binary), RCI_FIXTURE_PUBLISHED_VERSION="1.1.0")
-                parent = subprocess.Popen(machine.command(["upgrade", "--version", "1.1.0", "--json"]),
+                parent = subprocess.Popen([str(machine.binary), "upgrade", "--version", "1.1.0", "--json"],
                     env=machine.env(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     wait_for(gate.exists)

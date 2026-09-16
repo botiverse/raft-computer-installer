@@ -47,6 +47,28 @@ pub struct Answer {
     pub processes: Vec<process::Identity>,
 }
 
+pub fn bind_recovery_caller(cfg: &Config, operation_id: &str) -> Result<()> {
+    let Some(caller) = &cfg.waiting_caller else {
+        return Ok(());
+    };
+    // The normal recovery path still diagnoses missing/corrupt transaction
+    // state. Only rebind an already valid operation record here.
+    let Ok(mut record) = read(cfg) else {
+        return Ok(());
+    };
+    if record.operation_id != operation_id {
+        return Ok(());
+    }
+    if let Some(previous) = &record.waiting_caller
+        && !process::same_instance(previous, caller)
+        && process::instance_matches(previous)?
+    {
+        return Err(Error::Locked(previous.pid));
+    }
+    record.waiting_caller = Some(caller.clone());
+    save(cfg, &record)
+}
+
 pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity>> {
     let caller = cfg.waiting_caller.as_ref();
     Ok(process::installed(&cfg.binary)?

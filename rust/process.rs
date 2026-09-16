@@ -44,6 +44,26 @@ pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
             "installer parent changed during attestation".into(),
         ));
     }
+    #[cfg(windows)]
+    if let Some(parent) = &identity {
+        let own = observe(std::process::id())?
+            .ok_or_else(|| invalid("installer identity unavailable"))?;
+        let ticks = |created: &str| -> Result<u64> {
+            let (high, low) = created
+                .split_once(':')
+                .ok_or_else(|| invalid("invalid creation time"))?;
+            let high = high
+                .parse::<u32>()
+                .map_err(|_| invalid("invalid creation time"))?;
+            let low = low
+                .parse::<u32>()
+                .map_err(|_| invalid("invalid creation time"))?;
+            Ok((u64::from(high) << 32) | u64::from(low))
+        };
+        if ticks(&parent.created)? > ticks(&own.created)? {
+            return Err(Error::Uncertain("installer parent PID was reused".into()));
+        }
+    }
     Ok(identity.filter(|p| same_path(&p.executable, binary)))
 }
 
@@ -52,6 +72,16 @@ pub fn observe(pid: u32) -> Result<Option<Identity>> {
         return Ok(None);
     }
     native::observe(pid)
+}
+
+pub fn instance_matches(identity: &Identity) -> Result<bool> {
+    match observe(identity.pid)? {
+        Some(current) => Ok(same_instance(identity, &current)),
+        None if native::definitely_exited(identity.pid)? => Ok(false),
+        None => Err(Error::Uncertain(
+            "recorded caller identity is no longer observable".into(),
+        )),
+    }
 }
 
 pub fn matches(identity: &Identity) -> Result<bool> {

@@ -686,6 +686,9 @@ async fn resume(
         settle_terminal_metadata(cfg, &old);
         return Ok(Reply::receipt(old));
     }
+    if recovery {
+        host::bind_recovery_caller(cfg, &plan.request.id)?;
+    }
     // Every recovery waits for product commands that outlived its predecessor.
     if recovery
         && !(plan.kind == Kind::Repair && matches!(plan.phase, Phase::Ready | Phase::Stopping))
