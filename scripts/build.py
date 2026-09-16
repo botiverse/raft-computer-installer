@@ -66,8 +66,12 @@ def assemble(output, require_all=False):
     tag = os.environ.get("GITHUB_REF_NAME", "")
     if os.environ.get("GITHUB_REF_TYPE") == "tag" and tag != f"v{version}":
         raise ValueError("release tag does not match Cargo.toml version")
+    locked = tomllib.loads((ROOT / "Cargo.lock").read_text())
+    k = next(package for package in locked["package"] if package["name"] == "k-carrier")
+    if k.get("source") != "registry+https://github.com/rust-lang/crates.io-index" or cargo["dependencies"]["k-carrier"] != "=" + k["version"]:
+        raise ValueError("K must be an exact crates.io dependency matching Cargo.lock")
     manifest = {"schema": "raft-computer-installer/release/v3", "installerVersion": version,
-                "gitCommit": os.environ.get("GITHUB_SHA"), "kCommit": cargo["dependencies"]["k-carrier"]["rev"],
+                "gitCommit": os.environ.get("GITHUB_SHA"), "kVersion": k["version"], "kChecksum": k["checksum"],
                 "files": inventory}
     path = output / "installer-manifest.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
