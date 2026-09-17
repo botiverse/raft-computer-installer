@@ -14,11 +14,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from harness import ReleaseServer
+from harness import ReleaseServer, TARGET
 from http_client import public_request
 
 HANDS = "https://hands.build"
-CDN = "https://cdn.raft.build/computer"
 
 
 def read_json(url):
@@ -39,7 +38,10 @@ def versions(current, older):
         for number in range(patch - 1, max(-1, patch - 9), -1):
             candidate = f"{major}.{minor}.{number}"
             try:
-                read_json(CDN + f"/{candidate}/manifest.json")
+                platform, arch = TARGET.split("-")
+                response = read_json(HANDS + "/public/v2/apps/raft-computer-cli/updates/check?" + urllib.parse.urlencode(dict(product_type="cli-binary", current_version="0.0.0", version=candidate, platform=platform, arch=arch)))
+                if not response.get("update_available") or not response.get("artifact", {}).get("photon_wasm"):
+                    continue
                 older = candidate
                 break
             except urllib.error.HTTPError as error:
@@ -78,7 +80,7 @@ def main():
     current, older = versions(args.current, args.older)
     server = ReleaseServer()
     machine = server.machine()
-    extra = {"RAFT_COMPUTER_RELEASE_BASE": CDN, "RAFT_COMPUTER_HANDS_ORIGIN": HANDS,
+    extra = {"RAFT_COMPUTER_HANDS_ORIGIN": HANDS,
         "RAFT_COMPUTER_INSTALLER_RELEASE_BASE": server.base + "/installer"}
 
     def run(arguments, expected=0):

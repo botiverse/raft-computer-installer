@@ -15,7 +15,7 @@ import urllib.request
 
 from harness import ReleaseServer, ROOT, TARGET, DIST, SUFFIX
 from http_client import public_request
-from real import assert_stopped, HANDS, CDN
+from real import assert_stopped, HANDS
 
 TARGETS = ('darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-x64')
 BASELINES = Path(__file__).parent / 'baselines/published-2026-09-16.json'
@@ -91,23 +91,42 @@ def make_plan(mode, candidate=None):
     pinned = {r['version']: r for r in json.loads(BASELINES.read_text())['releases']}
     releases = {}
     for version in sorted({c[k] for c in cases for k in ('source', 'target') if c[k]}, key=version_key):
-        url = CDN + '/' + version + '/manifest.json'
-        body, manifest = fetch_json(url)
-        digest = hashlib.sha256(body).hexdigest()
-        if version in pinned and digest != pinned[version]['manifestSHA256']:
-            raise ValueError('fixed baseline manifest identity changed: ' + version)
-        if manifest['version'] != version or any(t not in manifest['targets'] for t in TARGETS):
-            raise ValueError('version or platform inventory mismatch: ' + version)
-        if version == latest:
-            for target in TARGETS:
-                platform, arch = target.split('-')
-                assets = [a for a in authority['assets'] if a['platform'] == platform and a['arch'] == arch
-                          and a['filetype'] == 'binary' and a['variant'] is None]
-                expected = manifest['targets'][target]
-                if len(assets) != 1 or assets[0]['sha256'] != expected['sha256'] or assets[0]['size_bytes'] != expected['size']:
-                    raise ValueError('main authority and manifest disagree: ' + target)
-        releases[version] = {'manifestUrl': url, 'manifestSHA256': digest, 'manifest': manifest}
-    return {'schema': 'installer-cold-matrix/v1', 'createdAt': datetime.now(timezone.utc).isoformat(),
+        manifest = {'version': version, 'targets': {}}
+        selections = {}
+        for target in TARGETS:
+            platform, arch = target.split('-')
+            query = urllib.parse.urlencode(dict(product_type='cli-binary', current_version='0.0.0', version=version, platform=platform, arch=arch))
+            _, selection = fetch_json(HANDS + '/public/v2/apps/raft-computer-cli/updates/check?' + query)
+            if not selection.get('update_available') or selection.get('release', {}).get('version') != version:
+                raise ValueError('version identity changed: ' + version)
+            artifact = selection['artifact']
+            release_id = selection['release']['id']
+            prefix = HANDS + '/dl/raft-computer-cli/releases/' + release_id + '/' + target
+            if artifact.get('platform') != platform or artifact.get('arch') != arch or artifact.get('download_url') != prefix:
+                raise ValueError('platform or hosted URL identity changed: ' + target)
+            def entry(identity, filename, expected_url):
+                if identity.get('download_url') != expected_url:
+                    raise ValueError('representation does not belong to fixed Hands release')
+                return {'file': filename, 'sha256': identity['sha256'], 'size': identity['size_bytes'], 'download_url': expected_url}
+            raw = entry(artifact, 'raft-computer-' + target, prefix)
+            if artifact.get('gzip'):
+                raw['gz'] = entry(artifact['gzip'], raw['file'] + '.gz', prefix + '.gz')
+            wasm = entry(artifact['photon_wasm'], 'photon_rs_bg.wasm', prefix + '?kind=photon-wasm')
+            if version in pinned:
+                for actual, expected in ((raw, pinned[version]['targets'][target]), (wasm, pinned[version]['photonWasm'])):
+                    if any(actual[k] != expected[k] for k in ('sha256', 'size')):
+                        raise ValueError('fixed baseline artifact identity changed: ' + version)
+            if version == latest:
+                matches = [a for a in authority['assets'] if a['platform'] == platform and a['arch'] == arch and a['filetype'] == 'binary' and a['variant'] is None]
+                if len(matches) != 1 or matches[0]['sha256'] != raw['sha256'] or matches[0]['size_bytes'] != raw['size']:
+                    raise ValueError('main authority and artifact disagree: ' + target)
+            manifest['targets'][target] = raw
+            if 'photonWasm' in manifest and manifest['photonWasm']['sha256'] != wasm['sha256']:
+                raise ValueError('WASM differs across targets')
+            manifest['photonWasm'] = wasm
+            selections[target] = selection
+        releases[version] = {'manifest': manifest, 'selections': selections}
+    return {'schema': 'installer-cold-matrix/v2', 'createdAt': datetime.now(timezone.utc).isoformat(),
         'mode': mode, 'installerCommit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'latest': latest, 'candidate': candidate, 'authority': authority, 'releases': releases, 'cases': cases,
         'excluded': ['authenticated live agents', 'original historical installer layouts', 'unpublished new Computer upgrade API baseline']}
@@ -135,7 +154,8 @@ class FrozenServer(ReleaseServer):
         try:
             for version, release in plan['releases'].items():
                 manifest = release['manifest']
-                assets = [manifest['targets'][TARGET], manifest['photonWasm']]
+                wasm = release['selections'][TARGET]['artifact']['photon_wasm']
+                assets = [manifest['targets'][TARGET], {'file': 'photon_rs_bg.wasm', 'sha256': wasm['sha256'], 'size': wasm['size_bytes'], 'download_url': wasm['download_url']}]
                 if manifest['targets'][TARGET].get('gz'):
                     assets.append(manifest['targets'][TARGET]['gz'])
                 for asset in assets:
@@ -143,8 +163,9 @@ class FrozenServer(ReleaseServer):
                     if Path(filename).name != filename or '/' in filename or '\\' in filename:
                         raise ValueError('asset filename is not a basename')
                     path = self.root / (version + '-' + filename)
-                    checked_download(CDN + '/' + version + '/' + filename, path, asset)
-                    self.product_files['/computer/' + version + '/' + filename] = path
+                    checked_download(asset['download_url'], path, asset)
+                    parts = urllib.parse.urlsplit(asset['download_url'])
+                    self.product_files[parts.path + ('?' + parts.query if parts.query else '')] = path
         except BaseException:
             self.close()
             raise
@@ -153,8 +174,9 @@ class FrozenServer(ReleaseServer):
         url = urllib.parse.urlsplit(handler.path)
         path = urllib.parse.unquote(url.path)
         parts = path.strip('/').split('/')
-        if path in self.product_files:
-            file = self.product_files[path]
+        key = path + ('?' + url.query if url.query else '')
+        if key in self.product_files:
+            file = self.product_files[key]
             self.requests.append(handler.path)
             handler.send_response(200)
             handler.send_header('Content-Length', str(file.stat().st_size))
@@ -163,10 +185,16 @@ class FrozenServer(ReleaseServer):
                 shutil.copyfileobj(data, handler.wfile)
             return
         body = None
-        if len(parts) == 3 and parts[0] == 'computer' and parts[2] == 'manifest.json' and parts[1] in self.plan['releases']:
-            body = self.plan['releases'][parts[1]]['manifest']
-        elif path == '/public/v2/apps/raft-computer-cli/latest' and urllib.parse.parse_qs(url.query).get('channel') == ['main']:
-            body = self.plan['authority']
+        if path == '/public/v2/apps/raft-computer-cli/updates/check':
+            query = urllib.parse.parse_qs(url.query)
+            version = query.get('version', [self.plan['latest']])[0]
+            if version in self.plan['releases']:
+                body = json.loads(json.dumps(self.plan['releases'][version]['selections'][TARGET]))
+                artifact = body['artifact']
+                for identity in (artifact, artifact.get('gzip'), artifact['photon_wasm']):
+                    if identity:
+                        remote = urllib.parse.urlsplit(identity['download_url'])
+                        identity['download_url'] = self.base + remote.path + ('?' + remote.query if remote.query else '')
         if body is not None:
             self.requests.append(handler.path)
             data = json.dumps(body).encode()
@@ -181,7 +209,7 @@ class FrozenServer(ReleaseServer):
 def execute(plan_path, output):
     plan_bytes = plan_path.read_bytes()
     plan = json.loads(plan_bytes)
-    if plan['schema'] != 'installer-cold-matrix/v1':
+    if plan['schema'] != 'installer-cold-matrix/v2':
         raise ValueError('unknown matrix schema')
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     if plan['installerCommit'] != head:

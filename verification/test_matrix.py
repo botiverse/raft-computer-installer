@@ -59,10 +59,20 @@ class MatrixContract(unittest.TestCase):
                    'filetype': 'binary', 'size_bytes': 4, 'sha256': 'a' * 64, 'download_url': 'must-not-persist'} for t in TARGETS]
         latest = {'build': {'id': 'release-build', 'version': '1.0.32'}, 'assets': assets}
         def fetch(url):
-            data = latest if '/latest?' in url else manifests[url.split('/')[-2]]
-            body = json.dumps(data).encode()
-            return body, data
-        baseline = {'releases': [{'version': v, 'manifestSHA256': hashlib.sha256(json.dumps(m).encode()).hexdigest()} for v, m in manifests.items()]}
+            import urllib.parse
+            if '/latest?' in url:
+                data = latest
+            else:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                v = query['version'][0]
+                target = query['platform'][0] + '-' + query['arch'][0]
+                base = 'https://hands.build/dl/raft-computer-cli/releases/r-' + v.replace('.', '-') + '/' + target
+                data = {'update_available': True, 'release': {'id': 'r-' + v.replace('.', '-'), 'version': v},
+                        'artifact': {'platform': query['platform'][0], 'arch': query['arch'][0], 'sha256': 'a' * 64,
+                                     'size_bytes': 4, 'download_url': base,
+                                     'photon_wasm': {'sha256': 'c' * 64, 'size_bytes': 2, 'download_url': base + '?kind=photon-wasm'}}}
+            return json.dumps(data).encode(), data
+        baseline = {'releases': [{'version': v, 'targets': m['targets'], 'photonWasm': {'sha256': 'c' * 64, 'size': 2}} for v, m in manifests.items()]}
         with tempfile.TemporaryDirectory() as root:
             file = Path(root) / 'baselines.json'
             file.write_text(json.dumps(baseline))
@@ -71,5 +81,5 @@ class MatrixContract(unittest.TestCase):
                 self.assertEqual(sum('/latest?' in c.args[0] for c in get.call_args_list), 1)
                 self.assertNotIn('must-not-persist', json.dumps(plan))
                 latest['assets'][-1]['sha256'] = 'b' * 64
-                with self.assertRaisesRegex(ValueError, 'authority and manifest disagree'):
+                with self.assertRaisesRegex(ValueError, 'authority and artifact disagree'):
                     make_plan('full')

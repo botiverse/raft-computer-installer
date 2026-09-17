@@ -10,63 +10,66 @@ use k_carrier::{
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct FileIdentity {
-    pub file: String,
-    pub sha256: String,
-    pub size: u64,
+#[derive(Deserialize)]
+struct FileIdentity {
+    download_url: String,
+    sha256: String,
+    size_bytes: u64,
 }
 
 impl FileIdentity {
-    fn validate(&mut self) -> Result<()> {
-        // Release files are names beneath one immutable version directory.
-        // Reject URLs, traversal, encoded separators, queries and fragments.
-        if self.file.is_empty()
-            || self.file.len() > 255
-            || self.file == "."
-            || self.file == ".."
-            || !self
-                .file
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    fn representation(
+        &self,
+        origin: &Url,
+        expected_path: &str,
+        expected_query: Option<&str>,
+    ) -> Result<Representation> {
+        let url =
+            Url::parse(&self.download_url).map_err(|_| invalid("invalid Hands artifact URL"))?;
+        if url.origin() != origin.origin()
+            || url.path() != expected_path
+            || url.query() != expected_query
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
             || self.sha256.len() != 64
             || !self.sha256.bytes().all(|c| c.is_ascii_hexdigit())
-            || self.size == 0
-            || self.size > 9_007_199_254_740_991
+            || self.size_bytes == 0
+            || self.size_bytes > 9_007_199_254_740_991
         {
-            return Err(invalid("invalid release file identity"));
+            return Err(invalid("invalid Hands release-bound artifact identity"));
         }
-        self.sha256.make_ascii_lowercase();
-        Ok(())
-    }
-    fn representation(&self, base: &Url) -> Result<Representation> {
-        let mut url = base.clone();
-        url.path_segments_mut()
-            .map_err(|_| invalid("invalid release base"))?
-            .push(&self.file);
         Ok(Representation {
             url: url.into(),
-            sha256: self.sha256.clone(),
-            size: self.size,
+            sha256: self.sha256.to_ascii_lowercase(),
+            size: self.size_bytes,
         })
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct Target {
-    #[serde(flatten)]
-    raw: FileIdentity,
-    gz: Option<FileIdentity>,
+#[derive(Deserialize)]
+struct AuthorityRelease {
+    id: String,
+    version: String,
 }
 
 #[derive(Deserialize)]
-struct WireManifest {
-    version: String,
-    targets: BTreeMap<String, Target>,
-    #[serde(rename = "photonWasm")]
-    sidecar: Option<FileIdentity>,
+struct AuthorityArtifact {
+    #[serde(flatten)]
+    raw: FileIdentity,
+    platform: String,
+    arch: String,
+    gzip: Option<FileIdentity>,
+    photon_wasm: FileIdentity,
+}
+
+#[derive(Deserialize)]
+struct Authority {
+    update_available: bool,
+    release: AuthorityRelease,
+    artifact: AuthorityArtifact,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,7 +103,6 @@ impl ReleaseSource for FrozenSource {
 #[derive(Clone)]
 pub struct Source {
     client: Client,
-    release_base: Url,
     hands_origin: Url,
     hands_app: String,
 }
@@ -144,7 +146,6 @@ impl Source {
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::limited(5))
                 .build()?,
-            release_base: base_url(&cfg.release_base)?,
             hands_origin: base_url(&cfg.hands_origin)?,
             hands_app: cfg.hands_app.clone(),
         })
@@ -181,109 +182,90 @@ impl Source {
 
     pub async fn manifest(&self, requested: &str) -> Result<Manifest> {
         version::exact(requested)?;
-        let base = append(&self.release_base, &[requested])?;
-        let mut wire: WireManifest = self.json(append(&base, &["manifest.json"])?).await?;
-        if wire.version != requested {
-            return Err(invalid("release manifest version mismatch"));
+        self.select(None, Some(requested)).await
+    }
+
+    /// Resolve exactly once. All representations must belong to the selected
+    /// immutable Hands release; preparation never follows a mutable channel again.
+    pub async fn resolve(&self, channel: &str) -> Result<Manifest> {
+        let channel = parse_channel(channel)?;
+        self.select(Some(&channel), None).await
+    }
+
+    async fn select(&self, channel: Option<&str>, requested: Option<&str>) -> Result<Manifest> {
+        let (os, arch) = platform()?;
+        let mut url = append(
+            &self.hands_origin,
+            &["public", "v2", "apps", &self.hands_app, "updates", "check"],
+        )?;
+        url.query_pairs_mut()
+            .append_pair("product_type", "cli-binary")
+            .append_pair("current_version", "0.0.0")
+            .append_pair("platform", os)
+            .append_pair("arch", arch);
+        if let Some(channel) = channel {
+            url.query_pairs_mut().append_pair("channel", channel);
         }
-        let mut target = wire
-            .targets
-            .remove(&platform_key()?)
-            .ok_or_else(|| invalid("release has no binary for this platform"))?;
-        target.raw.validate()?;
-        let raw = target.raw.representation(&base)?;
-        let gzip = match target.gz.as_mut() {
-            Some(gzip) => {
-                gzip.validate()?;
-                Some(gzip.representation(&base)?)
-            }
-            None => None,
-        };
-        let sidecar = match wire.sidecar.as_mut() {
-            Some(sidecar) => {
-                sidecar.validate()?;
-                let file = sidecar.representation(&base)?;
-                Some(Release {
-                    version: requested.into(),
-                    url: file.url,
-                    sha256: file.sha256,
-                    size: file.size,
-                    gzip: None,
-                })
-            }
-            None => None,
-        };
+        if let Some(requested) = requested {
+            url.query_pairs_mut().append_pair("version", requested);
+        }
+        let body: Authority = self.json(url).await?;
+        version::exact(&body.release.version)?;
+        if !body.update_available
+            || requested.is_some_and(|v| v != body.release.version)
+            || body.artifact.platform != os
+            || body.artifact.arch != arch
+            || body.release.id.is_empty()
+            || !body
+                .release
+                .id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        {
+            return Err(invalid("Hands release selection identity mismatch"));
+        }
+        let release_path = format!(
+            "/dl/{}/releases/{}/{}",
+            self.hands_app,
+            body.release.id,
+            platform_key()?
+        );
+        let raw = body
+            .artifact
+            .raw
+            .representation(&self.hands_origin, &release_path, None)?;
+        let gzip = body
+            .artifact
+            .gzip
+            .as_ref()
+            .map(|file| {
+                file.representation(&self.hands_origin, &format!("{release_path}.gz"), None)
+            })
+            .transpose()?;
+        let wasm = body.artifact.photon_wasm.representation(
+            &self.hands_origin,
+            &release_path,
+            Some("kind=photon-wasm"),
+        )?;
+        let version = body.release.version;
         Ok(Manifest {
-            version: requested.into(),
+            version: version.clone(),
             release: Release {
-                version: requested.into(),
+                version: version.clone(),
                 url: raw.url,
                 sha256: raw.sha256,
                 size: raw.size,
                 gzip,
             },
-            sidecar,
+            sidecar: Some(Release {
+                version,
+                url: wasm.url,
+                sha256: wasm.sha256,
+                size: wasm.size,
+                gzip: None,
+            }),
         })
     }
-
-    /// Resolve a channel once, then freeze and cross-check the exact manifest.
-    /// Callers pass the returned manifest to preparation; they do not resolve again.
-    pub async fn resolve(&self, channel: &str) -> Result<Manifest> {
-        let channel = parse_channel(channel)?;
-        let mut url = append(
-            &self.hands_origin,
-            &["public", "v2", "apps", &self.hands_app, "latest"],
-        )?;
-        url.query_pairs_mut()
-            .append_pair("channel", &channel)
-            .append_pair("product_type", "cli-binary");
-        let body: Authority = self.json(url).await?;
-        version::exact(&body.build.version)?;
-        let (os, arch) = platform()?;
-        let assets = body
-            .assets
-            .iter()
-            .filter(|a| {
-                a.platform == os && a.arch == arch && a.filetype == "binary" && a.variant.is_null()
-            })
-            .collect::<Vec<_>>();
-        if assets.len() != 1 {
-            return Err(invalid(
-                "release authority must name exactly one platform binary",
-            ));
-        }
-        let asset = assets[0];
-        let manifest = self.manifest(&body.build.version).await?;
-        if asset.sha256.len() != 64
-            || !asset.sha256.bytes().all(|c| c.is_ascii_hexdigit())
-            || !asset.sha256.eq_ignore_ascii_case(&manifest.release.sha256)
-            || asset.size_bytes != manifest.release.size
-        {
-            return Err(invalid(
-                "release authority and CDN disagree about artifact identity",
-            ));
-        }
-        Ok(manifest)
-    }
-}
-
-#[derive(Deserialize)]
-struct Build {
-    version: String,
-}
-#[derive(Deserialize)]
-struct Authority {
-    build: Build,
-    assets: Vec<Asset>,
-}
-#[derive(Deserialize)]
-struct Asset {
-    platform: String,
-    arch: String,
-    filetype: String,
-    variant: serde_json::Value,
-    sha256: String,
-    size_bytes: u64,
 }
 
 pub fn parse_channel(value: &str) -> Result<String> {

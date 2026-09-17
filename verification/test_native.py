@@ -37,6 +37,8 @@ class InstallerContract(unittest.TestCase):
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
         self.server.wrong_hash.clear()
         self.server.authority_lies.clear()
+        self.server.authority_changes.clear()
+        self.server.gzip_versions.clear()
         self.server.manifest_changes.clear()
         self.server.tamper_installer = False
         self.server.missing_checksums = False
@@ -45,6 +47,37 @@ class InstallerContract(unittest.TestCase):
         machine = self.server.machine()
         self.addCleanup(machine.close)
         return machine
+
+    def test_hands_gzip_and_wasm_install_from_one_frozen_release(self):
+        self.server.gzip_versions.add("1.1.0")
+        machine = self.machine()
+        machine.json(["install", "--channel", "main"])
+        self.assertEqual(sha(machine.binary.read_bytes()), sha(self.server.releases["1.1.0"]))
+        requests = self.server.requests
+        self.assertEqual(sum("/updates/check?" in p for p in requests), 1)
+        self.assertTrue(any(p.endswith(TARGET + ".gz") for p in requests), requests)
+        self.assertTrue(any(p.endswith("?kind=photon-wasm") for p in requests), requests)
+        self.assertFalse(any("/computer/" in p or "manifest.json" in p for p in requests), requests)
+
+    def test_incomplete_or_cross_identity_hands_response_is_rejected_before_download(self):
+        mutations = {
+            "missing wasm": lambda b: b["artifact"].pop("photon_wasm"),
+            "wrong target": lambda b: b["artifact"].update(platform="other"),
+            "other target URL": lambda b: b["artifact"].update(download_url=b["artifact"]["download_url"] + "-other"),
+            "mutable URL": lambda b: b["artifact"].update(download_url=self.server.base + "/dl/raft-computer-cli/main/" + TARGET),
+            "wrong wasm kind": lambda b: b["artifact"]["photon_wasm"].update(download_url=b["artifact"]["download_url"]),
+            "other release": lambda b: b["release"].update(id="another-release"),
+            "wrong version": lambda b: b["release"].update(version="1.0.0"),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                self.server.authority_changes["1.1.0"] = mutation
+                self.server.requests.clear()
+                machine = self.machine()
+                result = machine.run(["install", "--version", "1.1.0", "--json"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(machine.binary.exists())
+                self.assertEqual(len(self.server.requests), 1, self.server.requests)
 
     def test_installed_cli_waiting_for_upgrade_is_not_a_running_service(self):
         machine = self.machine()
@@ -200,8 +233,8 @@ class InstallerContract(unittest.TestCase):
         self.assertIsNone(machine.live())
         self.assertEqual((machine.install_dir / "photon_rs_bg.wasm").read_bytes(), self.server.sidecar)
         self.assertEqual(machine.receipt("channel-consent"), reply["receipt"])
-        self.assertEqual(sum("/latest?" in path for path in self.server.requests), 1)
-        self.assertEqual(self.server.requests.count("/computer/1.1.0/manifest.json"), 1)
+        self.assertEqual(sum("/updates/check?" in path for path in self.server.requests), 1)
+        self.assertFalse(any("/computer/" in path or "manifest.json" in path for path in self.server.requests))
 
     def test_fresh_and_cold_upgrade_preserve_stopped_state(self):
         machine = self.machine()
@@ -565,7 +598,6 @@ class InstallerContract(unittest.TestCase):
     def test_bad_sources_fail_before_publication(self):
         cases = (
             ("authority", {"RAFT_COMPUTER_HANDS_ORIGIN": "http://127.0.0.1:9"}),
-            ("manifest", {"RAFT_COMPUTER_RELEASE_BASE": "http://127.0.0.1:9"}),
         )
         for name, extra in cases:
             with self.subTest(name=name):
@@ -578,6 +610,8 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install"], expected=1)
         self.assertFalse(any(path.endswith("/raft-computer") for path in self.server.requests))
         self.server.authority_lies.clear()
+        self.server.authority_changes.clear()
+        self.server.gzip_versions.clear()
         self.server.manifest_changes["1.1.0"] = lambda m: m["targets"][TARGET].update(file="../outside")
         machine = self.machine()
         machine.json(["install", "--version", "1.1.0"], expected=1)
@@ -653,9 +687,9 @@ class InstallerContract(unittest.TestCase):
             "RAFT_COMPUTER_HANDS_ORIGIN": fake_origin, "RAFT_COMPUTER_RELEASE_BASE": fake_origin + "/computer"}
         machine.json(["install"], extra=extra)
         forwarded = [path for path in self.server.requests if path.startswith(fake_origin)]
-        self.assertTrue(any("/latest?" in path for path in forwarded))
-        self.assertTrue(any(path.endswith("/manifest.json") for path in forwarded))
-        self.assertTrue(any(path.endswith("/raft-computer") for path in forwarded))
+        self.assertTrue(any("/updates/check?" in path for path in forwarded))
+        self.assertFalse(any("manifest.json" in path for path in self.server.requests))
+        self.assertTrue(any("/dl/raft-computer-cli/releases/" in path for path in forwarded))
         bypass = self.machine()
         bypass.json(["install"], extra={"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9", "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"})
         broken = self.machine()
