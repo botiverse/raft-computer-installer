@@ -1,3 +1,4 @@
+import gzip
 """Real native processes, isolated homes, loopback release authority and CDN."""
 import hashlib
 import http.server
@@ -65,6 +66,8 @@ class ReleaseServer:
         self.channels = {"main": "1.1.0", "alpha": "1.1.0"}
         self.wrong_hash = set()
         self.authority_lies = set()
+        self.authority_changes = {}
+        self.gzip_versions = set()
         self.manifest_changes = {}
         self.requests = []
         self.tamper_installer = False
@@ -122,24 +125,42 @@ class ReleaseServer:
         self.requests.append(handler.path)
         status, body = 200, b""
         parts = path.strip("/").split("/")
-        if path == "/public/v2/apps/raft-computer-cli/latest":
-            version = self.channels.get(query.get("channel", ["main"])[0])
+        if path == "/public/v2/apps/raft-computer-cli/updates/check":
+            version = query.get("version", [self.channels.get(query.get("channel", ["main"])[0])])[0]
             if version not in self.releases:
                 status = 404
             else:
-                data = self.releases[version]
                 platform, arch = TARGET.split("-")
-                body = json.dumps({"build": {"version": version}, "assets": [{"platform": platform, "arch": arch,
-                    "variant": None, "filetype": "binary", "size_bytes": len(data),
-                    "sha256": "0" * 64 if version in self.authority_lies else sha(data)}]}).encode()
-        elif len(parts) == 3 and parts[0] == "computer" and parts[1] in self.releases:
-            version, name = parts[1:]
-            if name == "manifest.json":
-                body = json.dumps(self.manifest(version)).encode()
-            elif name == "raft-computer":
-                body = self.releases[version]
-            elif name == "photon_rs_bg.wasm":
+                # Proxy requests preserve their original URL authority.
+                origin = f"{url.scheme}://{url.netloc}" if url.netloc else self.base
+                release_id = sha(version.encode())[:32]
+                base = f"{origin}/dl/raft-computer-cli/releases/{release_id}/{TARGET}"
+                manifest = self.manifest(version)
+                raw = manifest["targets"][TARGET]
+                wasm = manifest["photonWasm"]
+                artifact = {"platform": platform, "arch": arch,
+                    "download_url": base if raw["file"] == "raft-computer" else origin + "/outside",
+                    "sha256": "0" * 64 if version in self.authority_lies else raw["sha256"], "size_bytes": raw["size"],
+                    "photon_wasm": {"download_url": base + "?kind=photon-wasm", "sha256": wasm["sha256"], "size_bytes": wasm["size"]}}
+                if version in self.gzip_versions:
+                    compressed = gzip.compress(self.releases[version], mtime=0)
+                    artifact["gzip"] = {"download_url": base + ".gz", "sha256": sha(compressed), "size_bytes": len(compressed)}
+                response = {"update_available": True, "release": {"id": release_id, "version": version}, "artifact": artifact}
+                self.authority_changes.get(version, lambda _: None)(response)
+                body = json.dumps(response).encode()
+        elif len(parts) == 5 and parts[:3] == ["dl", "raft-computer-cli", "releases"]:
+            version = next((v for v in self.releases if sha(v.encode())[:32] == parts[3]), None)
+            if version not in self.releases or parts[4] not in (TARGET, TARGET + ".gz"):
+                status = 404
+            elif parts[4].endswith(".gz"):
+                if version in self.gzip_versions and not query:
+                    body = gzip.compress(self.releases[version], mtime=0)
+                else:
+                    status = 404
+            elif query.get("kind") == ["photon-wasm"]:
                 body = self.sidecar
+            elif not query:
+                body = self.releases[version]
             else:
                 status = 404
         elif path == f"/dl/raft-computer-installer/main/{TARGET}":

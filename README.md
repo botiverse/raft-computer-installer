@@ -81,7 +81,6 @@ records remain authoritative until their operation is confirmed finished.
 | `RAFT_HOME`, fallback `SLOCK_HOME` | Computer's state root; default `~/.slock`. |
 | `RAFT_COMPUTER_INSTALL_DIR` | Directory for `raft-computer` and its sidecar; default `~/.local/bin`. For that default, update a supported shell profile or Windows user PATH when needed. Custom directories produce a PATH hint. |
 | `RAFT_COMPUTER_NO_MODIFY_PATH=1` | Leave PATH configuration unchanged. |
-| `RAFT_COMPUTER_RELEASE_BASE` | Product CDN holding `<version>/manifest.json` and artifacts; default `https://cdn.raft.build/computer`. |
 | `RAFT_COMPUTER_HANDS_ORIGIN`, `RAFT_COMPUTER_HANDS_APP` | Product release authority; defaults `https://hands.build` and `raft-computer-cli`. |
 | `RAFT_COMPUTER_INSTALLER_CHANNEL` | Installer release channel; default `main`. Separate from Computer's `--channel`. |
 | `RAFT_COMPUTER_INSTALLER_DL_BASE` | Installer download authority; default `https://hands.build/dl/raft-computer-installer`. |
@@ -96,7 +95,11 @@ commands. A live status attestation supplies `servicePid`, `computerVersion` and
 `serviceGeneration`; the installer also checks OS process identity. Stopped
 installations are checked through a short-lived `--version` process.
 
-`photon_rs_bg.wasm` is verified against the release manifest, cached per version,
+Computer raw/gzip and `photon_rs_bg.wasm` identities come from one Hands
+`updates/check` selection. Exact versions and channels both freeze immutable
+Hands release URLs; there is no product CDN manifest fallback. Missing WASM,
+cross-release URLs, or hash/size mismatches stop installation before service changes.
+`photon_rs_bg.wasm` is verified against this selection, cached per version,
 and published beside its matching binary, including during rollback. Product
 bytes run from the installation directory, outside K's slots.
 

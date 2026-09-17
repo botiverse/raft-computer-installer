@@ -23,7 +23,6 @@ pub struct Config {
     pub install_dir: PathBuf,
     pub binary: PathBuf,
     pub sidecar: PathBuf,
-    pub release_base: String,
     pub hands_origin: String,
     pub hands_app: String,
     pub waiting_caller: Option<crate::process::Identity>,
@@ -93,10 +92,6 @@ impl Config {
             install_dir,
             binary,
             sidecar,
-            release_base: setting(
-                "RAFT_COMPUTER_RELEASE_BASE",
-                "https://cdn.raft.build/computer",
-            )?,
             hands_origin: setting("RAFT_COMPUTER_HANDS_ORIGIN", "https://hands.build")?,
             hands_app: setting("RAFT_COMPUTER_HANDS_APP", "raft-computer-cli")?,
         })
