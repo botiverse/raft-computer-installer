@@ -48,6 +48,26 @@ class InstallerContract(unittest.TestCase):
         self.addCleanup(machine.close)
         return machine
 
+    def test_published_matrix_main_execution_uses_single_updates_resolution(self):
+        from unittest.mock import patch
+        from matrix import execute, ROOT
+        server = ReleaseServer()
+        self.addCleanup(server.close)
+        for version in ("1.0.0", "1.1.0"):
+            server.publish(version)
+        plan = {"schema": "installer-cold-matrix/v2", "installerCommit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                "latest": "1.1.0", "excluded": ["fixture validates matrix execution, not published delivery"],
+                "releases": {v: {"manifest": server.manifest(v)} for v in ("1.0.0", "1.1.0")},
+                "cases": [{"kind": "upgrade", "source": "1.0.0", "target": "1.1.0", "selection": "main"}]}
+        plan_path = server.root / "plan.json"
+        output = server.root / "report.json"
+        plan_path.write_text(json.dumps(plan))
+        # Keep receipts available after execute() performs its normal cleanup.
+        with patch('matrix.FrozenServer', return_value=server), patch.object(server, 'close'):
+            self.assertEqual(execute(plan_path, output), 0)
+            self.assertEqual(json.loads(output.read_text())["cases"][0]["status"], "PASS")
+
     def test_hands_gzip_and_wasm_install_from_one_frozen_release(self):
         self.server.gzip_versions.add("1.1.0")
         machine = self.machine()

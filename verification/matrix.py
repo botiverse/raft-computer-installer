@@ -265,7 +265,13 @@ def execute(plan_path, output):
                 before = len(server.requests)
                 reply = run(args, 2 if kind == 'deny-downgrade' else 0)
                 if case['selection'] == 'main':
-                    assert any(p.startswith('/public/v2/apps/raft-computer-cli/latest?') for p in server.requests[before:])
+                    selections = [urllib.parse.urlsplit(p) for p in server.requests[before:]
+                                  if urllib.parse.urlsplit(p).path == '/public/v2/apps/raft-computer-cli/updates/check']
+                    assert len(selections) == 1, 'main must resolve once via updates/check'
+                    query = urllib.parse.parse_qs(selections[0].query)
+                    platform, arch = TARGET.split('-')
+                    assert query.get('channel') == ['main'] and 'version' not in query
+                    assert query.get('platform') == [platform] and query.get('arch') == [arch]
                     assert reply['receipt']['targetVersion'] == plan['latest']
                 if kind == 'repeat':
                     assert reply['receipt']['outcome'] == 'up-to-date'
