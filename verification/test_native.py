@@ -699,6 +699,21 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(machine.self_version(), "1.0.0")
 
+    def test_bootstrap_forwards_version_pin_env(self):
+        # The released desktop/web install commands pin via RAFT_COMPUTER_VERSION.
+        machine = self.machine()
+        result = machine.run([], bootstrap=True,
+            extra={"RAFT_COMPUTER_VERSION": "1.0.0", "RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(machine.self_version(), "1.0.0")
+
+    def test_bootstrap_explicit_version_beats_pin_env(self):
+        machine = self.machine()
+        result = machine.run(["--version", "1.1.0"], bootstrap=True,
+            extra={"RAFT_COMPUTER_VERSION": "1.0.0", "RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(machine.self_version(), "1.1.0")
+
     def test_proxy_and_no_proxy_cover_authority_manifest_and_bytes(self):
         machine = self.machine()
         proxy = self.server.proxy()

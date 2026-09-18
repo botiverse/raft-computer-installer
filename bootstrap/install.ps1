@@ -77,6 +77,10 @@ try {
     $command = $argv[0]
     $argv = @($argv | Select-Object -Skip 1)
   }
+  # RAFT_COMPUTER_VERSION is the long-standing pin used by the desktop/web
+  # install commands; forward it to the installer. An explicit --version or
+  # --channel argument always wins over the environment pin.
+  if ($env:RAFT_COMPUTER_VERSION -and $command -in @('install', 'upgrade', 'repair') -and -not ($argv | Where-Object { $_ -match '^--(version|channel)(=|$)' })) { $argv += @('--version', $env:RAFT_COMPUTER_VERSION) }
   if ($InstallChannelDefault -and $command -in @('install', 'upgrade', 'repair') -and -not ($argv | Where-Object { $_ -match '^--(version|channel)(=|$)' })) { $argv += @('--channel', $InstallChannelDefault) }
   & $cli $command @argv
   $code = $LASTEXITCODE
