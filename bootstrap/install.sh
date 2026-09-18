@@ -63,6 +63,14 @@ dl "$binary_url" "$tmp/installer" || err "could not download installer"
 [ "$(sha "$tmp/installer")" = "$expected" ] || err "installer does not match its published checksum"
 chmod 0755 "$tmp/installer"
 case "${1:-}" in install|upgrade|repair|status|recover|help) cmd=$1; shift ;; *) cmd=install ;; esac
+# RAFT_COMPUTER_VERSION is the long-standing pin used by the desktop/web
+# install commands; forward it to the installer. An explicit --version or
+# --channel argument always wins over the environment pin.
+if [ -n "${RAFT_COMPUTER_VERSION:-}" ]; then
+  case " $* " in *" --version"*|*" --channel"*) ;; *)
+    case "$cmd" in install|upgrade|repair) set -- "$@" --version "$RAFT_COMPUTER_VERSION" ;; esac ;;
+  esac
+fi
 if [ -n "$INSTALL_CHANNEL_DEFAULT" ]; then
   case " $* " in *" --channel"*|*" --version"*) ;; *)
     case "$cmd" in install|upgrade|repair) set -- "$@" --channel "$INSTALL_CHANNEL_DEFAULT" ;; esac ;;
