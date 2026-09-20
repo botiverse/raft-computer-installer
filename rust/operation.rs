@@ -333,6 +333,15 @@ fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
     save(cfg, plan)
 }
 
+fn rollback_line(target: &str, from_version: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => {
+            format!("{target} failed its checks ({reason}); {from_version} was restored.")
+        }
+        None => format!("{target} failed its checks; {from_version} was restored."),
+    }
+}
+
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
         if recovery {
@@ -475,16 +484,11 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     let target = &plan.manifest.version;
     let line = match outcome {
         Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
-        Outcome::RolledBack => match plan.detail.get("reason") {
-            Some(reason) => format!(
-                "{target} failed its checks ({reason}); {} was restored.",
-                operation.from_version
-            ),
-            None => format!(
-                "{target} failed its checks; {} was restored.",
-                operation.from_version
-            ),
-        },
+        Outcome::RolledBack => rollback_line(
+            target,
+            &operation.from_version,
+            plan.detail.get("reason").map(String::as_str),
+        ),
         Outcome::UpToDate => format!("{target} is already installed."),
         Outcome::Held => {
             "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
@@ -1067,4 +1071,25 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         },
     )?;
     resume(cfg, &mut plan, false, &interaction).await
+}
+
+#[cfg(test)]
+mod rollback_line_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_line_with_reason_carries_it_inline() {
+        assert_eq!(
+            rollback_line("1.0.32", "1.0.31", Some("experiment probe failed: boom")),
+            "1.0.32 failed its checks (experiment probe failed: boom); 1.0.31 was restored.",
+        );
+    }
+
+    #[test]
+    fn rollback_line_without_reason_is_the_legacy_verbatim_line() {
+        assert_eq!(
+            rollback_line("1.0.32", "1.0.31", None),
+            "1.0.32 failed its checks; 1.0.31 was restored.",
+        );
+    }
 }

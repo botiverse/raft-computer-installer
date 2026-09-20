@@ -132,8 +132,11 @@ class InstallerContract(unittest.TestCase):
                 receipt = json.loads(stdout)["receipt"]
                 self.assertEqual(receipt["outcome"], expected_outcome)
                 if expected_outcome == "rolled-back":
-                    self.assertIn("failed its checks (", receipt["line"])
-                    self.assertIn(receipt["detail"]["reason"], receipt["line"])
+                    reason = receipt["detail"]["reason"]
+                    self.assertEqual(
+                        receipt["line"],
+                        f"{target} failed its checks ({reason}); {expected_version} was restored. It is running.",
+                    )
                 record = json.loads((machine.state / "product-state.json").read_text())
                 self.assertEqual([p["pid"] for p in record["initialProcesses"]], [before["pid"]])
                 self.assertNotIn(parent.pid, record["forcedStops"])
