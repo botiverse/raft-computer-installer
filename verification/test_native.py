@@ -267,28 +267,49 @@ class InstallerContract(unittest.TestCase):
         self.assertIsNone(machine.live())
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed", "wrong self-version must fail before handover")
-        # The status hint must name a runnable absolute path: a first-time user
-        # has never heard of the installer binary and it is not on PATH. The
-        # hint must also outlive the calling process and supervisor cleanup:
-        # resolve the printed path and actually run `status --json` with it.
-        status_hint = re.search(r'Run ("[^"]+"|\S+) status', failed["line"])
+        # The status hint must print a complete shell command that runs
+        # verbatim: a first-time user has never heard of the installer binary
+        # and it is not on PATH. Extract the printed command without adding
+        # anything and run it through the real shell.
+        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
         self.assertIsNotNone(status_hint, failed["line"])
-        invocation = status_hint.group(1)
-        binary = invocation.strip('"')
+        command = status_hint.group(1)
+        invocation = command[: -len(" status")]
+        binary = invocation.removeprefix("& ").strip('"')
         self.assertTrue(os.path.isabs(binary), failed["line"])
         self.assertEqual(Path(binary).read_bytes(), self.server.installer_bytes,
             "the hint must name the durable installer copy")
         if WINDOWS:
-            # The printed command must be runnable as printed, quotes included.
-            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"& {invocation} status --json"],
+            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
                 capture_output=True, text=True, timeout=60, env=machine.env())
         else:
-            ran = subprocess.run([binary, "status", "--json"], capture_output=True, text=True,
-                timeout=60, env=machine.env())
+            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
         json.loads(ran.stdout)
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
+
+    def test_hint_invocation_runs_verbatim_with_spaced_home(self):
+        # The printed command must survive spaces in RAFT_HOME: extract it
+        # verbatim and run it through the real shell without adding anything.
+        machine = Machine(self.server, prefix="rci machine with spaces ")
+        self.addCleanup(machine.close)
+        machine.json(["install", "--version", "1.0.0"])
+        failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
+        self.assertEqual(failed["receipt"]["outcome"], "failed")
+        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
+        self.assertIsNotNone(status_hint, failed["line"])
+        command = status_hint.group(1)
+        self.assertIn(" ", command[: -len(" status")].strip('"'), "the tooth must exercise a spaced path")
+        if WINDOWS:
+            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        else:
+            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        json.loads(ran.stdout)
 
     def test_warm_upgrade_replay_and_live_rollback(self):
         machine = self.machine()

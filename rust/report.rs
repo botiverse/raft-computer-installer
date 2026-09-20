@@ -28,7 +28,14 @@ pub enum Outcome {
 /// durable copy (see `Config::durable_binary`), quoted so the printed command
 /// is copy-pasteable even with spaces in the path.
 pub fn installer_invocation(durable_binary: &std::path::Path) -> String {
-    format!("\"{}\"", durable_binary.display())
+    let quoted = format!("\"{}\"", durable_binary.display());
+    if cfg!(windows) {
+        // The product entry point on Windows is PowerShell, which runs a
+        // quoted path only through the call operator.
+        format!("& {quoted}")
+    } else {
+        quoted
+    }
 }
 
 impl Outcome {
