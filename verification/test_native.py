@@ -129,7 +129,11 @@ class InstallerContract(unittest.TestCase):
                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = parent.communicate(timeout=120)
                 self.assertEqual(parent.returncode, expected_exit, stdout + stderr)
-                self.assertEqual(json.loads(stdout)["receipt"]["outcome"], expected_outcome)
+                receipt = json.loads(stdout)["receipt"]
+                self.assertEqual(receipt["outcome"], expected_outcome)
+                if expected_outcome == "rolled-back":
+                    self.assertIn("failed its checks (", receipt["line"])
+                    self.assertIn(receipt["detail"]["reason"], receipt["line"])
                 record = json.loads((machine.state / "product-state.json").read_text())
                 self.assertEqual([p["pid"] for p in record["initialProcesses"]], [before["pid"]])
                 self.assertNotIn(parent.pid, record["forcedStops"])

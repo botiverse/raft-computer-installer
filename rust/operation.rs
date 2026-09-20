@@ -475,10 +475,16 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     let target = &plan.manifest.version;
     let line = match outcome {
         Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
-        Outcome::RolledBack => format!(
-            "{target} failed its checks; {} was restored.",
-            operation.from_version
-        ),
+        Outcome::RolledBack => match plan.detail.get("reason") {
+            Some(reason) => format!(
+                "{target} failed its checks ({reason}); {} was restored.",
+                operation.from_version
+            ),
+            None => format!(
+                "{target} failed its checks; {} was restored.",
+                operation.from_version
+            ),
+        },
         Outcome::UpToDate => format!("{target} is already installed."),
         Outcome::Held => {
             "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
