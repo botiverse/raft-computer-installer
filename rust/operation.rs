@@ -336,8 +336,7 @@ fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
 /// The recovery hint names the running installer's absolute path (it is not
 /// on PATH after a bootstrap install) and carries the cause, so a first-time
 /// user can both understand and run it.
-fn recovery_hint_line(error: &Error) -> String {
-    let invocation = report::installer_invocation();
+fn recovery_hint_line(invocation: &str, error: &Error) -> String {
     format!(
         "Installation requires recovery ({error}). Run {invocation} recover to finish it, or {invocation} status to inspect the current state."
     )
@@ -495,7 +494,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         }
         _ => format!(
             "Could not upgrade to {target}. Run {} status for the current state.",
-            report::installer_invocation()
+            report::installer_invocation(&cfg.durable_binary())
         ),
     };
     finish(cfg, plan, outcome, line)
@@ -749,7 +748,7 @@ async fn resume(
                 if untouched {
                     "Could not prepare the installation. Installed files were not changed.".into()
                 } else {
-                    recovery_hint_line(&error)
+                    recovery_hint_line(&report::installer_invocation(&cfg.durable_binary()), &error)
                 },
             )
         }
@@ -936,7 +935,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 3,
                 format!(
                     "Installation requires repair. Run {} install.",
-                    report::installer_invocation()
+                    report::installer_invocation(&cfg.durable_binary())
                 ),
             ),
         };
@@ -1083,13 +1082,15 @@ mod recovery_hint_tests {
 
     #[test]
     fn recovery_hint_names_the_cause_and_a_runnable_invocation() {
-        let line = recovery_hint_line(&Error::Uncertain("digest mismatch".into()));
+        let line = recovery_hint_line(
+            "\"/opt/slot/raft-computer-installer\"",
+            &Error::Uncertain("digest mismatch".into()),
+        );
         assert!(
             line.starts_with("Installation requires recovery (digest mismatch). "),
             "{line}"
         );
-        let exe = std::env::current_exe().unwrap();
-        let quoted = format!("\"{}\"", exe.display());
+        let quoted = "\"/opt/slot/raft-computer-installer\"";
         assert!(
             line.contains(&format!("Run {quoted} recover to finish it")),
             "{line}"
@@ -1098,6 +1099,5 @@ mod recovery_hint_tests {
             line.contains(&format!("or {quoted} status to inspect")),
             "{line}"
         );
-        assert!(exe.is_absolute(), "{line}");
     }
 }

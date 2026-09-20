@@ -22,14 +22,13 @@ pub enum Outcome {
 }
 
 /// How the printed failure hints can invoke this installer again. The
-/// bootstrap downloads the binary into a slot, so it is normally not on PATH;
-/// a bare `raft-computer-installer` is not runnable as printed. Name the
-/// absolute path so the hint is copy-pasteable.
-pub fn installer_invocation() -> String {
-    match std::env::current_exe() {
-        Ok(exe) => format!("\"{}\"", exe.display()),
-        Err(_) => "raft-computer-installer".into(),
-    }
+/// bootstrap downloads the binary into a temporary directory it deletes on
+/// exit, and the supervisor's worker copy lives in scratch that is cleaned
+/// after a settled operation — neither survives. Hints therefore name the
+/// durable copy (see `Config::durable_binary`), quoted so the printed command
+/// is copy-pasteable even with spaces in the path.
+pub fn installer_invocation(durable_binary: &std::path::Path) -> String {
+    format!("\"{}\"", durable_binary.display())
 }
 
 impl Outcome {

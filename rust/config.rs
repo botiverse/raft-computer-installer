@@ -7,6 +7,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const INSTALLER_BIN_NAME: &str = if cfg!(windows) {
+    "raft-computer-installer.exe"
+} else {
+    "raft-computer-installer"
+};
+
 pub const BIN_NAME: &str = if cfg!(windows) {
     "raft-computer.exe"
 } else {
@@ -102,6 +108,13 @@ impl Config {
             ("RAFT_HOME".into(), self.state_home.as_os_str().to_owned()),
             ("SLOCK_HOME".into(), self.state_home.as_os_str().to_owned()),
         ])
+    }
+
+    /// One runnable copy of the installer itself, refreshed at every
+    /// operation start. Failure hints print this path, so it must survive
+    /// both process exit and supervisor scratch cleanup.
+    pub fn durable_binary(&self) -> PathBuf {
+        self.installer_dir.join("bin").join(INSTALLER_BIN_NAME)
     }
 
     pub fn scratch(&self) -> PathBuf {

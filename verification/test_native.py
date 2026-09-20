@@ -268,10 +268,25 @@ class InstallerContract(unittest.TestCase):
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed", "wrong self-version must fail before handover")
         # The status hint must name a runnable absolute path: a first-time user
-        # has never heard of the installer binary and it is not on PATH.
+        # has never heard of the installer binary and it is not on PATH. The
+        # hint must also outlive the calling process and supervisor cleanup:
+        # resolve the printed path and actually run `status --json` with it.
         status_hint = re.search(r'Run ("[^"]+"|\S+) status', failed["line"])
         self.assertIsNotNone(status_hint, failed["line"])
-        self.assertTrue(os.path.isabs(status_hint.group(1).strip('"')), failed["line"])
+        invocation = status_hint.group(1)
+        binary = invocation.strip('"')
+        self.assertTrue(os.path.isabs(binary), failed["line"])
+        self.assertEqual(Path(binary).read_bytes(), self.server.installer_bytes,
+            "the hint must name the durable installer copy")
+        if WINDOWS:
+            # The printed command must be runnable as printed, quotes included.
+            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"& {invocation} status --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        else:
+            ran = subprocess.run([binary, "status", "--json"], capture_output=True, text=True,
+                timeout=60, env=machine.env())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        json.loads(ran.stdout)
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
 

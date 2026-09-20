@@ -138,7 +138,7 @@ async fn worker(cfg: &Config) -> Result<u8> {
                 if unresolved { 3 } else { 1 },
                 format!(
                     "The installer could not finish. Run {} status for the current state.",
-                    crate::report::installer_invocation()
+                    crate::report::installer_invocation(&cfg.durable_binary())
                 ),
             )
         }
