@@ -1083,14 +1083,14 @@ mod recovery_hint_tests {
     #[test]
     fn recovery_hint_names_the_cause_and_a_runnable_invocation() {
         let line = recovery_hint_line(
-            "\"/opt/slot/raft-computer-installer\"",
+            "'/opt/slot/raft-computer-installer'",
             &Error::Uncertain("digest mismatch".into()),
         );
         assert!(
             line.starts_with("Installation requires recovery (digest mismatch). "),
             "{line}"
         );
-        let quoted = "\"/opt/slot/raft-computer-installer\"";
+        let quoted = "'/opt/slot/raft-computer-installer'";
         assert!(
             line.contains(&format!("Run {quoted} recover to finish it")),
             "{line}"
