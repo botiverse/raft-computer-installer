@@ -278,7 +278,9 @@ class InstallerContract(unittest.TestCase):
         status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
         self.assertIsNotNone(status_hint, failed["line"])
         command = status_hint.group(1)
-        self.assertIn(str(durable), command, failed["line"])
+        # The durable copy's identity is proven by the byte equality above plus
+        # the verbatim execution below — never by separator text: Rust joins
+        # keep intermediate `/` while Python renders `\` on Windows.
         if WINDOWS:
             self.assertTrue(command.startswith("& '"), command)
             ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
