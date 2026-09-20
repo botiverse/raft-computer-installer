@@ -1,6 +1,7 @@
 import faulthandler
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -266,6 +267,11 @@ class InstallerContract(unittest.TestCase):
         self.assertIsNone(machine.live())
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed", "wrong self-version must fail before handover")
+        # The status hint must name a runnable absolute path: a first-time user
+        # has never heard of the installer binary and it is not on PATH.
+        status_hint = re.search(r'Run ("[^"]+"|\S+) status', failed["line"])
+        self.assertIsNotNone(status_hint, failed["line"])
+        self.assertTrue(os.path.isabs(status_hint.group(1).strip('"')), failed["line"])
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
 

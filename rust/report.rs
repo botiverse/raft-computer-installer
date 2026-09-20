@@ -21,6 +21,17 @@ pub enum Outcome {
     Unresolved,
 }
 
+/// How the printed failure hints can invoke this installer again. The
+/// bootstrap downloads the binary into a slot, so it is normally not on PATH;
+/// a bare `raft-computer-installer` is not runnable as printed. Name the
+/// absolute path so the hint is copy-pasteable.
+pub fn installer_invocation() -> String {
+    match std::env::current_exe() {
+        Ok(exe) => format!("\"{}\"", exe.display()),
+        Err(_) => "raft-computer-installer".into(),
+    }
+}
+
 impl Outcome {
     pub fn exit_code(self) -> u8 {
         match self {

@@ -43,7 +43,10 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     let mut last = Reply::plain(
         &request.id,
         3,
-        "Installation could not be settled. Run raft-computer-installer recover.",
+        format!(
+            "Installation could not be settled. Run {} recover.",
+            crate::report::installer_invocation()
+        ),
     );
     for attempt in 0..3 {
         // Verify every execution, including retries of the retained copy.
@@ -96,7 +99,10 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     last = Reply::plain(
                         &request.id,
                         3,
-                        "Recovery is blocked by another installer. Run raft-computer-installer recover after it exits.",
+                        format!(
+                            "Recovery is blocked by another installer. Run {} recover after it exits.",
+                            crate::report::installer_invocation()
+                        ),
                     );
                 } else if reply.exit_code != 3 {
                     if reply.exit_code <= 1 && reply.receipt.is_some() {

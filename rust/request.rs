@@ -107,6 +107,10 @@ impl Reply {
             Outcome::Held => "held",
             Outcome::Unresolved => "unresolved",
         };
+        // Replay lines are validated against the supervisor's regeneration of
+        // the same line (see `validate`), and the supervisor may run from a
+        // different path than the worker — this line must stay free of
+        // process-local values like the current executable path.
         format!(
             "Previous operation: {result}. Run raft-computer-installer status for the current installation and service state."
         )

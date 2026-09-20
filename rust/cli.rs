@@ -136,7 +136,10 @@ async fn worker(cfg: &Config) -> Result<u8> {
             Reply::plain(
                 &request.id,
                 if unresolved { 3 } else { 1 },
-                "The installer could not finish. Run raft-computer-installer status for the current state.",
+                format!(
+                    "The installer could not finish. Run {} status for the current state.",
+                    crate::report::installer_invocation()
+                ),
             )
         }
     };
