@@ -9,7 +9,7 @@ $channel = if ($env:RAFT_COMPUTER_INSTALLER_CHANNEL) { $env:RAFT_COMPUTER_INSTAL
 $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALLER_DL_BASE.TrimEnd('/') } else { 'https://hands.build/dl/raft-computer-installer' }
 $tmp = $null
 $code = 1
-function Fail($message) { throw "Could not start the installer: $message." }
+function Fail($message) { throw "Could not start the installation: $message." }
 function ProxyFor([Uri]$uri) {
   $exclude = if ($env:NO_PROXY) { $env:NO_PROXY } else { $env:no_proxy }
   foreach ($entry in ($exclude -split ',')) {
@@ -52,11 +52,11 @@ try {
     $response = $probe.GetResponse()
     try {
       $location = [string]$response.Headers['Location']
-      if (-not $location) { Fail 'the installer channel did not name an immutable release' }
+      if (-not $location) { Fail 'the installation channel did not name an immutable release' }
       $release = New-Object Uri([Uri]$channelUrl, $location)
     } finally { $response.Close() }
-    if ($release.Scheme -notin @('http', 'https') -or $release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail 'invalid installer release redirect' }
-    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail 'installer release redirect did not freeze a release' }
+    if ($release.Scheme -notin @('http', 'https') -or $release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail 'invalid installation release redirect' }
+    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail 'installation release redirect did not freeze a release' }
     $releaseUrl = $release.AbsoluteUri
     $sumsUrl = "${releaseUrl}?kind=sha256sums"
     $binaryUrl = $releaseUrl
@@ -67,10 +67,10 @@ try {
   foreach ($line in Get-Content -LiteralPath $sums) {
     if ($line -match '^([0-9a-fA-F]{64})\s+(.+)$' -and $Matches[2] -eq $native) { $matchesForTarget += $Matches[1].ToLowerInvariant() }
   }
-  if ($matchesForTarget.Count -ne 1) { Fail 'checksums must name exactly one matching installer' }
+  if ($matchesForTarget.Count -ne 1) { Fail 'checksums must name exactly one matching installation file' }
   $cli = Join-Path $tmp 'installer.exe'
   Download $binaryUrl $cli
-  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash.ToLowerInvariant() -ne $matchesForTarget[0]) { Fail 'installer does not match its published checksum' }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash.ToLowerInvariant() -ne $matchesForTarget[0]) { Fail 'installation download does not match its published checksum' }
   $argv = @($args)
   $command = 'install'
   if ($argv.Count -gt 0 -and $argv[0] -in @('install', 'upgrade', 'repair', 'status', 'recover', 'help')) {
@@ -84,8 +84,17 @@ try {
   if ($InstallChannelDefault -and $command -in @('install', 'upgrade', 'repair') -and -not ($argv | Where-Object { $_ -match '^--(version|channel)(=|$)' })) { $argv += @('--channel', $InstallChannelDefault) }
   & $cli $command @argv
   $code = $LASTEXITCODE
+  # Exit 3 means the operation could not be settled in that process: either it
+  # stopped part-way (a fresh process resumes it) or it never started changing
+  # files (a fresh process re-plans it). Both are what running the same command
+  # again does, so do that once here with the same verified binary; the user
+  # is never told to run the installer themselves. A second 3 stays 3.
+  if ($code -eq 3 -and $command -notin @('status', 'recover', 'help')) {
+    & $cli $command @argv
+    $code = $LASTEXITCODE
+  }
 } catch {
-  [Console]::Error.WriteLine('Could not start the installer: ' + $_.Exception.Message)
+  [Console]::Error.WriteLine('Could not start the installation: ' + $_.Exception.Message)
   $code = 1
 } finally {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }

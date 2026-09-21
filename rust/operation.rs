@@ -333,12 +333,13 @@ fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
     save(cfg, plan)
 }
 
-/// The recovery hint names the running installer's absolute path (it is not
-/// on PATH after a bootstrap install) and carries the cause, so a first-time
-/// user can both understand and run it.
-fn recovery_hint_line(invocation: &str, error: &Error) -> String {
+/// The recovery hint carries the cause and tells the user to repeat the
+/// command they already have. The native installer is an internal detail:
+/// its path never appears in user-facing text, and the entry scripts resume
+/// an unresolved operation themselves before this line is ever shown.
+fn recovery_hint_line(error: &Error) -> String {
     format!(
-        "Installation requires recovery ({error}). Run {invocation} recover to finish it, or {invocation} status to inspect the current state."
+        "Installation could not finish ({error}). Run the same install command again to continue where it left off."
     )
 }
 
@@ -358,7 +359,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 cfg,
                 plan,
                 Outcome::Failed,
-                "Installation was interrupted before the upgrade started. Run the installer again.",
+                "Installation was interrupted before the upgrade started. Run the same install command again.",
             );
         }
         artifact::acquire_sidecar(cfg, &plan.manifest).await?;
@@ -403,7 +404,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                     cfg,
                     plan,
                     Outcome::Failed,
-                    "Installation was interrupted before the upgrade transaction started. Run the installer again.",
+                    "Installation was interrupted before the upgrade transaction started. Run the same install command again.",
                 );
             }
         }
@@ -503,8 +504,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
         }
         _ => format!(
-            "Could not upgrade to {target}. Run {} status for the current state.",
-            report::installer_invocation(&cfg.durable_binary())
+            "Could not upgrade to {target}. Run the same install command again to check and continue."
         ),
     };
     finish(cfg, plan, outcome, line)
@@ -522,7 +522,7 @@ async fn install(
                 cfg,
                 plan,
                 Outcome::Failed,
-                "Installation was interrupted before changing installed files. Run the installer again.",
+                "Installation was interrupted before changing installed files. Run the same install command again.",
             );
         }
         let candidate = if plan.kind == Kind::Repair {
@@ -758,7 +758,7 @@ async fn resume(
                 if untouched {
                     "Could not prepare the installation. Installed files were not changed.".into()
                 } else {
-                    recovery_hint_line(&report::installer_invocation(&cfg.durable_binary()), &error)
+                    recovery_hint_line(&error)
                 },
             )
         }
@@ -943,10 +943,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             World::Held { reason } => (2, format!("Not done: {reason}.")),
             _ => (
                 3,
-                format!(
-                    "Installation requires repair. Run {} install.",
-                    report::installer_invocation(&cfg.durable_binary())
-                ),
+                "Installation requires repair. Run the same install command again.".into(),
             ),
         };
         let mut reply = Reply::plain(&request.id, code, line);
@@ -978,7 +975,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         return Ok(Reply::plain(
             &request.id,
             if unresolved { 3 } else { 1 },
-            "The request was interrupted before a recoverable installation started. Run the installer again.",
+            "The request was interrupted before a recoverable installation started. Run the same install command again.",
         ));
     }
     let source = Source::new(cfg)?;
@@ -998,7 +995,8 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 request.version.clone(),
                 observed.version().map(str::to_owned),
                 Outcome::Failed,
-                "Could not resolve the requested release. Run the installer again.".into(),
+                "Could not resolve the requested release. Run the same install command again."
+                    .into(),
             );
             result.detail.insert("error".into(), error.to_string());
             result.preserve_unresolved(unresolved);
@@ -1091,24 +1089,14 @@ mod recovery_hint_tests {
     use super::*;
 
     #[test]
-    fn recovery_hint_names_the_cause_and_a_runnable_invocation() {
-        let line = recovery_hint_line(
-            "'/opt/slot/raft-computer-installer'",
-            &Error::Uncertain("digest mismatch".into()),
+    fn recovery_hint_names_the_cause_and_never_the_installer() {
+        let line = recovery_hint_line(&Error::Uncertain("digest mismatch".into()));
+        assert_eq!(
+            line,
+            "Installation could not finish (digest mismatch). Run the same install command again to continue where it left off."
         );
-        assert!(
-            line.starts_with("Installation requires recovery (digest mismatch). "),
-            "{line}"
-        );
-        let quoted = "'/opt/slot/raft-computer-installer'";
-        assert!(
-            line.contains(&format!("Run {quoted} recover to finish it")),
-            "{line}"
-        );
-        assert!(
-            line.contains(&format!("or {quoted} status to inspect")),
-            "{line}"
-        );
+        assert!(!line.contains("installer"), "{line}");
+        assert!(!line.contains('/'), "{line}");
     }
 }
 

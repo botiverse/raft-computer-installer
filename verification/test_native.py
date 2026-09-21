@@ -274,55 +274,33 @@ class InstallerContract(unittest.TestCase):
         self.assertIsNone(machine.live())
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed", "wrong self-version must fail before handover")
-        # The status hint must print a complete shell command that runs
-        # verbatim: a first-time user has never heard of the installer binary
-        # and it is not on PATH. Extract the printed command without adding
-        # anything and run it through the real shell.
-        durable = machine.state / "bin" / ("raft-computer-installer" + SUFFIX)
-        self.assertTrue(os.path.isabs(str(durable)))
-        self.assertEqual(durable.read_bytes(), self.server.installer_bytes,
-            "the hint must name the durable installer copy")
-        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
-        self.assertIsNotNone(status_hint, failed["line"])
-        command = status_hint.group(1)
-        # The durable copy's identity is proven by the byte equality above plus
-        # the verbatim execution below — never by separator text: Rust joins
-        # keep intermediate `/` while Python renders `\` on Windows.
-        if WINDOWS:
-            self.assertTrue(command.startswith("& '"), command)
-            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
-                capture_output=True, text=True, timeout=60, env=machine.env())
-        else:
-            self.assertTrue(command.startswith("'"), command)
-            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
-                capture_output=True, text=True, timeout=60, env=machine.env())
-        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-        json.loads(ran.stdout)
+        # The native installer is an internal detail: the failure line carries
+        # no binary name and no path, and tells the user to repeat the command
+        # they already have (the entry script resumes unresolved work itself).
+        line = failed["line"]
+        self.assertIn("Run the same install command again", line)
+        self.assertNotIn("installer", line.lower())
+        self.assertNotIn(str(machine.state), line)
+        self.assertNotIn(str(machine.home), line)
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
 
-    def test_hint_invocation_runs_verbatim_with_shell_hostile_home(self):
-        # The printed command must survive spaces, a literal $ and a single
-        # quote in RAFT_HOME: extract it verbatim and run it through the real
-        # shell without adding anything. This proves the escaper, not a
-        # per-character special case.
+    def test_failure_line_never_names_the_installer_even_with_hostile_home(self):
+        # A home containing spaces, a literal $ and a single quote used to be
+        # rendered into a paste-ready command. Now no path is rendered at all:
+        # the line must not leak the home, the state directory or the binary.
         machine = Machine(self.server, prefix="rci $HOME it's ")
         self.addCleanup(machine.close)
         self.assertTrue(all(c in str(machine.home) for c in " $'"), machine.home)
         machine.json(["install", "--version", "1.0.0"])
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed")
-        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
-        self.assertIsNotNone(status_hint, failed["line"])
-        command = status_hint.group(1)
-        if WINDOWS:
-            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
-                capture_output=True, text=True, timeout=60, env=machine.env())
-        else:
-            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
-                capture_output=True, text=True, timeout=60, env=machine.env())
-        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-        json.loads(ran.stdout)
+        line = failed["line"]
+        self.assertIn("Run the same install command again", line)
+        self.assertNotIn("installer", line.lower())
+        self.assertNotIn(str(machine.home), line)
+        self.assertNotIn(str(machine.state), line)
+        self.assertEqual(machine.self_version(), "1.0.0")
 
     def test_warm_upgrade_replay_and_live_rollback(self):
         machine = self.machine()
@@ -362,7 +340,8 @@ class InstallerContract(unittest.TestCase):
         repeated = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "history"})
         self.assertEqual(repeated["receipt"], original["receipt"])
         self.assertIn("Previous operation:", repeated["line"])
-        self.assertIn("status", repeated["line"])
+        self.assertIn("Run the same install command again", repeated["line"])
+        self.assertNotIn("installer", repeated["line"].lower())
         self.assertIsNone(machine.live())
         status = machine.json(["status"], extra={"RAFT_COMPUTER_OPERATION_ID": "history"})
         self.assertIn("stopped", status["line"])
@@ -691,6 +670,43 @@ class InstallerContract(unittest.TestCase):
         machine = self.machine()
         machine.json(["install", "--version", "1.1.0"], expected=1)
         self.assertFalse(machine.binary.exists())
+
+    def test_entry_script_resumes_an_unresolved_operation_once(self):
+        # The native installer is an internal detail. When an operation stops
+        # part-way (exit 3), the entry script must resume it itself, once, in a
+        # fresh process, so the user is never told to run the binary.
+        class FailOnce(set):
+            def __contains__(self, version):
+                if set.__contains__(self, version):
+                    self.discard(version)
+                    return True
+                return False
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        (machine.k / "operation.json").write_text("broken")
+        manifests_before = sum(1 for path in self.server.requests if "1.1.0" in path)
+        self.server.wrong_hash = FailOnce({"1.1.0"})
+        result = machine.run(["repair", "--version", "1.1.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assertNotIn("installer", (result.stdout + result.stderr).lower())
+        manifests_after = sum(1 for path in self.server.requests if "1.1.0" in path)
+        self.assertGreaterEqual(manifests_after - manifests_before, 2, self.server.requests)
+
+    def test_entry_script_resume_is_bounded_to_one_attempt(self):
+        # A cause that does not clear must not loop: the first run ends 3, the
+        # single resume ends 3 again, and the script reports 3.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        (machine.k / "operation.json").write_text("broken")
+        self.server.wrong_hash.add("1.1.0")
+        self.addCleanup(self.server.wrong_hash.clear)
+        result = machine.run(["repair", "--version", "1.1.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertNotIn("installer", (result.stdout + result.stderr).lower())
+        self.assertEqual(machine.self_version(), "1.0.0")
 
     def test_feature_channel_and_bootstrap_freeze_cleanup(self):
         machine = self.machine()

@@ -132,13 +132,12 @@ async fn worker(cfg: &Config) -> Result<u8> {
                             operation: k_carrier::state::Operation { outcome: None, .. }
                         }
                 );
-            eprintln!("Installer: {error}");
+            eprintln!("Installation: {error}");
             Reply::plain(
                 &request.id,
                 if unresolved { 3 } else { 1 },
-                format!(
-                    "The installer could not finish. Run {} status for the current state.",
-                    crate::report::installer_invocation(&cfg.durable_binary())
+                String::from(
+                    "The installation could not finish. Run the same install command again to check and continue.",
                 ),
             )
         }

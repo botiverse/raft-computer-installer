@@ -5,7 +5,7 @@ set -eu
 INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_CHANNEL:=main}"
 : "${RAFT_COMPUTER_INSTALLER_DL_BASE:=https://hands.build/dl/raft-computer-installer}"
-err() { printf 'Could not start the installer: %s.\n' "$1" >&2; exit 1; }
+err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
 need mktemp
 need uname
@@ -40,14 +40,14 @@ else
   base=${RAFT_COMPUTER_INSTALLER_DL_BASE%/}
   channel_url="$base/$RAFT_COMPUTER_INSTALLER_CHANNEL/$target"
   release_url=$(location "$channel_url" || true)
-  [ -n "$release_url" ] || err "no installer release resolves for $target"
+  [ -n "$release_url" ] || err "no installation release resolves for $target"
   case "$release_url" in
-    //*) err "invalid installer release redirect" ;;
+    //*) err "invalid installation release redirect" ;;
     /*) origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#'); release_url="$origin$release_url" ;;
   esac
-  case "$release_url" in http://*|https://*) ;; *) err "invalid installer release URL" ;; esac
-  case "$release_url" in *\?*|*\#*) err "installer release redirect must not contain a query or fragment" ;; esac
-  case "$release_url" in */releases/*/"$target") ;; *) err "installer release redirect did not freeze a release" ;; esac
+  case "$release_url" in http://*|https://*) ;; *) err "invalid installation release URL" ;; esac
+  case "$release_url" in *\?*|*\#*) err "installation release redirect must not contain a query or fragment" ;; esac
+  case "$release_url" in */releases/*/"$target") ;; *) err "installation release redirect did not freeze a release" ;; esac
   release_prefix=${release_url%/"$target"}
   release_id=${release_prefix##*/}
   case "$release_id" in ''|*[!a-zA-Z0-9_-]*) err "invalid immutable release identity" ;; esac
@@ -55,12 +55,12 @@ else
   sums_url="$release_url?kind=sha256sums"
   binary_url="$release_url"
 fi
-dl "$sums_url" "$tmp/SHA256SUMS" || err "could not download installer checksums"
+dl "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
-[ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installer"
-case "$expected" in *[!0-9a-f]*) err "invalid installer checksum" ;; esac
-dl "$binary_url" "$tmp/installer" || err "could not download installer"
-[ "$(sha "$tmp/installer")" = "$expected" ] || err "installer does not match its published checksum"
+[ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
+case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac
+dl "$binary_url" "$tmp/installer" || err "could not download the installation files"
+[ "$(sha "$tmp/installer")" = "$expected" ] || err "installation download does not match its published checksum"
 chmod 0755 "$tmp/installer"
 case "${1:-}" in install|upgrade|repair|status|recover|help) cmd=$1; shift ;; *) cmd=install ;; esac
 # RAFT_COMPUTER_VERSION is the long-standing pin used by the desktop/web
@@ -79,4 +79,12 @@ fi
 # Keep the shell alive so the EXIT trap removes downloads for every exit code.
 code=0
 "$tmp/installer" "$cmd" "$@" || code=$?
+# Exit 3 means the operation could not be settled in that process: either it
+# stopped part-way (a fresh process resumes it) or it never started changing
+# files (a fresh process re-plans it). Both are what running the same command
+# again does, so do that once here with the same verified binary; the user
+# is never told to run the installer themselves. A second 3 stays 3.
+if [ "$code" -eq 3 ]; then
+  case "$cmd" in status|recover|help) ;; *) code=0; "$tmp/installer" "$cmd" "$@" || code=$? ;; esac
+fi
 exit "$code"

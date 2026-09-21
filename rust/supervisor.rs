@@ -44,10 +44,7 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     let mut last = Reply::plain(
         &request.id,
         3,
-        format!(
-            "Installation could not be settled. Run {} recover.",
-            crate::report::installer_invocation(&cfg.durable_binary())
-        ),
+        String::from("Installation could not be settled. Run the same install command again."),
     );
     for attempt in 0..3 {
         // Verify every execution, including retries of the retained copy.
@@ -100,9 +97,8 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     last = Reply::plain(
                         &request.id,
                         3,
-                        format!(
-                            "Recovery is blocked by another installer. Run {} recover after it exits.",
-                            crate::report::installer_invocation(&cfg.durable_binary())
+                        String::from(
+                            "Recovery is blocked by another installation still running. Run the same install command again after it finishes.",
                         ),
                     );
                 } else if reply.exit_code != 3 {
