@@ -3,8 +3,8 @@ async fn main() {
     let code = match raft_computer_installer::cli::run().await {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("Installer: {error}");
-            println!("The installer could not finish.");
+            eprintln!("Installation: {error}");
+            println!("The installation could not finish.");
             1
         }
     };

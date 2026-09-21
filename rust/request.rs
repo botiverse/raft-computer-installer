@@ -112,7 +112,7 @@ impl Reply {
         // different path than the worker — this line must stay free of
         // process-local values like the current executable path.
         format!(
-            "Previous operation: {result}. Run raft-computer-installer status for the current installation and service state."
+            "Previous operation: {result}. Run the same install command again for the current installation and service state."
         )
     }
     pub fn replay(receipt: Receipt) -> Self {
