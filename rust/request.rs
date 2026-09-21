@@ -39,7 +39,7 @@ impl Request {
             || self.approved_by.chars().any(char::is_control)
             || (self.version.is_some() && self.channel.is_some())
         {
-            return Err(invalid("invalid installer request"));
+            return Err(invalid("invalid request"));
         }
         if let Some(caller) = &self.waiting_caller
             && (caller.pid <= 1
@@ -130,7 +130,7 @@ impl Reply {
             || self.line.len() > 2048
             || self.line.chars().any(char::is_control)
         {
-            return Err(invalid("invalid installer response"));
+            return Err(invalid("invalid response"));
         }
         if let Some(receipt) = &self.receipt {
             receipt.validate()?;
@@ -138,7 +138,7 @@ impl Reply {
                 || receipt.exit_code != self.exit_code
                 || (receipt.line != self.line && Self::replay_line(receipt) != self.line)
             {
-                return Err(invalid("installer response receipt mismatch"));
+                return Err(invalid("response receipt mismatch"));
             }
         }
         Ok(())

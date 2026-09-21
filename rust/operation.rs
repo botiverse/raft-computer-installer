@@ -152,7 +152,7 @@ fn preserve_metadata(cfg: &Config, request: &Request) -> Result<PathBuf> {
         let meta = fs::symlink_metadata(path)?;
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 1024 * 1024 {
             return Err(Error::Uncertain(
-                "installer metadata cannot be preserved safely".into(),
+                "installation records cannot be preserved safely".into(),
             ));
         }
         let name = format!("{i}.json");
@@ -169,7 +169,7 @@ fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > 1024 * 1024 {
-        return Err(invalid("installer operation record too large"));
+        return Err(invalid("operation record too large"));
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -190,7 +190,7 @@ fn read_plan(cfg: &Config, id: &str) -> Result<Plan> {
             .as_ref()
             .is_some_and(|v| v != &plan.manifest.version)
     {
-        return Err(invalid("installer operation identity mismatch"));
+        return Err(invalid("operation identity mismatch"));
     }
     version::exact(&plan.manifest.version)?;
     plan.manifest.release.validate()?;
@@ -203,7 +203,7 @@ fn active(cfg: &Config) -> Result<Option<Plan>> {
     }
     let active: Active = json(&active_path(cfg))?;
     if active.format_version != 1 {
-        return Err(invalid("unsupported installer operation format"));
+        return Err(invalid("unsupported operation record format"));
     }
     if let Some(receipt) = report::read(cfg, &active.id)?
         && receipt.outcome != Outcome::Unresolved
@@ -713,7 +713,7 @@ async fn install(
         );
         return finish(cfg, plan, outcome, line);
     }
-    Err(invalid("unexpected installer operation phase"))
+    Err(invalid("unexpected operation phase"))
 }
 
 async fn resume(
@@ -789,7 +789,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::plain(
                 &request.id,
                 2,
-                "Another installer is running on this machine.",
+                "Another installation is running on this machine.",
             ));
         }
         Err(error) => return Err(error),
@@ -885,7 +885,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::plain(
                 &request.id,
                 3,
-                "An earlier installation could not be recovered yet.",
+                "An earlier installation could not be recovered yet. Run the same install command again.",
             ));
         }
     }
@@ -904,7 +904,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 return Ok(Reply::plain(
                     &request.id,
                     3,
-                    "Recovery records are unreadable. Start a new repair command.",
+                    "Recovery records are unreadable. Run the same install command again.",
                 ));
             }
         }
@@ -923,7 +923,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::plain(
                 &request.id,
                 3,
-                "An earlier upgrade could not be recovered yet.",
+                "An earlier upgrade could not be recovered yet. Run the same install command again.",
             ));
         }
     }

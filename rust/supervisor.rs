@@ -122,7 +122,7 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     return Ok(Reply::plain(
                         &request.id,
                         3,
-                        "The installer worker has not exited. Recovery must wait for it.",
+                        "The previous installation step has not exited. Recovery must wait for it.",
                     ));
                 }
             }
@@ -196,7 +196,7 @@ fn persist_durable_installer(cfg: &Config, bytes: &[u8]) -> Result<()> {
     }
     let parent = durable
         .parent()
-        .ok_or_else(|| invalid("invalid durable installer path"))?;
+        .ok_or_else(|| invalid("invalid durable binary path"))?;
     ensure_dir(parent)?;
     write_durable(&durable, bytes, true)
 }
