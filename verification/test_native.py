@@ -685,11 +685,17 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         machine.login_start()
         (machine.k / "operation.json").write_text("broken")
+        # Stop the service first: a repair that succeeds must not restart a
+        # service the user stopped, so the entry script's retry never spawns a
+        # long-lived child under the harness's captured pipes (on Windows that
+        # child would inherit them and the capture would never return).
+        machine.product(["stop"])
         manifests_before = sum(1 for path in self.server.requests if "1.1.0" in path)
         self.server.wrong_hash = FailOnce({"1.1.0"})
         result = machine.run(["repair", "--version", "1.1.0"], bootstrap=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assertEqual(machine.self_version(), "1.1.0")
+        self.assertIsNone(machine.live())
         self.assertNotIn("installer", (result.stdout + result.stderr).lower())
         manifests_after = sum(1 for path in self.server.requests if "1.1.0" in path)
         self.assertGreaterEqual(manifests_after - manifests_before, 2, self.server.requests)
@@ -701,6 +707,7 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         machine.login_start()
         (machine.k / "operation.json").write_text("broken")
+        machine.product(["stop"])
         self.server.wrong_hash.add("1.1.0")
         self.addCleanup(self.server.wrong_hash.clear)
         result = machine.run(["repair", "--version", "1.1.0"], bootstrap=True)
