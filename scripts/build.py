@@ -80,25 +80,51 @@ def assemble(output, require_all=False):
     return manifest
 
 
+# Linux installers link statically against musl so one binary runs on every
+# distribution regardless of its glibc (Rocky/RHEL 9 ship 2.34; a host-glibc
+# build on the Ubuntu 24.04 runner demanded GLIBC_2.39 and refused to load).
+# The Computer product itself is not affected: only the installer is rebuilt.
+LINUX_MUSL_TRIPLES = {"linux-x64": "x86_64-unknown-linux-musl", "linux-arm64": "aarch64-unknown-linux-musl"}
+
+
+def rust_triple(target):
+    return LINUX_MUSL_TRIPLES.get(target)
+
+
+def assert_portable_linux(binary):
+    """A Linux installer must carry no glibc version references at all."""
+    data = Path(binary).read_bytes()
+    if b"GLIBC_" in data:
+        raise ValueError(f"Linux installer references glibc symbols: {binary}")
+    if b"/lib/ld-linux" in data or b"/lib64/ld-linux" in data:
+        raise ValueError(f"Linux installer requests the glibc dynamic loader: {binary}")
+
+
 def build(output, fixtures=False):
     output = Path(output).resolve()
     target = target_key()
+    triple = rust_triple(target)
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
     command = ["cargo", "build", "--locked", "--release", "--bin", "raft-computer-installer"]
+    if triple:
+        command += ["--target", triple]
     if fixtures:
         command += ["--features", "verification-fixture", "--bin", "raft-computer-fixture"]
     subprocess.run(command, cwd=ROOT, check=True, env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
+    built = target_dir / triple / "release" if triple else target_dir / "release"
     name = "raft-computer-installer" + (".exe" if os.name == "nt" else "")
     binary = output / "native" / target / name
     binary.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(target_dir / "release" / name, binary)
+    shutil.copy2(built / name, binary)
     binary.chmod(0o755)
+    if triple:
+        assert_portable_linux(binary)
     sign(binary)
     if fixtures:
         name = "raft-computer-fixture" + (".exe" if os.name == "nt" else "")
         fixture = output / "fixtures" / name
         fixture.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target_dir / "release" / name, fixture)
+        shutil.copy2(built / name, fixture)
         fixture.chmod(0o755)
     return assemble(output)
 

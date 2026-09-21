@@ -84,8 +84,8 @@ jobs:
         include:
           - { os: macos-14, target: darwin-arm64 }
           - { os: macos-15-intel, target: darwin-x64 }
-          - { os: ubuntu-24.04, target: linux-x64 }
-          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          - { os: ubuntu-24.04, target: linux-x64, rust_target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: linux-arm64, rust_target: aarch64-unknown-linux-musl }
           - { os: windows-latest, target: win32-x64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -97,6 +97,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt, clippy
+          # Linux installers are static musl binaries (scripts/build.py) so one
+          # artifact loads on any distribution's glibc; the host-gnu build made
+          # on this runner demanded GLIBC_2.39 and refused to start on RHEL 9.
+          targets: ${{ matrix.rust_target || '' }}
+      - name: Install the musl linker
+        if: ${{ matrix.rust_target }}
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - uses: Swatinem/rust-cache@v2
       - run: python scripts/verify.py
       - uses: actions/download-artifact@v4
