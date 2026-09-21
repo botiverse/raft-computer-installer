@@ -13,7 +13,7 @@ use tokio::{
     time::timeout,
 };
 
-const HELP: &str = "raft-computer-installer
+const HELP: &str = "Raft Computer installation commands
 
   install|upgrade [--version V | --channel main|alpha|NAME] [--yes] [--allow-downgrade] [--json]
   repair          [--version V | --channel main|alpha|NAME] [--yes] [--allow-downgrade] [--json]
@@ -182,7 +182,7 @@ pub async fn run() -> Result<u8> {
     if ["install", "upgrade", "repair"].contains(&args.request.command.as_str()) {
         let marker = env::var("RAFT_COMPUTER_INSTALLER_CALLER").ok();
         if marker.as_deref().is_some_and(|v| v != "waiting-cli-v1") {
-            return Err(invalid("invalid installer caller declaration"));
+            return Err(invalid("invalid caller declaration"));
         }
         let parent = crate::process::immediate_parent(&cfg.binary)?;
         if marker.is_some() && parent.is_none() {
@@ -199,7 +199,7 @@ pub async fn run() -> Result<u8> {
                 args.request.waiting_caller = Some(parent);
             } else if !remote {
                 return Err(invalid(
-                    "Computer caller has no waiting declaration; run the installer directly",
+                    "Computer caller has no waiting declaration; run the install command directly",
                 ));
             }
         }

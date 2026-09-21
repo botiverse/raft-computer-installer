@@ -41,13 +41,13 @@ pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
     let identity = observe(first)?;
     if first != native::parent()? {
         return Err(Error::Uncertain(
-            "installer parent changed during attestation".into(),
+            "parent process changed during attestation".into(),
         ));
     }
     #[cfg(windows)]
     if let Some(parent) = &identity {
-        let own = observe(std::process::id())?
-            .ok_or_else(|| invalid("installer identity unavailable"))?;
+        let own =
+            observe(std::process::id())?.ok_or_else(|| invalid("process identity unavailable"))?;
         let ticks = |created: &str| -> Result<u64> {
             let (high, low) = created
                 .split_once(':')
@@ -61,7 +61,7 @@ pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
             Ok((u64::from(high) << 32) | u64::from(low))
         };
         if ticks(&parent.created)? > ticks(&own.created)? {
-            return Err(Error::Uncertain("installer parent PID was reused".into()));
+            return Err(Error::Uncertain("parent process id was reused".into()));
         }
     }
     Ok(identity.filter(|p| same_path(&p.executable, binary)))
@@ -613,7 +613,7 @@ mod native {
             }
             found = unsafe { Process32NextW(snapshot.0, &mut entry) };
         }
-        Err(Error::Uncertain("installer parent unavailable".into()))
+        Err(Error::Uncertain("parent process unavailable".into()))
     }
 
     pub fn pids() -> Result<Vec<u32>> {

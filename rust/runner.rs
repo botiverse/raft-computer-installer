@@ -48,7 +48,7 @@ fn controller(cfg: &Config) -> Result<CommandHost> {
     let executable = std::env::current_exe()?
         .into_os_string()
         .into_string()
-        .map_err(|_| invalid("installer executable path is not Unicode"))?;
+        .map_err(|_| invalid("executable path is not Unicode"))?;
     CommandHost::new(
         vec![executable, "--host-controller".into()],
         &cfg.k_state,

@@ -96,7 +96,7 @@ pub async fn read(cfg: &Config) -> Result<World> {
     if fs::symlink_metadata(&cfg.binary).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
             reason: format!(
-                "{} is a link owned outside this installer; remove it with its owning manager before retrying",
+                "{} is a link owned by another manager; remove it with that manager before retrying",
                 cfg.binary.display()
             ),
         });
@@ -104,14 +104,14 @@ pub async fn read(cfg: &Config) -> Result<World> {
     if fs::symlink_metadata(&cfg.sidecar).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
             reason: format!(
-                "{} is a link owned outside this installer; remove it with its owning manager before retrying",
+                "{} is a link owned by another manager; remove it with that manager before retrying",
                 cfg.sidecar.display()
             ),
         });
     }
     if exists(&cfg.installer_dir.join("metadata-damage.json"))? {
         return Ok(World::Broken {
-            reason: "installer records require repair".into(),
+            reason: "installation records require repair".into(),
         });
     }
     let store = FileStore::new(&cfg.k_state);

@@ -68,7 +68,7 @@ impl Receipt {
                 .as_ref()
                 .is_some_and(|s| s.len() > 512 || s.chars().any(char::is_control))
         {
-            return Err(invalid("invalid installer receipt"));
+            return Err(invalid("invalid receipt"));
         }
         if let Some(v) = &self.target_version {
             version::exact(v)?;
@@ -96,13 +96,13 @@ impl Receipt {
         // request's successful continuation, after disk recovery proves it.
         if let Some(old) = read(cfg, &self.id)? {
             if old.target_version != self.target_version || old.operation != self.operation {
-                return Err(invalid("installer request identity conflict"));
+                return Err(invalid("request identity conflict"));
             }
             if old.outcome != Outcome::Unresolved {
                 if old == self {
                     return Ok(old);
                 }
-                return Err(invalid("installer request already completed"));
+                return Err(invalid("request already completed"));
             }
         }
         write_json(&path, &self)?;
@@ -117,12 +117,12 @@ pub fn read(cfg: &Config, id: &str) -> Result<Option<Receipt>> {
         Err(e) => return Err(e.into()),
     };
     if bytes.len() > 65536 {
-        return Err(invalid("installer receipt too large"));
+        return Err(invalid("receipt too large"));
     }
     let receipt: Receipt = serde_json::from_slice(&bytes)?;
     receipt.validate()?;
     if receipt.id != id {
-        return Err(invalid("installer receipt identity mismatch"));
+        return Err(invalid("receipt identity mismatch"));
     }
     Ok(Some(receipt))
 }
