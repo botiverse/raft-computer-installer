@@ -213,9 +213,9 @@ class ReleaseServer:
 
 
 class Machine:
-    def __init__(self, server):
+    def __init__(self, server, prefix="rci-machine-"):
         self.server = server
-        self.directory = tempfile.TemporaryDirectory(prefix="rci-machine-")
+        self.directory = tempfile.TemporaryDirectory(prefix=prefix)
         self.home = Path(self.directory.name).resolve()
         self.install_dir = self.home / "bin"
         self.install_dir.mkdir()

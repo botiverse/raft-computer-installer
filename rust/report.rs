@@ -21,6 +21,28 @@ pub enum Outcome {
     Unresolved,
 }
 
+/// How the printed failure hints can invoke this installer again. The
+/// bootstrap downloads the binary into a temporary directory it deletes on
+/// exit, and the supervisor's worker copy lives in scratch that is cleaned
+/// after a settled operation — neither survives. Hints therefore name the
+/// durable copy (see `Config::durable_binary`), quoted so the printed command
+/// is copy-pasteable even with spaces in the path.
+pub fn installer_invocation(durable_binary: &std::path::Path) -> String {
+    shell_invocation(&durable_binary.display().to_string(), cfg!(windows))
+}
+
+/// Render a path as a complete, paste-ready command for the entry shell.
+/// POSIX sh single-quotes the literal (no expansion of `$`, backticks or
+/// spaces; an inner `'` becomes the standard `'"'"'` splice). PowerShell
+/// needs the call operator and single-quoted literals double an inner `'`.
+fn shell_invocation(path: &str, windows: bool) -> String {
+    if windows {
+        format!("& '{}'", path.replace('\'', "''"))
+    } else {
+        format!("'{}'", path.replace('\'', "'\"'\"'"))
+    }
+}
+
 impl Outcome {
     pub fn exit_code(self) -> u8 {
         match self {
@@ -125,4 +147,37 @@ pub fn read(cfg: &Config, id: &str) -> Result<Option<Receipt>> {
         return Err(invalid("installer receipt identity mismatch"));
     }
     Ok(Some(receipt))
+}
+
+#[cfg(test)]
+mod shell_invocation_tests {
+    use super::*;
+
+    #[test]
+    fn posix_invocation_is_a_single_quoted_literal() {
+        assert_eq!(
+            shell_invocation("/opt/slot/installer", false),
+            "'/opt/slot/installer'"
+        );
+        assert_eq!(
+            shell_invocation("/opt/a b/$HOME/`id`", false),
+            "'/opt/a b/$HOME/`id`'"
+        );
+        assert_eq!(
+            shell_invocation("/opt/it's here/installer", false),
+            "'/opt/it'\"'\"'s here/installer'",
+        );
+    }
+
+    #[test]
+    fn powershell_invocation_uses_the_call_operator_with_doubled_quotes() {
+        assert_eq!(
+            shell_invocation("C:\\slot space\\installer.exe", true),
+            "& 'C:\\slot space\\installer.exe'"
+        );
+        assert_eq!(
+            shell_invocation("C:\\it's\\installer.exe", true),
+            "& 'C:\\it''s\\installer.exe'"
+        );
+    }
 }

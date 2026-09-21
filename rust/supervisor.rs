@@ -31,6 +31,7 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     });
     let bytes = fs::read(std::env::current_exe()?)?;
     write_durable(&executable, &bytes, true)?;
+    persist_durable_installer(cfg, &bytes)?;
     let digest = sha256(&bytes);
     let owner = crate::process::observe(std::process::id())?
         .ok_or_else(|| invalid("supervisor identity is unavailable"))?;
@@ -43,7 +44,10 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     let mut last = Reply::plain(
         &request.id,
         3,
-        "Installation could not be settled. Run raft-computer-installer recover.",
+        format!(
+            "Installation could not be settled. Run {} recover.",
+            crate::report::installer_invocation(&cfg.durable_binary())
+        ),
     );
     for attempt in 0..3 {
         // Verify every execution, including retries of the retained copy.
@@ -96,7 +100,10 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     last = Reply::plain(
                         &request.id,
                         3,
-                        "Recovery is blocked by another installer. Run raft-computer-installer recover after it exits.",
+                        format!(
+                            "Recovery is blocked by another installer. Run {} recover after it exits.",
+                            crate::report::installer_invocation(&cfg.durable_binary())
+                        ),
                     );
                 } else if reply.exit_code != 3 {
                     if reply.exit_code <= 1 && reply.receipt.is_some() {
@@ -178,4 +185,22 @@ fn remove_finished_supervisors(cfg: &Config, current: &std::path::Path) -> Resul
         k_carrier::storage::remove_dir(&entry.path())?;
     }
     Ok(())
+}
+
+/// Refresh the stable installer copy that failure hints print. It lives
+/// outside the scratch supervisors (which are cleaned once operations settle)
+/// and is overwritten atomically only when the bytes change, so a hint stays
+/// runnable after this process exits.
+fn persist_durable_installer(cfg: &Config, bytes: &[u8]) -> Result<()> {
+    let durable = cfg.durable_binary();
+    if let Ok(existing) = fs::read(&durable)
+        && sha256(&existing) == sha256(bytes)
+    {
+        return Ok(());
+    }
+    let parent = durable
+        .parent()
+        .ok_or_else(|| invalid("invalid durable installer path"))?;
+    ensure_dir(parent)?;
+    write_durable(&durable, bytes, true)
 }

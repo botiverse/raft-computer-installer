@@ -1,6 +1,7 @@
 import faulthandler
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import time
 import unittest
 
-from harness import DIST, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
+from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
 
 
 class InstallerContract(unittest.TestCase):
@@ -273,8 +274,55 @@ class InstallerContract(unittest.TestCase):
         self.assertIsNone(machine.live())
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed", "wrong self-version must fail before handover")
+        # The status hint must print a complete shell command that runs
+        # verbatim: a first-time user has never heard of the installer binary
+        # and it is not on PATH. Extract the printed command without adding
+        # anything and run it through the real shell.
+        durable = machine.state / "bin" / ("raft-computer-installer" + SUFFIX)
+        self.assertTrue(os.path.isabs(str(durable)))
+        self.assertEqual(durable.read_bytes(), self.server.installer_bytes,
+            "the hint must name the durable installer copy")
+        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
+        self.assertIsNotNone(status_hint, failed["line"])
+        command = status_hint.group(1)
+        # The durable copy's identity is proven by the byte equality above plus
+        # the verbatim execution below — never by separator text: Rust joins
+        # keep intermediate `/` while Python renders `\` on Windows.
+        if WINDOWS:
+            self.assertTrue(command.startswith("& '"), command)
+            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        else:
+            self.assertTrue(command.startswith("'"), command)
+            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        json.loads(ran.stdout)
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
+
+    def test_hint_invocation_runs_verbatim_with_shell_hostile_home(self):
+        # The printed command must survive spaces, a literal $ and a single
+        # quote in RAFT_HOME: extract it verbatim and run it through the real
+        # shell without adding anything. This proves the escaper, not a
+        # per-character special case.
+        machine = Machine(self.server, prefix="rci $HOME it's ")
+        self.addCleanup(machine.close)
+        self.assertTrue(all(c in str(machine.home) for c in " $'"), machine.home)
+        machine.json(["install", "--version", "1.0.0"])
+        failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
+        self.assertEqual(failed["receipt"]["outcome"], "failed")
+        status_hint = re.search(r"Run (.*? status) for the current state\.", failed["line"])
+        self.assertIsNotNone(status_hint, failed["line"])
+        command = status_hint.group(1)
+        if WINDOWS:
+            ran = subprocess.run(["powershell", "-NoProfile", "-Command", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        else:
+            ran = subprocess.run(["/bin/sh", "-c", f"{command} --json"],
+                capture_output=True, text=True, timeout=60, env=machine.env())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        json.loads(ran.stdout)
 
     def test_warm_upgrade_replay_and_live_rollback(self):
         machine = self.machine()

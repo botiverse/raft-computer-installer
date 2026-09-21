@@ -333,6 +333,15 @@ fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
     save(cfg, plan)
 }
 
+/// The recovery hint names the running installer's absolute path (it is not
+/// on PATH after a bootstrap install) and carries the cause, so a first-time
+/// user can both understand and run it.
+fn recovery_hint_line(invocation: &str, error: &Error) -> String {
+    format!(
+        "Installation requires recovery ({error}). Run {invocation} recover to finish it, or {invocation} status to inspect the current state."
+    )
+}
+
 fn rollback_line(target: &str, from_version: &str, reason: Option<&str>) -> String {
     match reason {
         Some(reason) => {
@@ -494,7 +503,8 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
         }
         _ => format!(
-            "Could not upgrade to {target}. Run raft-computer-installer status for the current state."
+            "Could not upgrade to {target}. Run {} status for the current state.",
+            report::installer_invocation(&cfg.durable_binary())
         ),
     };
     finish(cfg, plan, outcome, line)
@@ -746,9 +756,9 @@ async fn resume(
                     Outcome::Unresolved
                 },
                 if untouched {
-                    "Could not prepare the installation. Installed files were not changed."
+                    "Could not prepare the installation. Installed files were not changed.".into()
                 } else {
-                    "Installation requires recovery. Run raft-computer-installer recover or status."
+                    recovery_hint_line(&report::installer_invocation(&cfg.durable_binary()), &error)
                 },
             )
         }
@@ -933,7 +943,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             World::Held { reason } => (2, format!("Not done: {reason}.")),
             _ => (
                 3,
-                "Installation requires repair. Run raft-computer-installer install.".into(),
+                format!(
+                    "Installation requires repair. Run {} install.",
+                    report::installer_invocation(&cfg.durable_binary())
+                ),
             ),
         };
         let mut reply = Reply::plain(&request.id, code, line);
@@ -1071,6 +1084,32 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         },
     )?;
     resume(cfg, &mut plan, false, &interaction).await
+}
+
+#[cfg(test)]
+mod recovery_hint_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_hint_names_the_cause_and_a_runnable_invocation() {
+        let line = recovery_hint_line(
+            "'/opt/slot/raft-computer-installer'",
+            &Error::Uncertain("digest mismatch".into()),
+        );
+        assert!(
+            line.starts_with("Installation requires recovery (digest mismatch). "),
+            "{line}"
+        );
+        let quoted = "'/opt/slot/raft-computer-installer'";
+        assert!(
+            line.contains(&format!("Run {quoted} recover to finish it")),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("or {quoted} status to inspect")),
+            "{line}"
+        );
+    }
 }
 
 #[cfg(test)]
