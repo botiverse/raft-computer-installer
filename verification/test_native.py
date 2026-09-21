@@ -671,6 +671,19 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.1.0"], expected=1)
         self.assertFalse(machine.binary.exists())
 
+    def test_top_level_failure_never_names_the_installer(self):
+        # An error before any command runs (here: the user home is not an
+        # absolute path, rejected by Config::load) is reported by main() itself.
+        # That path had no test and still said "Installer:". Neither stream may
+        # name the binary; the user is told the installation could not finish.
+        machine = self.machine()
+        key = "USERPROFILE" if WINDOWS else "HOME"
+        result = machine.run(["status"], extra={key: "relative-home"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        out = result.stdout + result.stderr
+        self.assertIn("The installation could not finish.", out)
+        self.assertNotIn("installer", out.lower(), out)
+
     def test_entry_script_resumes_an_unresolved_operation_once(self):
         # The native installer is an internal detail. When an operation stops
         # part-way (exit 3), the entry script must resume it itself, once, in a

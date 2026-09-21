@@ -91,7 +91,7 @@ fn parse(args: &[String]) -> Result<Args> {
                     request.channel = Some(source::parse_channel(value)?);
                 }
             }
-            _ => return Err(invalid("unknown installer option")),
+            _ => return Err(invalid("unknown option")),
         }
         position += 1;
     }
@@ -118,7 +118,7 @@ async fn worker(cfg: &Config) -> Result<u8> {
         Err(Error::Locked(_)) => Reply::plain(
             &request.id,
             2,
-            "Another installer is running on this machine.",
+            "Another installation is running on this machine.",
         ),
         Err(error) => {
             // Inspect persistent state instead of reporting a write/read failure
