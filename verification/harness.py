@@ -240,40 +240,16 @@ class Machine:
         environment.update(extra or {})
         return environment
 
-    def command(self, args, extra=None, bootstrap=False, psreadline=False):
+    def command(self, args, extra=None, bootstrap=False):
         if bootstrap:
             if WINDOWS:
-                powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
-                if psreadline:
-                    # An interactive Windows PowerShell 5.1 console has PSReadLine
-                    # loaded before the entry script runs, and PSReadLine carries a
-                    # stub System.Runtime.InteropServices.RuntimeInformation type
-                    # that shadows the real one. Importing PSReadLine in a CI
-                    # session does not reproduce the shadowing (measured: the old
-                    # script passed), so reproduce it deterministically: compile an
-                    # equivalent stub and register it as the type accelerator for
-                    # that exact name, which is what the type literal resolves
-                    # through first. Then prove the shadowing is in effect; if the
-                    # literal still yields a real OSArchitecture, exit 97 so the test
-                    # fails on a missing precondition instead of passing vacuously.
-                    # -File cannot do any of this: it starts a bare session.
-                    stub = ("namespace RaftEntryScriptTest { public static class RuntimeInformationStub {"
-                            " public static string OSDescription { get { return \"stub\"; } }"
-                            " public static bool IsOSPlatform(object platform) { return true; } } }")
-                    quoted = " ".join("'" + a.replace("'", "''") + "'" for a in args)
-                    script = ("Add-Type -TypeDefinition '" + stub + "' -ErrorAction Stop; "
-                              "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add("
-                              "'System.Runtime.InteropServices.RuntimeInformation', [RaftEntryScriptTest.RuntimeInformationStub]); "
-                              "if ($null -ne [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) "
-                              "{ [Console]::Error.WriteLine('precondition failed: RuntimeInformation stub is not shadowing the real type'); exit 97 }; "
-                              "& '" + str(DIST / "install.ps1") + "' " + quoted + "; exit $LASTEXITCODE")
-                    return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
-                return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(DIST / "install.ps1"), *args]
+                return [str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"),
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(DIST / "install.ps1"), *args]
             return ["/bin/sh", str(DIST / "install.sh"), *args]
         return [str(self.server.installer), *args]
 
-    def run(self, args, extra=None, bootstrap=False, psreadline=False):
-        return subprocess.run(self.command(args, extra, bootstrap, psreadline), env=self.env(extra), text=True, capture_output=True, timeout=180)
+    def run(self, args, extra=None, bootstrap=False):
+        return subprocess.run(self.command(args, extra, bootstrap), env=self.env(extra), text=True, capture_output=True, timeout=180)
 
     def json(self, args, expected=0, extra=None):
         result = self.run([*args, "--json"], extra)
