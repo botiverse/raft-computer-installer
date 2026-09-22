@@ -33,6 +33,8 @@ class InstallerContract(unittest.TestCase):
         faulthandler.dump_traceback_later(60, repeat=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.server.requests.clear()
+        self.server.request_times.clear()
+        self.server.slow_checksums = 0.0
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
@@ -683,6 +685,40 @@ class InstallerContract(unittest.TestCase):
         out = result.stdout + result.stderr
         self.assertIn("The installation could not finish.", out)
         self.assertNotIn("installer", out.lower(), out)
+
+    def test_entry_script_speaks_before_its_first_round_trip(self):
+        # A silent terminal reads as a hang: the entry script must say what it
+        # is doing before the checksum/download round trips, then again before
+        # the binary download, and the installer must announce the release
+        # resolution before it happens. All on stderr (stdout is the
+        # installer's, including --json), and none of it names the installer.
+        machine = self.machine()
+        result = machine.run(["install", "--version", "1.0.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        preparing = next(i for i, line in enumerate(lines) if "Preparing the Raft Computer installation" in line)
+        downloading = next(i for i, line in enumerate(lines) if "Downloading the installation files" in line)
+        checking = next(i for i, line in enumerate(lines) if "Checking the Raft Computer release" in line)
+        self.assertEqual(preparing, 0, lines[:3])
+        self.assertLess(preparing, downloading)
+        self.assertLess(downloading, checking)
+        self.assertNotIn("Preparing", result.stdout)
+        self.assertNotIn("installer", (result.stdout + result.stderr).lower())
+
+    @unittest.skipIf(WINDOWS, "install.ps1 still downloads serially; concurrency is the POSIX entry script's contract")
+    def test_entry_script_downloads_checksums_and_binary_concurrently(self):
+        # The checksum list and the binary are independent fetches of one
+        # frozen release. With the checksum response held for a while, the
+        # binary request must still arrive during that hold: a serial entry
+        # script would only ask for the binary after the checksums returned.
+        self.server.slow_checksums = 1.5
+        machine = self.machine()
+        result = machine.run(["install", "--version", "1.0.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sums_at = next(t for path, t in self.server.request_times if "sha256sums" in path or path.endswith("SHA256SUMS"))
+        binary_at = next(t for path, t in self.server.request_times if path.endswith(f"/releases/frozen-1/{TARGET}") and "?" not in path)
+        self.assertLess(abs(binary_at - sums_at), 1.0, "binary was requested only after the checksums returned")
+        self.assertEqual(machine.self_version(), "1.0.0")
 
     def test_entry_script_resumes_an_unresolved_operation_once(self):
         # The native installer is an internal detail. When an operation stops
