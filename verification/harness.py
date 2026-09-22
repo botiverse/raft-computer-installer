@@ -70,6 +70,8 @@ class ReleaseServer:
         self.gzip_versions = set()
         self.manifest_changes = {}
         self.requests = []
+        self.request_times = []
+        self.slow_checksums = 0.0
         self.tamper_installer = False
         self.missing_checksums = False
         self.channel_resolutions = 0
@@ -123,6 +125,7 @@ class ReleaseServer:
         path = urllib.parse.unquote(url.path)
         query = urllib.parse.parse_qs(url.query)
         self.requests.append(handler.path)
+        self.request_times.append((handler.path, time.monotonic()))
         status, body = 200, b""
         parts = path.strip("/").split("/")
         if path == "/public/v2/apps/raft-computer-cli/updates/check":
@@ -176,6 +179,7 @@ class ReleaseServer:
             return
         elif path in (f"/dl/raft-computer-installer/releases/frozen-1/{TARGET}", "/installer/SHA256SUMS", f"/installer/native/{TARGET}/raft-computer-installer{SUFFIX}"):
             if path.endswith("SHA256SUMS") or query.get("kind") == ["sha256sums"]:
+                time.sleep(self.slow_checksums)
                 relative = f"native/{TARGET}/raft-computer-installer{SUFFIX}"
                 body = b"" if self.missing_checksums else f"{sha(self.installer_bytes)}  {relative}\n".encode()
             else:

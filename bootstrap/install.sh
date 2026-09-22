@@ -2,6 +2,11 @@
 # Download one immutable, verified native installer. All product policy lives
 # in that executable. Rust's worker and supervisor share this single binary.
 set -eu
+# Say something before the first network round trip: the download, checksum
+# and release resolution below take several sequential round trips, and a
+# silent terminal reads as a hang. Status goes to stderr so stdout stays the
+# installer's (including --json output).
+printf 'Preparing the Raft Computer installation...\n' >&2
 INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_CHANNEL:=main}"
 : "${RAFT_COMPUTER_INSTALLER_DL_BASE:=https://hands.build/dl/raft-computer-installer}"
@@ -27,7 +32,8 @@ case "$machine" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=x64 ;; *) err
 target="$plat-$arch"
 native="native/$target/raft-computer-installer"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' 0
+download_pid=
+trap '[ -n "$download_pid" ] && kill "$download_pid" 2>/dev/null; rm -rf "$tmp"' 0
 trap 'exit 130' 2
 trap 'exit 143' 15
 if [ -n "${RAFT_COMPUTER_INSTALLER_RELEASE_BASE:-}" ]; then
@@ -55,11 +61,16 @@ else
   sums_url="$release_url?kind=sha256sums"
   binary_url="$release_url"
 fi
+# The checksum list and the binary are independent fetches of one frozen
+# release: download them concurrently and verify once both are complete.
+printf 'Downloading the installation files...\n' >&2
+dl "$binary_url" "$tmp/installer" & download_pid=$!
 dl "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
 [ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
 case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac
-dl "$binary_url" "$tmp/installer" || err "could not download the installation files"
+wait "$download_pid" || err "could not download the installation files"
+download_pid=
 [ "$(sha "$tmp/installer")" = "$expected" ] || err "installation download does not match its published checksum"
 chmod 0755 "$tmp/installer"
 case "${1:-}" in install|upgrade|repair|status|recover|help) cmd=$1; shift ;; *) cmd=install ;; esac

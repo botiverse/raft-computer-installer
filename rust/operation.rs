@@ -979,6 +979,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         ));
     }
     let source = Source::new(cfg)?;
+    // Status before the release resolution round trip, on stderr so --json
+    // stdout stays clean; the entry scripts print their own lines before the
+    // download that precedes this.
+    eprintln!("Checking the Raft Computer release...");
     let manifest = match &request.version {
         Some(version) => source.manifest(version).await,
         None => {

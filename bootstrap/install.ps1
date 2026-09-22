@@ -10,6 +10,8 @@ $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALL
 $tmp = $null
 $code = 1
 function Fail($message) { throw "Could not start the installation: $message." }
+# Say something before the first network round trip (see install.sh).
+[Console]::Error.WriteLine('Preparing the Raft Computer installation...')
 function ProxyFor([Uri]$uri) {
   $exclude = if ($env:NO_PROXY) { $env:NO_PROXY } else { $env:no_proxy }
   foreach ($entry in ($exclude -split ',')) {
@@ -68,6 +70,7 @@ try {
     if ($line -match '^([0-9a-fA-F]{64})\s+(.+)$' -and $Matches[2] -eq $native) { $matchesForTarget += $Matches[1].ToLowerInvariant() }
   }
   if ($matchesForTarget.Count -ne 1) { Fail 'checksums must name exactly one matching installation file' }
+  [Console]::Error.WriteLine('Downloading the installation files...')
   $cli = Join-Path $tmp 'installer.exe'
   Download $binaryUrl $cli
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash.ToLowerInvariant() -ne $matchesForTarget[0]) { Fail 'installation download does not match its published checksum' }
