@@ -705,6 +705,20 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("Preparing", result.stdout)
         self.assertNotIn("installer", (result.stdout + result.stderr).lower())
 
+    @unittest.skipUnless(WINDOWS, "PSReadLine shadowing only exists in a Windows PowerShell 5.1 console")
+    def test_entry_script_starts_with_psreadline_loaded(self):
+        # Windows PowerShell 5.1 consoles load PSReadLine, which carries a stub
+        # System.Runtime.InteropServices.RuntimeInformation type that shadows the
+        # real one and has no OSArchitecture. The entry script used to read the
+        # architecture through that type literal and died before its first
+        # network request ("You cannot call a method on a null-valued
+        # expression"). It must start and complete with PSReadLine loaded.
+        machine = self.machine()
+        result = machine.run(["install", "--version", "1.0.0"], bootstrap=True, psreadline=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("null-valued", result.stdout + result.stderr)
+        self.assertEqual(machine.self_version(), "1.0.0")
+
     @unittest.skipIf(WINDOWS, "install.ps1 still downloads serially; concurrency is the POSIX entry script's contract")
     def test_entry_script_downloads_checksums_and_binary_concurrently(self):
         # The checksum list and the binary are independent fetches of one

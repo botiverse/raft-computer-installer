@@ -33,8 +33,15 @@ function Download($url, $out) {
   Invoke-WebRequest @options
 }
 try {
-  $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-  if ($arch -ne 'X64') { Fail 'unsupported Windows architecture' }
+  # Read the machine architecture from the environment, never from
+  # [System.Runtime.InteropServices.RuntimeInformation]: in Windows PowerShell 5.1
+  # an interactive console has PSReadLine loaded, which ships a same-named stub
+  # type without OSArchitecture, so the type literal resolves to the stub and
+  # ::OSArchitecture is $null (report: task #877). PROCESSOR_ARCHITEW6432 names
+  # the real machine when this PowerShell runs under WOW64 or x64 emulation.
+  $arch = $env:PROCESSOR_ARCHITEW6432
+  if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+  if ($arch -ne 'AMD64') { Fail 'unsupported Windows architecture' }
   $target = 'win32-x64'
   $native = "native/$target/raft-computer-installer.exe"
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ('raft-computer-installer-' + [Guid]::NewGuid().ToString('N'))
