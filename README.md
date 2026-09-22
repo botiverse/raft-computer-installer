@@ -31,6 +31,16 @@ The bootstrap downloads and verifies the installer, runs it, and cleans up its
 temporary files. It uses a published release. To run code from this checkout,
 use the native executable produced by the build command below.
 
+If an operation stops before it can be settled (exit code 3), the bootstrap
+runs the same command once more with the same verified binary before
+reporting; a second unresolved result is reported as-is, with the cause and
+the advice to run the same install command again. Users are never asked to
+run the installer executable themselves.
+
+Linux installers are statically linked against musl, so one binary runs on
+any distribution regardless of its glibc version (Rocky/RHEL 9, Ubuntu 22.04,
+Debian 12 and newer are all supported).
+
 | Command | Behavior |
 | --- | --- |
 | `install`, `upgrade` | Bring the machine to the selected version: install if fresh, adopt a pre-K installation, upgrade a managed installation, or repair a broken one. No command means `upgrade` in the native CLI and `install` in the bootstrap; both choose the path from the machine's state. |
@@ -57,8 +67,10 @@ A Computer CLI waiting for its installer is not a running service. The installer
 attests that CLI's immediate-parent process identity at entry and retains the
 exclusion only for that operation. Remote service callers remain product processes.
 Computer CLIs must explicitly declare that they are waiting. A terminal does not
-establish this role. For older Computer versions, invoke the standalone installer
-directly: upgrading through an older CLI without this declaration is unsupported.
+establish this role. Upgrading through an older Computer CLI that cannot make
+this declaration is unsupported; for such machines, support runs the published
+install command (the bootstrap), which never requires the user to know about or
+run the installer executable.
 An undeclared CLI caller is rejected before installation changes. Supported
 calling CLIs receive the final installer exit code, not background acceptance.
 The installer lock serializes installation and recovery. If an installer dies
@@ -66,7 +78,8 @@ but leaves its calling CLI behind, a later recovery may terminate that orphaned
 CLI; it does not block recovery or count as a service that must be restarted.
 
 Exit codes: **0** succeeded or already up to date; **1** failed or rolled back;
-**2** held; **3** recovery unresolved. Details are recorded under
+**2** held; **3** recovery unresolved (the bootstrap retries the same command
+once on this code before surfacing it). Details are recorded under
 `<RAFT_HOME>/computer/installer/receipts/`. Repeating a completed operation ID
 returns its unchanged receipt with a historical-result label; use `status` to
 observe the machine now. An unreadable old receipt prevents reusing that request
@@ -114,9 +127,19 @@ by another package manager are held.
 
 ## Develop
 
-Use Rust 1.89 (pinned in `rust-toolchain.toml`), Python 3.11 or newer, and the
-platform's native linker. Node is not required for building, running or core
-verification. On Windows, use `python` in place of `python3`.
+Use Rust 1.89 (pinned in `rust-toolchain.toml`) and Python 3.11 or newer. Node
+is not required for building, running or core verification. On Windows, use
+`python` in place of `python3`.
+
+macOS and Windows build with the platform's native linker. Linux builds target
+musl (`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`) so the
+installer is a static binary; install the target and a musl-capable linker
+first:
+
+```sh
+rustup target add x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+sudo apt-get install -y musl-tools            # provides musl-gcc (Debian/Ubuntu)
+```
 
 ```sh
 python3 scripts/build.py           # native executable, bootstrap and manifests
@@ -131,8 +154,6 @@ Windows). Targets are `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` a
 
 See [verification/README.md](verification/README.md) for scenarios, isolated test
 resources and the distinction between fixture and real-product coverage.
-Implementation progress and verification results are tracked in the
-[alignment document](https://github.com/botiverse/elephant/blob/rust-native/docs/installer-alignment.zh-CN.md).
 
 ## Release
 
@@ -158,3 +179,7 @@ release to another installer channel, run the **Promote installer release**
 workflow with its exact tag and destination channel. It reuses the GitHub release
 archive, checks the tag/commit and every asset hash, and downloads the published
 Hands bytes again; it does not rebuild them or advance the Computer channel.
+
+## License
+
+Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
