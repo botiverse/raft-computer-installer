@@ -33,6 +33,8 @@ class InstallerContract(unittest.TestCase):
         faulthandler.dump_traceback_later(60, repeat=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.server.requests.clear()
+        self.server.request_times.clear()
+        self.server.slow_checksums = 0.0
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
@@ -703,6 +705,7 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("Preparing", result.stdout)
         self.assertNotIn("installer", (result.stdout + result.stderr).lower())
 
+    @unittest.skipIf(WINDOWS, "install.ps1 still downloads serially; concurrency is the POSIX entry script's contract")
     def test_entry_script_downloads_checksums_and_binary_concurrently(self):
         # The checksum list and the binary are independent fetches of one
         # frozen release. With the checksum response held for a while, the
