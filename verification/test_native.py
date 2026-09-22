@@ -712,9 +712,12 @@ class InstallerContract(unittest.TestCase):
         # real one and has no OSArchitecture. The entry script used to read the
         # architecture through that type literal and died before its first
         # network request ("You cannot call a method on a null-valued
-        # expression"). It must start and complete with PSReadLine loaded.
+        # expression"). The harness installs an equivalent stub and proves the
+        # shadowing is in effect (exit 97 otherwise); the script must then
+        # start and complete anyway.
         machine = self.machine()
         result = machine.run(["install", "--version", "1.0.0"], bootstrap=True, psreadline=True)
+        self.assertNotEqual(result.returncode, 97, "shadowing precondition not reproduced: " + result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("null-valued", result.stdout + result.stderr)
         self.assertEqual(machine.self_version(), "1.0.0")
