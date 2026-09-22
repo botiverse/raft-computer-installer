@@ -719,6 +719,24 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("null-valued", result.stdout + result.stderr)
         self.assertEqual(machine.self_version(), "1.0.0")
 
+    @unittest.skipUnless(WINDOWS, "the architecture gate is the Windows entry script's contract")
+    def test_entry_script_refuses_non_x64_windows(self):
+        # The gate reads PROCESSOR_ARCHITEW6432 first (the real machine under
+        # WOW64 / x64 emulation), then PROCESSOR_ARCHITECTURE, and only AMD64
+        # may proceed. Present an ARM64 machine and require the refusal before
+        # any download; CI runners are AMD64, so this branch never runs on its
+        # own.
+        machine = self.machine()
+        for extra in ({"PROCESSOR_ARCHITEW6432": "ARM64", "PROCESSOR_ARCHITECTURE": "AMD64"},
+                      {"PROCESSOR_ARCHITEW6432": "", "PROCESSOR_ARCHITECTURE": "ARM64"}):
+            with self.subTest(extra=extra):
+                requests_before = len(self.server.request_times)
+                result = machine.run(["install", "--version", "1.0.0"], extra=extra, bootstrap=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("unsupported Windows architecture", result.stderr)
+                self.assertEqual(len(self.server.request_times), requests_before, "refused machines must not download")
+        self.assertFalse(machine.binary.exists())
+
     @unittest.skipIf(WINDOWS, "install.ps1 still downloads serially; concurrency is the POSIX entry script's contract")
     def test_entry_script_downloads_checksums_and_binary_concurrently(self):
         # The checksum list and the binary are independent fetches of one
