@@ -259,13 +259,14 @@ fn finish(
     outcome: Outcome,
     line: impl Into<String>,
 ) -> Result<Reply> {
+    // Installation and account/workspace setup are separate product actions.
+    // Keep the persisted field for backwards-compatible plan decoding, but
+    // never carry a product-provided login/setup hint into a current receipt.
+    plan.next_step = None;
     let mut line = line.into();
     if outcome.exit_code() == 0 || outcome == Outcome::RolledBack {
         if plan.detail.get("readback").map(String::as_str) == Some("service") {
             line.push_str(" It is running.");
-        }
-        if let Some(hint) = &plan.next_step {
-            line.push_str(&format!(" Next: {hint}"));
         }
         if let Some(hint) = plan.detail.get("pathHint") {
             line.push(' ');
@@ -280,7 +281,6 @@ fn finish(
         line,
     );
     result.detail = plan.detail.clone();
-    result.next_step = plan.next_step.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
     let result = result.finish(cfg)?;
     if result.outcome != Outcome::Unresolved {
@@ -489,7 +489,6 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 serde_json::to_string(&dead)?,
             );
         }
-        plan.next_step = state.next_step;
     }
     let target = &plan.manifest.version;
     let line = match outcome {
@@ -550,7 +549,6 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
-        plan.next_step = answer.next_step;
         transition(
             cfg,
             plan,
@@ -649,7 +647,6 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         // actions. The surface that knows the target server and workspace
         // prints the exact setup command; the installer neither guesses it nor
         // starts an interactive login of its own.
-        plan.next_step = None;
         transition(cfg, plan, Phase::Starting)?;
     }
     if plan.phase == Phase::Setup {
@@ -677,13 +674,6 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 ));
             }
             plan.detail.insert("readback".into(), "candidate".into());
-        }
-        if plan.kind != Kind::Fresh
-            && let Ok(status) = computer::status(cfg).await
-        {
-            plan.next_step = status.next_step;
-        } else if plan.kind == Kind::Fresh {
-            plan.next_step = None;
         }
         let outcome = if plan.kind == Kind::Repair {
             Outcome::Repaired

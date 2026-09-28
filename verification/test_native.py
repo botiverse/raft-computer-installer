@@ -268,9 +268,16 @@ class InstallerContract(unittest.TestCase):
 
     def test_fresh_and_cold_upgrade_preserve_stopped_state(self):
         machine = self.machine()
-        machine.json(["install", "--version", "1.0.0"])
+        installed = machine.json(["install", "--version", "1.0.0"])
+        self.assertNotIn("Next:", installed["line"])
+        self.assertIsNone(installed["receipt"]["nextStep"])
+        repeated = machine.json(["install", "--version", "1.0.0"])
+        self.assertEqual(repeated["receipt"]["outcome"], "up-to-date")
+        self.assertNotIn("Next:", repeated["line"])
+        self.assertIsNone(repeated["receipt"]["nextStep"])
         upgraded = machine.json(["upgrade", "--version", "1.1.0"])
-        self.assertIn("Next:", upgraded["line"])
+        self.assertNotIn("Next:", upgraded["line"])
+        self.assertIsNone(upgraded["receipt"]["nextStep"])
         self.assertNotIn("It is running.", upgraded["line"])
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
