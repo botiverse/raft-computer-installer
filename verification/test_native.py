@@ -703,7 +703,11 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(preparing, 0, lines[:3])
         self.assertLess(preparing, downloading)
         self.assertLess(downloading, checking)
-        self.assertRegex(bootstrap_transfer, r"100(?:\.0)?%", bootstrap_transfer)
+        # PowerShell's progress host is visible in an interactive console but
+        # intentionally does not serialize into redirected stderr. Its source
+        # contract is pinned separately; POSIX progress is observable here.
+        if not WINDOWS:
+            self.assertRegex(bootstrap_transfer, r"100(?:\.0)?%", bootstrap_transfer)
         self.assertIn("Downloading Raft Computer: 100%", result.stderr)
         self.assertIn("Downloading Raft Computer support file: 100%", result.stderr)
         self.assertNotIn("Preparing", result.stdout)
