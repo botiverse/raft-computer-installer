@@ -7,7 +7,7 @@ use crate::{
     version,
 };
 use k_carrier::{
-    artifact::{Downloader, Release, sha256},
+    artifact::{Downloader, Progress, Release, sha256},
     error::invalid,
     storage::{ensure_dir, write_durable, write_json},
 };
@@ -15,7 +15,35 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
+
+fn download_progress(label: &'static str) -> Progress {
+    eprintln!("Downloading {label}: 0%");
+    let last_bucket = Arc::new(Mutex::new(0_u64));
+    Arc::new(move |received, total| {
+        if total == 0 {
+            return;
+        }
+        let percent = received
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(100);
+        let bucket = if percent == 100 {
+            100
+        } else {
+            percent / 10 * 10
+        };
+        let Ok(mut last) = last_bucket.lock() else {
+            return;
+        };
+        if bucket > *last {
+            *last = bucket;
+            eprintln!("Downloading {label}: {bucket}%");
+        }
+    })
+}
 
 fn u16le(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
@@ -259,7 +287,11 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
                 let bytes = Downloader::new()?
-                    .download(release, Some(&dir), None)
+                    .download(
+                        release,
+                        Some(&dir),
+                        Some(download_progress("Raft Computer support file")),
+                    )
                     .await?;
                 write_durable(&path, &bytes, false)?;
             }
@@ -286,7 +318,11 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
     ensure_dir(&scratch)?;
     let sidecar = acquire_sidecar(cfg, manifest).await?;
     let bytes = Downloader::new()?
-        .download(&manifest.release, Some(&scratch), None)
+        .download(
+            &manifest.release,
+            Some(&scratch),
+            Some(download_progress("Raft Computer")),
+        )
         .await?;
     check_platform(&bytes)?;
     let directory = tempfile::Builder::new()
@@ -321,7 +357,11 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
     ensure_dir(&cfg.scratch())?;
     let downloader = Downloader::new()?;
     let bytes = downloader
-        .download(&manifest.release, Some(&cfg.scratch()), None)
+        .download(
+            &manifest.release,
+            Some(&cfg.scratch()),
+            Some(download_progress("Raft Computer")),
+        )
         .await?;
     check_platform(&bytes)?;
     let directory = tempfile::Builder::new()
@@ -332,7 +372,11 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
     let sidecar = match &manifest.sidecar {
         Some(release) => {
             let bytes = downloader
-                .download(release, Some(&cfg.scratch()), None)
+                .download(
+                    release,
+                    Some(&cfg.scratch()),
+                    Some(download_progress("Raft Computer support file")),
+                )
                 .await?;
             write_durable(&directory.path().join(SIDECAR_NAME), &bytes, false)?;
             Some(bytes)

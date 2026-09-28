@@ -16,10 +16,12 @@ need mktemp
 need uname
 need awk
 if command -v curl >/dev/null 2>&1; then
-  dl() { curl -fsSL --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
+  dl_quiet() { curl -fsSL --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
+  dl_progress() { curl -fL --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
   location() { curl -fsS --connect-timeout 30 --max-time 30 -o /dev/null -w '%{redirect_url}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-  dl() { wget -q --timeout=30 --tries=1 -O "$2" "$1"; }
+  dl_quiet() { wget -q --timeout=30 --tries=1 -O "$2" "$1"; }
+  dl_progress() { wget --timeout=30 --tries=1 -O "$2" "$1"; }
   location() { wget -q --timeout=30 --tries=1 --max-redirect=0 -S -O /dev/null "$1" 2>&1 | awk 'tolower($1)=="location:" {print $2}' | tail -1 | tr -d '\r'; }
 else err "curl or wget is required"; fi
 if command -v sha256sum >/dev/null 2>&1; then sha() { sha256sum "$1" | awk '{print $1}'; }
@@ -64,8 +66,8 @@ fi
 # The checksum list and the binary are independent fetches of one frozen
 # release: download them concurrently and verify once both are complete.
 printf 'Downloading the installation files...\n' >&2
-dl "$binary_url" "$tmp/installer" & download_pid=$!
-dl "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums"
+dl_progress "$binary_url" "$tmp/installer" & download_pid=$!
+dl_quiet "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
 [ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
 case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac

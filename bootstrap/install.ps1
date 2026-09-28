@@ -26,11 +26,17 @@ function ProxyFor([Uri]$uri) {
   if (-not $value) { $value = $env:ALL_PROXY }
   return $value
 }
-function Download($url, $out) {
+function Download($url, $out, [bool]$showProgress = $false) {
   $options = @{ UseBasicParsing = $true; Uri = $url; OutFile = $out; TimeoutSec = 180 }
   $proxy = ProxyFor ([Uri]$url)
   if ($proxy) { $options.Proxy = $proxy }
-  Invoke-WebRequest @options
+  $beforeDownloadProgress = $ProgressPreference
+  try {
+    $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
+    Invoke-WebRequest @options
+  } finally {
+    $ProgressPreference = $beforeDownloadProgress
+  }
 }
 try {
   # Read the machine architecture from the environment, never from
@@ -71,7 +77,7 @@ try {
     $binaryUrl = $releaseUrl
   }
   $sums = Join-Path $tmp 'SHA256SUMS'
-  Download $sumsUrl $sums
+  Download $sumsUrl $sums $false
   $matchesForTarget = @()
   foreach ($line in Get-Content -LiteralPath $sums) {
     if ($line -match '^([0-9a-fA-F]{64})\s+(.+)$' -and $Matches[2] -eq $native) { $matchesForTarget += $Matches[1].ToLowerInvariant() }
@@ -79,7 +85,7 @@ try {
   if ($matchesForTarget.Count -ne 1) { Fail 'checksums must name exactly one matching installation file' }
   [Console]::Error.WriteLine('Downloading the installation files...')
   $cli = Join-Path $tmp 'installer.exe'
-  Download $binaryUrl $cli
+  Download $binaryUrl $cli $true
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash.ToLowerInvariant() -ne $matchesForTarget[0]) { Fail 'installation download does not match its published checksum' }
   $argv = @($args)
   $command = 'install'

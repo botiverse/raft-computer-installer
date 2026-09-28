@@ -14,7 +14,7 @@ pub enum Presence {
 }
 
 /// Retain the terminal opened at entry: presence is decided once, even when
-/// stdin is a bootstrap pipeline. Questions and setup use this same terminal.
+/// stdin is a bootstrap pipeline. Consent questions use this same terminal.
 pub struct Interaction {
     pub presence: Presence,
     input: Option<File>,
@@ -109,16 +109,5 @@ impl Interaction {
         }
         let answer = String::from_utf8_lossy(&answer);
         Ok(!too_long && ["y", "yes"].contains(&answer.trim().to_ascii_lowercase().as_str()))
-    }
-
-    pub fn setup_stdio(&self) -> Result<Option<(File, File, File)>> {
-        match (&self.input, &self.output) {
-            (Some(input), Some(output)) => Ok(Some((
-                input.try_clone()?,
-                output.try_clone()?,
-                output.try_clone()?,
-            ))),
-            _ => Ok(None),
-        }
     }
 }

@@ -699,9 +699,13 @@ class InstallerContract(unittest.TestCase):
         preparing = next(i for i, line in enumerate(lines) if "Preparing the Raft Computer installation" in line)
         downloading = next(i for i, line in enumerate(lines) if "Downloading the installation files" in line)
         checking = next(i for i, line in enumerate(lines) if "Checking the Raft Computer release" in line)
+        bootstrap_transfer = "\n".join(lines[downloading:checking])
         self.assertEqual(preparing, 0, lines[:3])
         self.assertLess(preparing, downloading)
         self.assertLess(downloading, checking)
+        self.assertRegex(bootstrap_transfer, r"100(?:\.0)?%", bootstrap_transfer)
+        self.assertIn("Downloading Raft Computer: 100%", result.stderr)
+        self.assertIn("Downloading Raft Computer support file: 100%", result.stderr)
         self.assertNotIn("Preparing", result.stdout)
         self.assertNotIn("installer", (result.stdout + result.stderr).lower())
 
@@ -1011,7 +1015,7 @@ class InstallerContract(unittest.TestCase):
                         parent.kill()
                         parent.communicate(timeout=10)
 
-    def test_attended_first_setup_uses_a_real_terminal(self):
+    def test_attended_install_does_not_login_start_or_print_a_setup_hint(self):
         machine = self.machine()
         environment = machine.env({"CI": "", "RAFT_COMPUTER_NON_INTERACTIVE": "0"})
         command = machine.command(["install", "--version", "1.0.0", "--yes"])
@@ -1043,8 +1047,12 @@ class InstallerContract(unittest.TestCase):
                 self.assertEqual(os.waitstatus_to_exitcode(status), 0, captured.decode(errors="replace"))
             finally:
                 os.close(terminal)
-        self.assertEqual(machine.live()["version"], "1.0.0")
-        self.assertTrue((machine.home / "fixture-login").exists())
+        output = (child.stdout + child.stderr) if WINDOWS else captured.decode(errors="replace")
+        self.assertIsNone(machine.live())
+        self.assertFalse((machine.home / "fixture-login").exists())
+        self.assertNotIn("Next:", output)
+        self.assertNotIn("raft-computer login", output)
+        self.assertNotIn("raft-computer setup", output)
 
     def test_default_path_update_is_idempotent(self):
         machine = self.machine()
