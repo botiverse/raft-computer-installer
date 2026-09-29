@@ -39,7 +39,7 @@ def versions(current, older):
             candidate = f"{major}.{minor}.{number}"
             try:
                 platform, arch = TARGET.split("-")
-                response = read_json(HANDS + "/public/v2/apps/raft-computer-cli/updates/check?" + urllib.parse.urlencode(dict(product_type="cli-binary", current_version="0.0.0", version=candidate, platform=platform, arch=arch)))
+                response = read_json(HANDS + "/public/v2/apps/raft-computer-cli/updates/check?" + urllib.parse.urlencode(dict(product_type="cli-binary", current_version="0.0.0", current_version_code=0, version=candidate, platform=platform, arch=arch)))
                 if not response.get("update_available") or not response.get("artifact", {}).get("photon_wasm"):
                     continue
                 older = candidate

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from matrix import cases_for, make_plan, version_key, checked_download
@@ -79,6 +80,10 @@ class MatrixContract(unittest.TestCase):
             with patch('matrix.BASELINES', file), patch('matrix.fetch_json', side_effect=fetch) as get:
                 plan = make_plan('full')
                 self.assertEqual(sum('/latest?' in c.args[0] for c in get.call_args_list), 1)
+                update_queries = [urllib.parse.parse_qs(urllib.parse.urlsplit(c.args[0]).query)
+                                  for c in get.call_args_list if '/updates/check?' in c.args[0]]
+                self.assertTrue(update_queries)
+                self.assertTrue(all(query.get('current_version_code') == ['0'] for query in update_queries))
                 self.assertNotIn('must-not-persist', json.dumps(plan))
                 latest['assets'][-1]['sha256'] = 'b' * 64
                 with self.assertRaisesRegex(ValueError, 'authority and artifact disagree'):
