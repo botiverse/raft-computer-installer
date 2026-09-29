@@ -195,12 +195,13 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("multiline-short-value", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
         self.assertEqual(receipt["outcome"], "rolled-back")
-        self.assertEqual(
-            receipt["detail"]["reason"],
-            "experiment probe failed: HOST_COMMAND_FAILED: probe",
-        )
         reference = receipt["detail"]["startFailureDiagnostic"]
         self.assertRegex(reference, r"^diagnostics/[0-9a-f-]+\.json$")
+        self.assertEqual(
+            receipt["detail"]["reason"],
+            "experiment probe failed: HOST_COMMAND_FAILED: probe (exit 1): "
+            f"candidate was not started successfully; private diagnostic {reference}",
+        )
 
         diagnostic_path = machine.state / reference
         self.assertEqual(len(list(diagnostics.glob("*.json"))), 16)
