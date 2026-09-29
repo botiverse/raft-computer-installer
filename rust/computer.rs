@@ -15,11 +15,133 @@ use tokio::{
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
 
 pub struct CommandResult {
     pub success: bool,
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: Option<i32>,
     pub pid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleFailure {
+    pub kind: String,
+    pub argv: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub stderr_tail: String,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LifecycleResult {
+    pub success: bool,
+    pub failure: Option<LifecycleFailure>,
+}
+
+fn credential_marker(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "authorization",
+        "bearer",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "api key",
+        "api-key",
+        "apikey",
+        "access_key",
+        "access key",
+        "access-key",
+        "client_secret",
+        "client secret",
+        "client-secret",
+        "cookie",
+        "database_url",
+        "database-url",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn contains_url_userinfo(value: &str) -> bool {
+    let mut remainder = value;
+    while let Some(index) = remainder.find("://") {
+        let after_scheme = &remainder[index + 3..];
+        let authority = after_scheme
+            .split(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+            .next()
+            .unwrap_or_default();
+        // A URL authority may carry either `user:password@host` or a token as
+        // the username (`token@host`). Git commonly echoes both forms when a
+        // remote operation fails, so neither is safe diagnostic text.
+        if authority.rfind('@').is_some_and(|at| at > 0) {
+            return true;
+        }
+        remainder = after_scheme;
+    }
+    false
+}
+
+fn redact_opaque_word(word: &str) -> String {
+    let opaque = word.len() >= 24
+        && !word.contains('/')
+        && !word.contains('\\')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-+".contains(c));
+    if opaque {
+        "<redacted>".into()
+    } else {
+        word.into()
+    }
+}
+
+fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
+    let original_truncated = bytes.len() > DIAGNOSTIC_STDERR_LIMIT;
+    let mut redacted = Vec::new();
+    let mut redact_next_nonempty_line = false;
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let normalized = line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>();
+        let trimmed = normalized.trim();
+        let redact_from_previous_line = redact_next_nonempty_line && !trimmed.is_empty();
+        if redact_from_previous_line {
+            redact_next_nonempty_line = false;
+        }
+        let credential_line = credential_marker(&normalized);
+        if credential_line && matches!(trimmed.chars().last(), Some(':' | '=')) {
+            // Pretty-printed configuration and JSON may put the value on the
+            // next line. Carry the redaction across blank lines to the next
+            // non-empty line, but no farther.
+            redact_next_nonempty_line = true;
+        }
+        // A diagnostic does not need partial fidelity on a credential-bearing
+        // line. Redacting the entire line avoids delimiter, quoting, multi-word
+        // header, cookie-list, and URL-userinfo variants leaking short values.
+        if redact_from_previous_line || credential_line || contains_url_userinfo(&normalized) {
+            redacted.push("<redacted>".into());
+            continue;
+        }
+        for word in normalized.split_whitespace() {
+            redacted.push(redact_opaque_word(word));
+        }
+    }
+    let redacted = redacted.join(" ");
+    if redacted.len() <= DIAGNOSTIC_STDERR_LIMIT {
+        return (redacted, original_truncated);
+    }
+    let mut start = redacted.len() - DIAGNOSTIC_STDERR_LIMIT;
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    (redacted[start..].into(), true)
 }
 
 async fn bounded_read(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
@@ -74,9 +196,11 @@ pub async fn run(
     })
     .await;
     match result {
-        Ok(Ok((status, stdout, _stderr))) => Ok(CommandResult {
+        Ok(Ok((status, stdout, stderr))) => Ok(CommandResult {
             success: status.success(),
             stdout,
+            stderr,
+            exit_code: status.code(),
             pid,
         }),
         failure => {
@@ -218,6 +342,8 @@ struct LifecycleResponse {
     protocol_version: u32,
     completed: bool,
     success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<LifecycleFailure>,
 }
 
 fn command_path(cfg: &Config, id: &str) -> Result<std::path::PathBuf> {
@@ -234,7 +360,7 @@ fn command_path(cfg: &Config, id: &str) -> Result<std::path::PathBuf> {
 /// it may invoke Computer, and it survives the calling host controller. That
 /// closes the late-effect window when K kills a timed-out controller while a
 /// product `start` or `stop` is still in flight.
-pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
+pub async fn lifecycle(cfg: &Config, action: &str) -> Result<LifecycleResult> {
     if !["start", "stop"].contains(&action) {
         return Err(invalid("invalid product lifecycle action"));
     }
@@ -301,6 +427,20 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
             "product lifecycle command has not settled".into(),
         ));
     }
+    let valid_failure = response.failure.as_ref().is_some_and(|failure| {
+        !response.success
+            && ["nonzero-exit", "command-error"].contains(&failure.kind.as_str())
+            && failure.argv == [action]
+            && failure.stderr_tail.len() <= DIAGNOSTIC_STDERR_LIMIT
+            && !failure.stderr_tail.chars().any(char::is_control)
+    });
+    if response.success != response.failure.is_none()
+        || (response.failure.is_some() && !valid_failure)
+    {
+        return Err(Error::Uncertain(
+            "product lifecycle diagnostic is invalid".into(),
+        ));
+    }
     let record: CommandRecord = serde_json::from_slice(&fs::read(&path)?)?;
     if !record.completed {
         return Err(Error::Uncertain(
@@ -312,7 +452,10 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
         path.parent()
             .ok_or_else(|| invalid("command directory missing"))?,
     )?;
-    Ok(response.success)
+    Ok(LifecycleResult {
+        success: response.success,
+        failure: response.failure,
+    })
 }
 
 pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
@@ -350,7 +493,33 @@ pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
     )
     .await;
     let completed = !result.as_ref().is_err_and(|e| e.is_uncertain());
-    let success = result.is_ok_and(|result| result.success);
+    let (success, failure) = match result {
+        Ok(result) if result.success => (true, None),
+        Ok(result) => {
+            let (stderr_tail, stderr_truncated) = diagnostic_stderr(&result.stderr);
+            (
+                false,
+                Some(LifecycleFailure {
+                    kind: "nonzero-exit".into(),
+                    argv: vec![request.action.clone()],
+                    exit_code: result.exit_code,
+                    stderr_tail,
+                    stderr_truncated,
+                }),
+            )
+        }
+        Err(error) if error.is_uncertain() => (false, None),
+        Err(_) => (
+            false,
+            Some(LifecycleFailure {
+                kind: "command-error".into(),
+                argv: vec![request.action.clone()],
+                exit_code: None,
+                stderr_tail: String::new(),
+                stderr_truncated: false,
+            }),
+        ),
+    };
     if completed {
         record.completed = true;
         write_json(&path, &record)?;
@@ -359,6 +528,7 @@ pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
         protocol_version: 1,
         completed,
         success,
+        failure,
     })?;
     bytes.push(b'\n');
     let mut output = tokio::io::stdout();

@@ -456,6 +456,14 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     if let Some(reason) = operation.reason {
         plan.detail.insert("reason".into(), reason);
     }
+    if outcome == Outcome::RolledBack
+        && let Ok(Some(reference)) = host::latest_start_failure_diagnostic(cfg, &plan.request.id)
+    {
+        // The receipt exposes only the opaque relative reference. The bounded
+        // stderr tail and exit code remain in the local mode-0600 file.
+        plan.detail
+            .insert("startFailureDiagnostic".into(), reference);
+    }
     if let Ok(state) = host::read(cfg) {
         if outcome == Outcome::UpToDate
             && state.running
