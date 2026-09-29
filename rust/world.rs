@@ -13,11 +13,23 @@ use std::{fs, io::Read, path::Path};
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum World {
     Fresh,
-    Adopted { version: String },
-    Managed { version: String },
-    Upgrading { id: String },
-    Broken { reason: String },
-    Held { reason: String },
+    Adopted {
+        version: String,
+    },
+    Managed {
+        version: String,
+    },
+    Upgrading {
+        id: String,
+    },
+    Broken {
+        reason: String,
+    },
+    Held {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_step: Option<String>,
+    },
 }
 
 impl World {
@@ -88,25 +100,22 @@ pub async fn read(cfg: &Config) -> Result<World> {
     if let Some(manager) = foreign_manager(&cfg.binary)? {
         return Ok(World::Held {
             reason: format!(
-                "{} belongs to {manager}; remove it with that manager before retrying",
+                "Raft Computer at {} is managed by {manager}",
                 cfg.binary.display()
             ),
+            next_step: Some(format!("Update it with {manager}.")),
         });
     }
     if fs::symlink_metadata(&cfg.binary).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
-            reason: format!(
-                "{} is a link owned by another manager; remove it with that manager before retrying",
-                cfg.binary.display()
-            ),
+            reason: "Raft Computer's installation is managed by another tool".into(),
+            next_step: None,
         });
     }
     if fs::symlink_metadata(&cfg.sidecar).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(World::Held {
-            reason: format!(
-                "{} is a link owned by another manager; remove it with that manager before retrying",
-                cfg.sidecar.display()
-            ),
+            reason: "Raft Computer's installation is managed by another tool".into(),
+            next_step: None,
         });
     }
     if exists(&cfg.installer_dir.join("metadata-damage.json"))? {

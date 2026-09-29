@@ -12,6 +12,15 @@ import unittest
 import urllib.parse
 
 from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
+from test_no_installer_wording import runtime_offenders
+
+FAILURE_CODES = {
+    "caller_not_computer", "candidate_start_failed", "downgrade_not_allowed",
+    "install_failed", "installation_declined", "installation_held",
+    "interrupted_before_start", "legacy_failure", "operation_busy",
+    "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
+    "request_conflict", "result_unreadable",
+}
 
 
 class InstallerContract(unittest.TestCase):
@@ -51,6 +60,25 @@ class InstallerContract(unittest.TestCase):
         machine = self.server.machine()
         self.addCleanup(machine.close)
         return machine
+
+    def assert_failure_contract(self, reply):
+        self.assertNotEqual(reply["exitCode"], 0)
+        self.assertIn(reply["code"], FAILURE_CODES)
+        self.assertTrue(reply["reason"].strip())
+        self.assertEqual(runtime_offenders(reply["reason"]), [])
+        self.assertNotIn(reply["code"], reply["line"])
+        if reply.get("diagnostic") is not None:
+            self.assertTrue(reply["diagnostic"].strip())
+            self.assertNotIn(reply["diagnostic"], reply["line"])
+            self.assertNotIn(reply["diagnostic"], reply["reason"])
+        if reply.get("receipt") is not None:
+            receipt = reply["receipt"]
+            self.assertEqual(receipt["code"], reply["code"])
+            self.assertEqual(receipt["reason"], reply["reason"])
+            self.assertEqual(runtime_offenders(receipt["reason"]), [])
+            self.assertNotIn("reason", receipt["detail"])
+            self.assertNotIn("error", receipt["detail"])
+            self.assertNotIn("upgradeError", receipt["detail"])
 
     def test_published_matrix_main_execution_uses_single_updates_resolution(self):
         from unittest.mock import patch
@@ -138,11 +166,18 @@ class InstallerContract(unittest.TestCase):
                 receipt = json.loads(stdout)["receipt"]
                 self.assertEqual(receipt["outcome"], expected_outcome)
                 if expected_outcome == "rolled-back":
-                    reason = receipt["detail"]["reason"]
+                    reply = json.loads(stdout)
+                    self.assert_failure_contract(reply)
                     self.assertEqual(
                         receipt["line"],
-                        f"{target} failed its checks ({reason}); {expected_version} was restored. It is running.",
+                        f"Raft Computer {target} didn't start correctly, so {expected_version} is still running. "
+                        "Nothing else was changed. Run the same install command again to retry.",
                     )
+                    self.assertEqual(
+                        receipt["reason"],
+                        f"Raft Computer {target} didn't start correctly, so {expected_version} is still running.",
+                    )
+                    self.assertEqual(receipt["code"], "candidate_start_failed")
                 record = json.loads((machine.state / "product-state.json").read_text())
                 self.assertEqual([p["pid"] for p in record["initialProcesses"]], [before["pid"]])
                 self.assertNotIn(parent.pid, record["forcedStops"])
@@ -195,10 +230,11 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("multiline-short-value", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
         self.assertEqual(receipt["outcome"], "rolled-back")
+        self.assert_failure_contract(json.loads(result.stdout))
         reference = receipt["detail"]["startFailureDiagnostic"]
         self.assertRegex(reference, r"^diagnostics/[0-9a-f-]+\.json$")
         self.assertEqual(
-            receipt["detail"]["reason"],
+            receipt["detail"]["diagnostic"],
             "experiment probe failed: HOST_COMMAND_FAILED: probe (exit 1): "
             f"candidate was not started successfully; private diagnostic {reference}",
         )
@@ -301,7 +337,8 @@ class InstallerContract(unittest.TestCase):
             env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
             text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("has no waiting declaration", result.stderr)
+        self.assertIn("This command is started by Raft Computer", result.stderr)
+        self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
         self.assertEqual(machine.binary.read_bytes(), before)
         self.assertEqual(self.server.requests, [])
         self.assertFalse((machine.state / "active.json").exists())
@@ -311,7 +348,12 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         result = machine.run(["upgrade"], extra={"RAFT_COMPUTER_INSTALLER_CALLER": "waiting-cli-v1"})
         self.assertEqual(result.returncode, 1)
-        self.assertIn("not the installed immediate parent", result.stderr)
+        self.assertIn(
+            "The installation could not finish. Run the same install command again.",
+            result.stderr,
+        )
+        self.assertNotIn("installed immediate parent", result.stderr)
+        self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
         self.assertEqual(machine.self_version(), "1.0.0")
 
     @unittest.skipIf(WINDOWS, "terminal rejection case uses Unix PTY; Windows also tests noninteractive rejection")
@@ -342,12 +384,55 @@ class InstallerContract(unittest.TestCase):
                 self.fail("undeclared CLI rejection timed out")
             _, status = os.waitpid(pid, 0)
             self.assertEqual(os.waitstatus_to_exitcode(status), 1, captured.decode(errors="replace"))
-            self.assertIn("has no waiting declaration", captured.decode(errors="replace"))
+            rendered = captured.decode(errors="replace")
+            reply = json.loads(rendered.strip())
+            self.assert_failure_contract(reply)
+            self.assertEqual(reply["code"], "caller_not_computer")
+            self.assertIsNone(reply["receipt"])
+            self.assertIn("This command is started by Raft Computer", reply["line"])
+            self.assertEqual(runtime_offenders(reply["line"] + reply["reason"]), [])
         finally:
             os.close(terminal)
         self.assertEqual(machine.self_version(), "1.0.0")
         self.assertIsNone(machine.live())
         self.assertFalse((machine.state / "active.json").exists())
+
+    def test_human_failure_output_hides_internal_failure_concepts(self):
+        rollback = self.machine()
+        rollback.json(["install", "--version", "1.0.0"])
+        rollback.login_start()
+        result = rollback.run(["upgrade", "--version", "1.2.0"])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "Raft Computer 1.2.0 didn't start correctly, so 1.0.0 is still running. Nothing else was changed. Run the same install command again to retry.",
+            result.stdout,
+        )
+        self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
+
+        unresolved = self.machine()
+        unresolved.json(["install", "--version", "1.0.0"])
+        unresolved.login_start()
+        (unresolved.k / "operation.json").write_text("broken")
+        result = unresolved.run(["repair", "--version", "1.2.0"])
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn(
+            "Raft Computer's current status couldn't be confirmed. Run the same command again to continue.",
+            result.stdout,
+        )
+        self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
+
+        rejected = self.machine()
+        rejected.json(["install", "--version", "1.0.0"])
+        result = subprocess.run(
+            [str(rejected.binary), "upgrade", "--version", "1.1.0"],
+            env=rejected.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("This command is started by Raft Computer", result.stderr)
+        self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
 
     def test_short_lived_protocol_replies_are_flushed(self):
         machine = self.machine()
@@ -442,6 +527,9 @@ class InstallerContract(unittest.TestCase):
         machine.json(["install", "--version", "1.0.0"])
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed")
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["code"], "install_failed")
+        self.assertIn("diagnostic", failed["receipt"]["detail"])
         line = failed["line"]
         self.assertIn("Run the same install command again", line)
         self.assertNotIn("installer", line.lower())
@@ -575,9 +663,38 @@ class InstallerContract(unittest.TestCase):
         for action in (["status"], ["install", "--version", "1.1.0"], ["repair", "--version", "1.1.0"]):
             result = machine.json(action, expected=2)
             self.assertEqual(machine.binary.read_bytes(), script)
-            self.assertIn(str(machine.binary), result["line"])
-            self.assertIn("remove", result["line"])
+            self.assertEqual(
+                result["line"],
+                f"Not done: Raft Computer at {machine.binary} is managed by a script package manager. "
+                "Update it with a script package manager.",
+            )
+            self.assertEqual(
+                result["reason"],
+                f"Raft Computer at {machine.binary} is managed by a script package manager",
+            )
+            self.assertEqual(runtime_offenders(result["line"]), [])
+            self.assertNotIn("remove", result["line"])
         self.assertEqual(self.server.requests, [])
+
+        if not WINDOWS:
+            linked = self.machine()
+            linked.preinstall("1.0.0")
+            linked.sidecar = linked.install_dir / "photon_rs_bg.wasm"
+            linked.sidecar.unlink()
+            target = linked.home / "foreign-support-file"
+            target.write_bytes(self.server.sidecar)
+            linked.sidecar.symlink_to(target)
+            result = linked.json(["status"], expected=2)
+            self.assertEqual(
+                result["line"],
+                "Not done: Raft Computer's installation is managed by another tool.",
+            )
+            self.assertEqual(
+                result["reason"],
+                "Raft Computer's installation is managed by another tool",
+            )
+            self.assertEqual(runtime_offenders(result["line"]), [])
+            self.assertNotIn(str(linked.sidecar), result["line"])
 
     def test_broken_states_are_repaired_then_recovery_payloads_are_removed(self):
         def damage_artifact(machine):
@@ -804,7 +921,9 @@ class InstallerContract(unittest.TestCase):
         for name, extra in cases:
             with self.subTest(name=name):
                 machine = self.machine()
-                machine.json(["install"], expected=1, extra=extra)
+                failed = machine.json(["install"], expected=1, extra=extra)
+                self.assert_failure_contract(failed)
+                self.assertEqual(failed["code"], "release_resolution_failed")
                 self.assertFalse(machine.binary.exists())
         self.server.authority_lies.add("1.1.0")
         machine = self.machine()
@@ -829,8 +948,43 @@ class InstallerContract(unittest.TestCase):
         result = machine.run(["status"], extra={key: "relative-home"})
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         out = result.stdout + result.stderr
-        self.assertIn("The installation could not finish.", out)
+        self.assertIn(
+            "The installation could not finish. Run the same install command again.",
+            result.stderr,
+        )
+        self.assertNotIn("user home must be absolute", out)
         self.assertNotIn("installer", out.lower(), out)
+        self.assertEqual(runtime_offenders(out), [])
+
+    def test_top_level_failure_preserves_a_private_bounded_diagnostic(self):
+        machine = self.machine()
+        for _ in range(18):
+            result = machine.run(["--not-a-real-option"])
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(runtime_offenders(result.stdout + result.stderr), [])
+            self.assertNotIn("unknown option", result.stdout + result.stderr)
+        diagnostics = sorted((machine.state / "diagnostics").glob("cli-*.json"))
+        self.assertEqual(len(diagnostics), 16)
+        records = [json.loads(path.read_text()) for path in diagnostics]
+        self.assertTrue(all(record["formatVersion"] == 1 for record in records))
+        self.assertTrue(all(record["kind"] == "top-level-error" for record in records))
+        self.assertTrue(all(record["diagnostic"] == "unknown option" for record in records))
+        if not WINDOWS:
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in diagnostics))
+
+    def test_worker_execute_failure_keeps_diagnostic_only_in_structured_output(self):
+        machine = self.machine()
+        gate = machine.state / "gate"
+        gate.mkdir(parents=True)
+        (gate / "upgrade.lock.claims").write_text("not a directory")
+        result = machine.run(["install", "--version", "1.0.0", "--json"])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        reply = json.loads(result.stdout)
+        self.assert_failure_contract(reply)
+        self.assertEqual(reply["code"], "install_failed")
+        self.assertEqual(reply["diagnostic"], "directory is not a regular directory")
+        self.assertNotIn(reply["diagnostic"], result.stderr)
+        self.assertEqual(runtime_offenders(result.stderr), [])
 
     def test_entry_script_speaks_before_its_first_round_trip(self):
         # A silent terminal reads as a hang: the entry script must say what it

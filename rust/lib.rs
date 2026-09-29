@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod cli;
 pub mod computer;
 pub mod config;
+mod diagnostic;
 pub mod host;
 pub mod operation;
 pub mod presence;

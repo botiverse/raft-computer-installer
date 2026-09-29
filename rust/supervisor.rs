@@ -3,6 +3,7 @@
 use crate::{
     Error, Result,
     config::Config,
+    report::FailureCode,
     request::{Reply, Request},
 };
 use k_carrier::{
@@ -41,10 +42,14 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
             "formatVersion":1,"sha256":digest,"size":bytes.len(),"request":request,"owner":owner
         }),
     )?;
-    let mut last = Reply::plain(
+    let mut last = Reply::failure(
         &request.id,
         3,
-        String::from("Installation could not be settled. Run the same install command again."),
+        String::from(
+            "The installation could not be completed or recovered. Run the same install command again.",
+        ),
+        FailureCode::RecoveryUnresolved,
+        "The installation could not be completed or recovered.",
     );
     for attempt in 0..3 {
         // Verify every execution, including retries of the retained copy.
@@ -94,12 +99,14 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                 if reply.exit_code == 2 && next.recovery_only {
                     // A busy recovery has not settled the original operation.
                     // Preserve its executable/request and its unresolved status.
-                    last = Reply::plain(
+                    last = Reply::failure(
                         &request.id,
                         3,
                         String::from(
                             "Recovery is blocked by another installation still running. Run the same install command again after it finishes.",
                         ),
+                        FailureCode::RecoveryUnresolved,
+                        "Recovery is blocked by another installation still running.",
                     );
                 } else if reply.exit_code != 3 {
                     if reply.exit_code <= 1 && reply.receipt.is_some() {
@@ -119,10 +126,12 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     Ok(Ok(_))
                 ) {
                     let _retained = directory.keep();
-                    return Ok(Reply::plain(
+                    return Ok(Reply::failure(
                         &request.id,
                         3,
                         "The previous installation step has not exited. Recovery must wait for it.",
+                        FailureCode::RecoveryUnresolved,
+                        "The previous installation step has not exited.",
                     ));
                 }
             }

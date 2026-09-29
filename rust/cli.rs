@@ -1,8 +1,9 @@
 use crate::{
     Error, Result, computer,
     config::Config,
-    host, operation,
+    diagnostic, host, operation,
     presence::Interaction,
+    report::FailureCode,
     request::{Reply, Request},
     source, supervisor, version,
 };
@@ -12,6 +13,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
 };
+
+pub fn failure_line() -> &'static str {
+    "The installation could not finish. Run the same install command again."
+}
+
+pub fn preserve_top_level_failure(error: &Error) {
+    diagnostic::preserve_top_level_failure(error);
+}
 
 const HELP: &str = "Raft Computer installation commands
 
@@ -115,9 +124,11 @@ async fn worker(cfg: &Config) -> Result<u8> {
     request.validate()?;
     let reply = match operation::execute(cfg, &request).await {
         Ok(reply) => reply,
-        Err(Error::Locked(_)) => Reply::plain(
+        Err(Error::Locked(_)) => Reply::failure(
             &request.id,
             2,
+            "Another installation is running on this machine.",
+            FailureCode::OperationBusy,
             "Another installation is running on this machine.",
         ),
         Err(error) => {
@@ -132,14 +143,19 @@ async fn worker(cfg: &Config) -> Result<u8> {
                             operation: k_carrier::state::Operation { outcome: None, .. }
                         }
                 );
-            eprintln!("Installation: {error}");
-            Reply::plain(
+            let diagnostic = diagnostic::safe_error(&error);
+            Reply::failure(
                 &request.id,
                 if unresolved { 3 } else { 1 },
-                String::from(
-                    "The installation could not finish. Run the same install command again to check and continue.",
-                ),
+                failure_line(),
+                if unresolved {
+                    FailureCode::RecoveryUnresolved
+                } else {
+                    FailureCode::InstallFailed
+                },
+                "The installation could not finish.",
             )
+            .with_diagnostic(diagnostic)
         }
     };
     // execute() has released the operation gate. Cleanup reacquires it and
@@ -198,9 +214,19 @@ pub async fn run() -> Result<u8> {
                 // OS parent identity limits the exemption to this invocation.
                 args.request.waiting_caller = Some(parent);
             } else if !remote {
-                return Err(invalid(
-                    "Computer caller has no waiting declaration; run the install command directly",
-                ));
+                let reply = Reply::failure(
+                    &args.request.id,
+                    1,
+                    "This command is started by Raft Computer, not run by hand. To install or upgrade, use the install command from the setup page.",
+                    FailureCode::CallerNotComputer,
+                    "This command is started by Raft Computer, not run by hand.",
+                );
+                if args.json {
+                    println!("{}", serde_json::to_string(&reply)?);
+                } else {
+                    eprintln!("{}", reply.line);
+                }
+                return Ok(reply.exit_code);
             }
         }
     }
@@ -211,4 +237,17 @@ pub async fn run() -> Result<u8> {
         println!("{}", reply.line);
     }
     Ok(reply.exit_code)
+}
+
+#[cfg(test)]
+mod failure_line_tests {
+    use super::*;
+
+    #[test]
+    fn failure_line_has_one_runnable_next_step() {
+        assert_eq!(
+            failure_line(),
+            "The installation could not finish. Run the same install command again."
+        );
+    }
 }

@@ -26,6 +26,12 @@ ALLOWED_EXACT = {
 }
 ENV_NAME = re.compile(r"\b[A-Z_]*INSTALLER_[A-Z_]+\b")  # env-var names such as RAFT_COMPUTER_INSTALLER_CHANNEL
 STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+RUNTIME_FORBIDDEN = re.compile(
+    r"(?i)diagnostics[/\\\\][0-9a-z._-]+\.json"
+    r"|(?<![a-z0-9_-])(?:installer|probe|host_command_failed|receipts?|diagnostics?|k-carrier|sidecar)(?![a-z0-9_-])"
+    r"|(?<![a-z0-9_-])exit(?:\s+code)?\s*[:=]?\s*-?\d+(?![a-z0-9_-])"
+    r"|(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![0-9a-f])"
+)
 
 
 def allowed(literal):
@@ -81,6 +87,11 @@ def script_offenders():
     return found
 
 
+def runtime_offenders(text):
+    """Return internal concepts that escaped into human stdout/stderr."""
+    return [match.group(0) for match in RUNTIME_FORBIDDEN.finditer(text)]
+
+
 class NoInstallerWording(unittest.TestCase):
     def test_rust_string_literals_never_name_the_installer(self):
         self.assertEqual(rust_offenders(), [])
@@ -114,3 +125,21 @@ class NoInstallerWording(unittest.TestCase):
         lines = dict(production_lines(text))
         self.assertIn(6, lines)
         self.assertNotIn(4, lines)
+
+    def test_runtime_checker_rejects_a_reinserted_private_reason(self):
+        line = (
+            "1.0.39 failed its checks (experiment probe failed: "
+            "HOST_COMMAND_FAILED: probe; private diagnostic "
+            "diagnostics/00000000-0000-4000-8000-000000000000.json); "
+            "1.0.38 was restored."
+        )
+        offenders = [value.lower() for value in runtime_offenders(line)]
+        self.assertIn("probe", offenders)
+        self.assertIn("host_command_failed", offenders)
+        self.assertIn("diagnostic", offenders)
+        self.assertTrue(any(value.startswith("diagnostics/") for value in offenders))
+
+    def test_runtime_checker_rejects_exit_codes_and_internal_uuids(self):
+        line = "exit code 23 for 00000000-0000-4000-8000-000000000000"
+        offenders = runtime_offenders(line)
+        self.assertEqual(len(offenders), 2, offenders)
