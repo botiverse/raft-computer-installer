@@ -154,9 +154,18 @@ def publish(args):
         uploaded = hands.upload(app, path)
         hands.api(f"/api/apps/{app}/builds/{build['id']}/assets", {**metadata,
             "r2_key": uploaded["r2_key"], "file_hash": uploaded["file_hash"], "size_bytes": uploaded["size_bytes"]})
-    release = hands.api(f"/api/apps/{app}/releases", {"build_id": build["id"], "channel_id": channel_id,
-        "product_type": "cli-binary", "release_type": "stable", "status": "active", "changelog": None,
-        "provenance_json": provenance, "scopes": [{"scope_type": "full", "scope_value": "all"}]})
+    scopes = [{"scope_type": "full", "scope_value": "all"}]
+    release = hands.api(f"/api/apps/{app}/releases/draft", {"build_id": build["id"], "channel_id": channel_id,
+        "product_type": "cli-binary", "release_type": "stable", "changelog": None,
+        "provenance_json": provenance, "scopes": scopes})
+    if release.get("status") != "draft" or not release.get("id") or not isinstance(release.get("revision"), int):
+        raise RuntimeError("Hands did not return the expected draft release identity")
+    published = hands.api(f"/api/apps/{app}/releases/{release['id']}/publish",
+        {"expected_revision": release["revision"], "expected_scopes": scopes})
+    if published.get("status") == "pending_approval":
+        raise RuntimeError("Hands release is pending human approval")
+    if published.get("status") != "active" or published.get("id") != release["id"]:
+        raise RuntimeError("Hands did not activate the expected release")
     readback(hands.origin, args.app, channel, release["id"], files)
     print(json.dumps({"buildId": build["id"], "releaseId": release["id"], "status": "published-and-read-back"}))
 
