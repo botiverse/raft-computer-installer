@@ -1,7 +1,7 @@
 use crate::{
     Result,
     presence::Presence,
-    report::{Outcome, Receipt},
+    report::{FailureCode, Outcome, Receipt},
     source, version,
     world::World,
 };
@@ -71,30 +71,77 @@ pub struct Reply {
     pub id: String,
     pub exit_code: u8,
     pub line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<FailureCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub receipt: Option<Receipt>,
     pub world: Option<World>,
 }
 
 impl Reply {
     pub fn plain(id: &str, exit_code: u8, line: impl Into<String>) -> Self {
+        debug_assert_eq!(exit_code, 0, "non-success replies require reason and code");
         Self {
             protocol_version: 1,
             id: id.into(),
             exit_code,
             line: line.into(),
+            reason: None,
+            code: None,
+            diagnostic: None,
+            receipt: None,
+            world: None,
+        }
+    }
+    pub fn failure(
+        id: &str,
+        exit_code: u8,
+        line: impl Into<String>,
+        code: FailureCode,
+        reason: impl Into<String>,
+    ) -> Self {
+        debug_assert_ne!(exit_code, 0, "success replies cannot carry failure fields");
+        Self {
+            protocol_version: 1,
+            id: id.into(),
+            exit_code,
+            line: line.into(),
+            reason: Some(reason.into()),
+            code: Some(code),
+            diagnostic: None,
             receipt: None,
             world: None,
         }
     }
     pub fn receipt(receipt: Receipt) -> Self {
+        let (reason, code) = if receipt.exit_code == 0 {
+            (None, None)
+        } else {
+            (
+                Some(receipt.reason.clone().unwrap_or_else(|| {
+                    "A previous installation did not complete successfully.".into()
+                })),
+                Some(receipt.code.unwrap_or(FailureCode::LegacyFailure)),
+            )
+        };
         Self {
             protocol_version: 1,
             id: receipt.id.clone(),
             exit_code: receipt.exit_code,
             line: receipt.line.clone(),
+            reason,
+            code,
+            diagnostic: None,
             receipt: Some(receipt),
             world: None,
         }
+    }
+    pub fn with_diagnostic(mut self, diagnostic: impl Into<String>) -> Self {
+        self.diagnostic = Some(diagnostic.into());
+        self
     }
     fn replay_line(receipt: &Receipt) -> String {
         let result = match receipt.outcome {
@@ -129,6 +176,26 @@ impl Reply {
             || self.line.trim().is_empty()
             || self.line.len() > 2048
             || self.line.chars().any(char::is_control)
+            || self.reason.as_ref().is_some_and(|reason| {
+                reason.trim().is_empty()
+                    || reason.len() > 2048
+                    || reason.chars().any(char::is_control)
+            })
+            || self.diagnostic.as_ref().is_some_and(|diagnostic| {
+                diagnostic.trim().is_empty()
+                    || diagnostic.len() > 2048
+                    || diagnostic.chars().any(char::is_control)
+            })
+            || self
+                .code
+                .is_some_and(|code| self.line.contains(code.as_str()))
+            || matches!(
+                (&self.reason, &self.code),
+                (Some(_), None) | (None, Some(_))
+            )
+            || (self.exit_code == 0 && (self.reason.is_some() || self.code.is_some()))
+            || (self.exit_code == 0 && self.diagnostic.is_some())
+            || (self.exit_code != 0 && (self.reason.is_none() || self.code.is_none()))
         {
             return Err(invalid("invalid response"));
         }
@@ -136,6 +203,8 @@ impl Reply {
             receipt.validate()?;
             if receipt.id != self.id
                 || receipt.exit_code != self.exit_code
+                || (receipt.reason.is_some() && receipt.reason != self.reason)
+                || (receipt.code.is_some() && receipt.code != self.code)
                 || (receipt.line != self.line && Self::replay_line(receipt) != self.line)
             {
                 return Err(invalid("response receipt mismatch"));

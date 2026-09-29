@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     host,
     presence::{Interaction, Presence},
-    report::{self, Outcome, Receipt},
+    report::{self, FailureCode, Outcome, Receipt},
     request::{Reply, Request},
     runner, shell_path,
     source::{FrozenSource, Manifest, Source},
@@ -246,6 +246,8 @@ fn receipt(
         approved_by: Some(request.approved_by.clone()),
         outcome,
         exit_code: outcome.exit_code(),
+        reason: None,
+        code: None,
         line,
         next_step: None,
         finished_at_ms: 0,
@@ -257,6 +259,7 @@ fn finish(
     cfg: &Config,
     plan: &mut Plan,
     outcome: Outcome,
+    failure: Option<(FailureCode, String)>,
     line: impl Into<String>,
 ) -> Result<Reply> {
     // Installation and account/workspace setup are separate product actions.
@@ -264,7 +267,7 @@ fn finish(
     // never carry a product-provided login/setup hint into a current receipt.
     plan.next_step = None;
     let mut line = line.into();
-    if outcome.exit_code() == 0 || outcome == Outcome::RolledBack {
+    if outcome.exit_code() == 0 {
         if plan.detail.get("readback").map(String::as_str) == Some("service") {
             line.push_str(" It is running.");
         }
@@ -280,6 +283,10 @@ fn finish(
         outcome,
         line,
     );
+    if let Some((code, reason)) = failure {
+        result.code = Some(code);
+        result.reason = Some(reason);
+    }
     result.detail = plan.detail.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
     let result = result.finish(cfg)?;
@@ -333,23 +340,60 @@ fn transition(cfg: &Config, plan: &mut Plan, phase: Phase) -> Result<()> {
     save(cfg, plan)
 }
 
-/// The recovery hint carries the cause and tells the user to repeat the
-/// command they already have. The native installer is an internal detail:
-/// its path never appears in user-facing text, and the entry scripts resume
-/// an unresolved operation themselves before this line is ever shown.
-fn recovery_hint_line(error: &Error) -> String {
-    format!(
-        "Installation could not finish ({error}). Run the same install command again to continue where it left off."
-    )
+/// The receipt's reason and the human line share product-language state; raw
+/// causes stay in detail.diagnostic and never become display copy.
+fn recovery_hint_copy(previous_version: Option<&str>, running: Option<bool>) -> (String, String) {
+    match (previous_version, running) {
+        (Some(previous), Some(true)) => {
+            let reason = format!("Raft Computer {previous} is running.");
+            (
+                format!("{reason} You can try the upgrade again later."),
+                reason,
+            )
+        }
+        (Some(_), Some(false)) => (
+            "Raft Computer is not running. Run `raft-computer start`.".into(),
+            "Raft Computer is not running.".into(),
+        ),
+        _ => (
+            "Raft Computer's current status couldn't be confirmed. Run the same command again to continue."
+                .into(),
+            "Raft Computer's current status couldn't be confirmed.".into(),
+        ),
+    }
 }
 
-fn rollback_line(target: &str, from_version: &str, reason: Option<&str>) -> String {
-    match reason {
-        Some(reason) => {
-            format!("{target} failed its checks ({reason}); {from_version} was restored.")
-        }
-        None => format!("{target} failed its checks; {from_version} was restored."),
+fn rollback_copy(
+    target: &str,
+    from_version: &str,
+    was_running: Option<bool>,
+    running: bool,
+) -> (String, String) {
+    if running {
+        let reason = format!(
+            "Raft Computer {target} didn't start correctly, so {from_version} is still running."
+        );
+        return (
+            format!(
+                "{reason} Nothing else was changed. Run the same install command again to retry."
+            ),
+            reason,
+        );
     }
+    if was_running == Some(false) {
+        return (
+            format!(
+                "Raft Computer {target} didn't start correctly, so {from_version} is still installed. It was not running before the upgrade and is still not running."
+            ),
+            format!(
+                "Raft Computer {target} didn't start correctly, so {from_version} is still installed and not running."
+            ),
+        );
+    }
+    let reason = format!(
+        "Raft Computer {target} didn't start correctly, so {from_version} is still installed but not running."
+    );
+    (format!("{reason} Run `raft-computer start`."), reason)
 }
 
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
@@ -359,6 +403,10 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 cfg,
                 plan,
                 Outcome::Failed,
+                Some((
+                    FailureCode::InterruptedBeforeStart,
+                    "Installation was interrupted before the upgrade started.".into(),
+                )),
                 "Installation was interrupted before the upgrade started. Run the same install command again.",
             );
         }
@@ -404,6 +452,11 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                     cfg,
                     plan,
                     Outcome::Failed,
+                    Some((
+                        FailureCode::InterruptedBeforeStart,
+                        "Installation was interrupted before the upgrade transaction started."
+                            .into(),
+                    )),
                     "Installation was interrupted before the upgrade transaction started. Run the same install command again.",
                 );
             }
@@ -423,13 +476,17 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             cfg,
             plan,
             Outcome::Held,
+            Some((
+                FailureCode::OperationBusy,
+                "Another upgrade is running on this machine.".into(),
+            )),
             "Another upgrade is running on this machine.",
         );
     }
     if let Some(error) = &response.error {
         // Preserve the initiating failure across recovery's later outcome.
         plan.detail
-            .entry("upgradeError".into())
+            .entry("diagnostic".into())
             .or_insert_with(|| error.clone());
         save(cfg, plan)?;
     }
@@ -454,7 +511,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         k_carrier::state::Outcome::Failed => Outcome::Failed,
     };
     if let Some(reason) = operation.reason {
-        plan.detail.insert("reason".into(), reason);
+        plan.detail.insert("diagnostic".into(), reason);
     }
     if outcome == Outcome::RolledBack
         && let Ok(Some(reference)) = host::latest_start_failure_diagnostic(cfg, &plan.request.id)
@@ -464,7 +521,11 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.detail
             .insert("startFailureDiagnostic".into(), reference);
     }
+    let mut running = None;
+    let mut was_running = None;
     if let Ok(state) = host::read(cfg) {
+        running = Some(state.running);
+        was_running = Some(!state.initial_processes.is_empty());
         if outcome == Outcome::UpToDate
             && state.running
             && host::live_evidence(cfg).await?.version != plan.manifest.version
@@ -499,30 +560,50 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         }
     }
     let target = &plan.manifest.version;
-    let line = match outcome {
+    let (line, failure) = match outcome {
         Outcome::Promoted
             if plan.detail.get("readback").map(String::as_str) == Some("candidate") =>
         {
-            format!(
-                "Upgraded {} to {target}. The service remains stopped. Run raft-computer start to start it.",
-                operation.from_version
+            (
+                format!(
+                    "Upgraded {} to {target}. The service remains stopped. Run raft-computer start to start it.",
+                    operation.from_version
+                ),
+                None,
             )
         }
-        Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
-        Outcome::RolledBack => rollback_line(
-            target,
-            &operation.from_version,
-            plan.detail.get("reason").map(String::as_str),
+        Outcome::Promoted => (
+            format!("Upgraded {} to {target}.", operation.from_version),
+            None,
         ),
-        Outcome::UpToDate => format!("{target} is already installed."),
-        Outcome::Held => {
-            "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into()
+        Outcome::RolledBack => {
+            let (line, reason) = rollback_copy(
+                target,
+                &operation.from_version,
+                was_running,
+                running == Some(true),
+            );
+            (line, Some((FailureCode::CandidateStartFailed, reason)))
         }
-        _ => format!(
-            "Could not upgrade to {target}. Run the same install command again to check and continue."
+        Outcome::UpToDate => (format!("{target} is already installed."), None),
+        Outcome::Held => (
+            "Upgrade was not allowed. Check the selected version and --allow-downgrade.".into(),
+            Some((
+                FailureCode::InstallationHeld,
+                "The requested upgrade was not allowed.".into(),
+            )),
+        ),
+        _ => (
+            format!(
+                "Could not upgrade to {target}. Run the same install command again to check and continue."
+            ),
+            Some((
+                FailureCode::InstallFailed,
+                format!("Raft Computer could not be upgraded to {target}."),
+            )),
         ),
     };
-    finish(cfg, plan, outcome, line)
+    finish(cfg, plan, outcome, failure, line)
 }
 
 async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
@@ -532,6 +613,10 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 cfg,
                 plan,
                 Outcome::Failed,
+                Some((
+                    FailureCode::InterruptedBeforeStart,
+                    "Installation was interrupted before changing installed files.".into(),
+                )),
                 "Installation was interrupted before changing installed files. Run the same install command again.",
             );
         }
@@ -705,7 +790,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             },
             plan.manifest.version
         );
-        return finish(cfg, plan, outcome, line);
+        return finish(cfg, plan, outcome, None, line);
     }
     Err(invalid("unexpected operation phase"))
 }
@@ -734,8 +819,22 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
     match result {
         Ok(reply) => Ok(reply),
         Err(error) => {
-            plan.detail.insert("error".into(), error.to_string());
+            plan.detail.insert("diagnostic".into(), error.to_string());
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
+            let (line, reason) = if untouched {
+                (
+                    "The installation could not finish. Nothing was changed. Run the same install command again."
+                        .into(),
+                    "The installation could not finish.".into(),
+                )
+            } else {
+                recovery_hint_copy(
+                    plan.from_version.as_deref(),
+                    plan.from_version
+                        .as_ref()
+                        .and_then(|_| host::read(cfg).ok().map(|state| state.running)),
+                )
+            };
             finish(
                 cfg,
                 plan,
@@ -744,11 +843,15 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                 } else {
                     Outcome::Unresolved
                 },
-                if untouched {
-                    "Could not prepare the installation. Installed files were not changed.".into()
-                } else {
-                    recovery_hint_line(&error)
-                },
+                Some((
+                    if untouched {
+                        FailureCode::InstallFailed
+                    } else {
+                        FailureCode::RecoveryUnresolved
+                    },
+                    reason,
+                )),
+                line,
             )
         }
     }
@@ -760,9 +863,12 @@ fn reject(
     target: Option<String>,
     from: Option<String>,
     unresolved: bool,
+    failure: (FailureCode, String),
     line: &str,
 ) -> Result<Reply> {
     let mut result = receipt(request, target, from, Outcome::Held, line.into());
+    result.code = Some(failure.0);
+    result.reason = Some(failure.1);
     result.preserve_unresolved(unresolved);
     Ok(Reply::receipt(result.finish(cfg)?))
 }
@@ -775,9 +881,11 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     let _gate = match UpgradeLock::acquire(&cfg.installer_dir.join("gate")) {
         Ok(gate) => gate,
         Err(Error::Locked(_)) => {
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 2,
+                "Another installation is running on this machine.",
+                FailureCode::OperationBusy,
                 "Another installation is running on this machine.",
             ));
         }
@@ -796,10 +904,12 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             // Current recovery inputs are checked below independently; an old
             // unreadable result alone does not make today's installation broken.
             if request.command != "status" {
-                return Ok(Reply::plain(
+                return Ok(Reply::failure(
                     &request.id,
                     3,
                     "This request's result is unreadable. Use status to inspect the current installation.",
+                    FailureCode::ResultUnreadable,
+                    "This request's result is unreadable.",
                 ));
             }
             None
@@ -813,9 +923,11 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 .is_some_and(|v| Some(v) != old.target_version.as_ref())
                 || (request.command != "recover" && request.command != old.operation))
         {
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 2,
+                "This request ID already belongs to a different operation.",
+                FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
         }
@@ -848,9 +960,11 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                     .as_ref()
                     .is_some_and(|v| v != &previous.manifest.version))
         {
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 2,
+                "This request ID already belongs to a different operation.",
+                FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
         }
@@ -871,10 +985,12 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             // must enter the repair decision, not repeat the same failed
             // recovery and then compete with its own retained claim again.
             write_json(&settlement, request)?;
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 3,
                 "An earlier installation could not be recovered yet. Run the same install command again.",
+                FailureCode::RecoveryUnresolved,
+                "An earlier installation could not be recovered yet.",
             ));
         }
     }
@@ -890,29 +1006,35 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                     && saved.channel == request.channel => {}
             _ => {
                 mark_damage(cfg)?;
-                return Ok(Reply::plain(
+                return Ok(Reply::failure(
                     &request.id,
                     3,
                     "Recovery records are unreadable. Run the same install command again.",
+                    FailureCode::ResultUnreadable,
+                    "Recovery records are unreadable.",
                 ));
             }
         }
         unresolved = true;
     } else if let Err(error) = settle_k(cfg).await {
         if let Error::Locked(_) = error {
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 2,
+                "Another upgrade is running on this machine.",
+                FailureCode::OperationBusy,
                 "Another upgrade is running on this machine.",
             ));
         }
         unresolved = true;
         write_json(&settlement, request)?;
         if error.is_uncertain() {
-            return Ok(Reply::plain(
+            return Ok(Reply::failure(
                 &request.id,
                 3,
                 "An earlier upgrade could not be recovered yet. Run the same install command again.",
+                FailureCode::RecoveryUnresolved,
+                "An earlier upgrade could not be recovered yet.",
             ));
         }
     }
@@ -929,24 +1051,52 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                     if answer.running { "running" } else { "stopped" }
                 ),
             ),
-            World::Held { reason } => (2, format!("Not done: {reason}.")),
+            World::Held { reason, next_step } => (
+                2,
+                format!(
+                    "Not done: {reason}.{}",
+                    next_step
+                        .as_ref()
+                        .map(|step| format!(" {step}"))
+                        .unwrap_or_default()
+                ),
+            ),
             _ => (
                 3,
                 "Installation requires repair. Run the same install command again.".into(),
             ),
         };
-        let mut reply = Reply::plain(&request.id, code, line);
+        let mut reply = if code == 0 {
+            Reply::plain(&request.id, code, line)
+        } else {
+            let (failure_code, reason) = match &observed {
+                World::Held { reason, .. } => (FailureCode::InstallationHeld, reason.clone()),
+                _ => (
+                    FailureCode::RecoveryUnresolved,
+                    "The installation requires repair.".into(),
+                ),
+            };
+            Reply::failure(&request.id, code, line, failure_code, reason)
+        };
         reply.world = Some(observed);
         return Ok(reply);
     }
-    if let World::Held { reason } = &observed {
+    if let World::Held { reason, next_step } = &observed {
+        let line = format!(
+            "Not done: {reason}.{}",
+            next_step
+                .as_ref()
+                .map(|step| format!(" {step}"))
+                .unwrap_or_default()
+        );
         return reject(
             cfg,
             request,
             request.version.clone(),
             None,
             unresolved,
-            &format!("Not done: {reason}."),
+            (FailureCode::InstallationHeld, reason.clone()),
+            &line,
         );
     }
     let broken = unresolved || matches!(observed, World::Broken { .. } | World::Upgrading { .. });
@@ -957,14 +1107,24 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             request.version.clone(),
             observed.version().map(str::to_owned),
             false,
+            (
+                FailureCode::RepairNotNeeded,
+                "This installation does not need repair.".into(),
+            ),
             "This installation does not need repair. Use install or upgrade.",
         );
     }
     if request.recovery_only && !exists(&settlement)? {
-        return Ok(Reply::plain(
+        return Ok(Reply::failure(
             &request.id,
             if unresolved { 3 } else { 1 },
-            "The request was interrupted before a recoverable installation started. Run the same install command again.",
+            "The installation was interrupted before it started. Run the same install command again.",
+            if unresolved {
+                FailureCode::RecoveryUnresolved
+            } else {
+                FailureCode::InterruptedBeforeStart
+            },
+            "The installation was interrupted before it started.",
         ));
     }
     let source = Source::new(cfg)?;
@@ -991,7 +1151,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 "Could not resolve the requested release. Run the same install command again."
                     .into(),
             );
-            result.detail.insert("error".into(), error.to_string());
+            result.code = Some(FailureCode::ReleaseResolutionFailed);
+            result.reason =
+                Some("The requested Raft Computer release could not be resolved.".into());
+            result.detail.insert("diagnostic".into(), error.to_string());
             result.preserve_unresolved(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));
         }
@@ -1008,6 +1171,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             Some(manifest.version),
             from,
             unresolved,
+            (
+                FailureCode::DowngradeNotAllowed,
+                "The selected version is older than the installed version.".into(),
+            ),
             "The selected version is older. Add --allow-downgrade to install it.",
         );
     }
@@ -1030,6 +1197,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 Some(manifest.version),
                 from,
                 unresolved,
+                (
+                    FailureCode::InstallationDeclined,
+                    "The installation was declined.".into(),
+                ),
                 "Installation declined.",
             );
         }
@@ -1082,34 +1253,79 @@ mod recovery_hint_tests {
     use super::*;
 
     #[test]
-    fn recovery_hint_names_the_cause_and_never_the_installer() {
-        let line = recovery_hint_line(&Error::Uncertain("digest mismatch".into()));
+    fn recovery_hint_reports_a_running_previous_version() {
+        let (line, reason) = recovery_hint_copy(Some("1.0.31"), Some(true));
         assert_eq!(
             line,
-            "Installation could not finish (digest mismatch). Run the same install command again to continue where it left off."
+            "Raft Computer 1.0.31 is running. You can try the upgrade again later."
         );
-        assert!(!line.contains("installer"), "{line}");
-        assert!(!line.contains('/'), "{line}");
+        assert_eq!(reason, "Raft Computer 1.0.31 is running.");
+    }
+
+    #[test]
+    fn recovery_hint_reports_a_stopped_previous_version() {
+        let (line, reason) = recovery_hint_copy(Some("1.0.31"), Some(false));
+        assert_eq!(
+            line,
+            "Raft Computer is not running. Run `raft-computer start`."
+        );
+        assert_eq!(reason, "Raft Computer is not running.");
+    }
+
+    #[test]
+    fn recovery_hint_falls_back_without_a_readable_previous_state() {
+        let (line, reason) = recovery_hint_copy(None, None);
+        assert_eq!(
+            line,
+            "Raft Computer's current status couldn't be confirmed. Run the same command again to continue."
+        );
+        assert_eq!(
+            reason,
+            "Raft Computer's current status couldn't be confirmed."
+        );
     }
 }
 
 #[cfg(test)]
-mod rollback_line_tests {
+mod rollback_copy_tests {
     use super::*;
 
     #[test]
-    fn rollback_line_with_reason_carries_it_inline() {
+    fn rollback_copy_reports_a_restored_running_service() {
+        let (line, reason) = rollback_copy("1.0.32", "1.0.31", Some(true), true);
         assert_eq!(
-            rollback_line("1.0.32", "1.0.31", Some("experiment probe failed: boom")),
-            "1.0.32 failed its checks (experiment probe failed: boom); 1.0.31 was restored.",
+            line,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still running. Nothing else was changed. Run the same install command again to retry.",
+        );
+        assert_eq!(
+            reason,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still running."
         );
     }
 
     #[test]
-    fn rollback_line_without_reason_is_the_legacy_verbatim_line() {
+    fn rollback_copy_reports_a_service_that_failed_to_return() {
+        let (line, reason) = rollback_copy("1.0.32", "1.0.31", Some(true), false);
         assert_eq!(
-            rollback_line("1.0.32", "1.0.31", None),
-            "1.0.32 failed its checks; 1.0.31 was restored.",
+            line,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed but not running. Run `raft-computer start`.",
+        );
+        assert_eq!(
+            reason,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed but not running."
+        );
+    }
+
+    #[test]
+    fn rollback_copy_preserves_an_already_stopped_service_without_a_next_step() {
+        let (line, reason) = rollback_copy("1.0.32", "1.0.31", Some(false), false);
+        assert_eq!(
+            line,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed. It was not running before the upgrade and is still not running."
+        );
+        assert_eq!(
+            reason,
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed and not running."
         );
     }
 }

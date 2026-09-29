@@ -101,7 +101,7 @@ fn redact_opaque_word(word: &str) -> String {
     }
 }
 
-fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
+pub(crate) fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
     let original_truncated = bytes.len() > DIAGNOSTIC_STDERR_LIMIT;
     let mut redacted = Vec::new();
     let mut redact_next_nonempty_line = false;
