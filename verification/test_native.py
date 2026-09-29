@@ -276,6 +276,11 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("Next:", repeated["line"])
         self.assertIsNone(repeated["receipt"]["nextStep"])
         upgraded = machine.json(["upgrade", "--version", "1.1.0"])
+        self.assertEqual(
+            upgraded["line"],
+            "Upgraded 1.0.0 to 1.1.0. The service remains stopped. "
+            "Run raft-computer start to start it.",
+        )
         self.assertNotIn("Next:", upgraded["line"])
         self.assertIsNone(upgraded["receipt"]["nextStep"])
         self.assertNotIn("It is running.", upgraded["line"])
@@ -291,6 +296,19 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("installer", line.lower())
         self.assertNotIn(str(machine.state), line)
         self.assertNotIn(str(machine.home), line)
+        self.assertEqual(machine.self_version(), "1.1.0")
+        self.assertIsNone(machine.live())
+
+    def test_cold_upgrade_human_output_explains_how_to_start(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        upgraded = machine.run(["upgrade", "--version", "1.1.0"])
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        self.assertEqual(
+            upgraded.stdout.strip(),
+            "Upgraded 1.0.0 to 1.1.0. The service remains stopped. "
+            "Run raft-computer start to start it.",
+        )
         self.assertEqual(machine.self_version(), "1.1.0")
         self.assertIsNone(machine.live())
 
@@ -317,6 +335,7 @@ class InstallerContract(unittest.TestCase):
         before = machine.login_start()
         first = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "warm"})
         self.assertIn("It is running.", first["line"])
+        self.assertNotIn("raft-computer start", first["line"])
         dead = json.loads(first["receipt"]["detail"]["deadProcessIdentities"])
         self.assertTrue(any(identity.startswith(f"pid:{before['pid']}:created:") for identity in dead))
         live = machine.live()

@@ -492,6 +492,14 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     }
     let target = &plan.manifest.version;
     let line = match outcome {
+        Outcome::Promoted
+            if plan.detail.get("readback").map(String::as_str) == Some("candidate") =>
+        {
+            format!(
+                "Upgraded {} to {target}. The service remains stopped. Run raft-computer start to start it.",
+                operation.from_version
+            )
+        }
         Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
         Outcome::RolledBack => rollback_line(
             target,
