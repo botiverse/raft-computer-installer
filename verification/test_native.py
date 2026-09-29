@@ -253,31 +253,44 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("startFailureDiagnostic", receipt["detail"])
         self.assertEqual(machine.live()["version"], "1.0.38")
 
+    def assert_remote_service_parent_is_still_stopped_and_replaced(self):
+        machine = self.server.machine()
+        try:
+            machine.json(["install", "--version", "1.0.0"])
+            machine.product(["login"])
+            start = subprocess.run([str(machine.binary), "start"],
+                env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+                text=True, capture_output=True, timeout=20)
+            self.assertEqual(start.returncode, 0, start.stderr)
+            before = machine.live()
+            self.assertIsNotNone(before)
+            exchange(machine.home, "upgrade")
+            receipt_path = machine.state / "receipts" / (sha(b"remote-caller-regression") + ".json")
+            wait_for(lambda: receipt_path.exists(), timeout=90)
+            # A durable receipt precedes worker cleanup and launcher exit. Reap the
+            # exact detached instance before teardown can delete its state home.
+            settled = subprocess.run([str(machine.binary), "__wait-remote-installer"],
+                env=machine.env(), text=True, capture_output=True, timeout=70)
+            self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["outcome"], "promoted", receipt)
+            record = json.loads((machine.state / "product-state.json").read_text())
+            self.assertIsNone(record["waitingCaller"])
+            self.assertIn(before["pid"], [p["pid"] for p in record["initialProcesses"]])
+            self.assertNotEqual(machine.live()["pid"], before["pid"])
+            self.assertEqual(machine.live()["version"], "1.1.0")
+        finally:
+            machine.close()
+            self.server.machines.remove(machine)
+
     def test_remote_service_parent_is_still_stopped_and_replaced(self):
-        machine = self.machine()
-        machine.json(["install", "--version", "1.0.0"])
-        machine.product(["login"])
-        start = subprocess.run([str(machine.binary), "start"],
-            env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
-            text=True, capture_output=True, timeout=20)
-        self.assertEqual(start.returncode, 0, start.stderr)
-        before = machine.live()
-        self.assertIsNotNone(before)
-        exchange(machine.home, "upgrade")
-        receipt_path = machine.state / "receipts" / (sha(b"remote-caller-regression") + ".json")
-        wait_for(lambda: receipt_path.exists(), timeout=90)
-        # A durable receipt precedes worker cleanup and launcher exit. Reap the
-        # exact detached instance before teardown can delete its state home.
-        settled = subprocess.run([str(machine.binary), "__wait-remote-installer"],
-            env=machine.env(), text=True, capture_output=True, timeout=70)
-        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
-        receipt = json.loads(receipt_path.read_text())
-        self.assertEqual(receipt["outcome"], "promoted", receipt)
-        record = json.loads((machine.state / "product-state.json").read_text())
-        self.assertIsNone(record["waitingCaller"])
-        self.assertIn(before["pid"], [p["pid"] for p in record["initialProcesses"]])
-        self.assertNotEqual(machine.live()["pid"], before["pid"])
-        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assert_remote_service_parent_is_still_stopped_and_replaced()
+
+    @unittest.skipUnless(TARGET == "darwin-x64", "macOS x64 caller-exit stress")
+    def test_remote_service_parent_exit_converges_ten_times_on_macos_x64(self):
+        for iteration in range(10):
+            with self.subTest(iteration=iteration):
+                self.assert_remote_service_parent_is_still_stopped_and_replaced()
 
     def test_old_noninteractive_cli_is_rejected_without_stopping_it(self):
         machine = self.machine()
