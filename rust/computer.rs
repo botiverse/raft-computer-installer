@@ -76,10 +76,10 @@ fn contains_url_userinfo(value: &str) -> bool {
             .split(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
             .next()
             .unwrap_or_default();
-        if authority
-            .rfind('@')
-            .is_some_and(|at| authority[..at].contains(':'))
-        {
+        // A URL authority may carry either `user:password@host` or a token as
+        // the username (`token@host`). Git commonly echoes both forms when a
+        // remote operation fails, so neither is safe diagnostic text.
+        if authority.rfind('@').is_some_and(|at| at > 0) {
             return true;
         }
         remainder = after_scheme;
@@ -104,15 +104,28 @@ fn redact_opaque_word(word: &str) -> String {
 fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
     let original_truncated = bytes.len() > DIAGNOSTIC_STDERR_LIMIT;
     let mut redacted = Vec::new();
+    let mut redact_next_nonempty_line = false;
     for line in String::from_utf8_lossy(bytes).lines() {
         let normalized = line
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect::<String>();
+        let trimmed = normalized.trim();
+        let redact_from_previous_line = redact_next_nonempty_line && !trimmed.is_empty();
+        if redact_from_previous_line {
+            redact_next_nonempty_line = false;
+        }
+        let credential_line = credential_marker(&normalized);
+        if credential_line && matches!(trimmed.chars().last(), Some(':' | '=')) {
+            // Pretty-printed configuration and JSON may put the value on the
+            // next line. Carry the redaction across blank lines to the next
+            // non-empty line, but no farther.
+            redact_next_nonempty_line = true;
+        }
         // A diagnostic does not need partial fidelity on a credential-bearing
         // line. Redacting the entire line avoids delimiter, quoting, multi-word
         // header, cookie-list, and URL-userinfo variants leaking short values.
-        if credential_marker(&normalized) || contains_url_userinfo(&normalized) {
+        if redact_from_previous_line || credential_line || contains_url_userinfo(&normalized) {
             redacted.push("<redacted>".into());
             continue;
         }

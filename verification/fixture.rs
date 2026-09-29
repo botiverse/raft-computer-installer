@@ -220,6 +220,12 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 eprintln!("password = spaced-password token : spaced-token");
                 eprintln!("Cookie: theme=dark; sid=cookie-secret");
                 eprintln!("connection=postgres://u:pw123@h/db");
+                eprintln!(
+                    "fatal: could not read from https://ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/org/repo.git"
+                );
+                eprintln!("https://glpat-shortTok@gitlab.com/x.git");
+                eprintln!("\"formattedPassword\":");
+                eprintln!("\"multiline-short-value\"");
                 eprintln!("harmless candidate context remains available");
                 return Ok(23);
             }

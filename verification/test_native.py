@@ -190,6 +190,9 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", result.stdout + result.stderr)
         self.assertNotIn("cookie-secret", result.stdout + result.stderr)
         self.assertNotIn("pw123", result.stdout + result.stderr)
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", result.stdout + result.stderr)
+        self.assertNotIn("glpat-shortTok", result.stdout + result.stderr)
+        self.assertNotIn("multiline-short-value", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
         self.assertEqual(receipt["outcome"], "rolled-back")
         self.assertEqual(
@@ -222,6 +225,9 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", diagnostic["stderrTail"])
         self.assertNotIn("cookie-secret", diagnostic["stderrTail"])
         self.assertNotIn("pw123", diagnostic["stderrTail"])
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", diagnostic["stderrTail"])
+        self.assertNotIn("glpat-shortTok", diagnostic["stderrTail"])
+        self.assertNotIn("multiline-short-value", diagnostic["stderrTail"])
         self.assertIn("<redacted>", diagnostic["stderrTail"])
         self.assertIn("harmless candidate context remains available", diagnostic["stderrTail"])
         if not WINDOWS:
