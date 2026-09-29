@@ -217,6 +217,10 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                     "diagnostic-tail-".repeat(200),
                 );
                 eprintln!("Authorization=Bearer compact-secret token=fixture-token");
+                eprintln!("password = spaced-password token : spaced-token");
+                eprintln!("Cookie: theme=dark; sid=cookie-secret");
+                eprintln!("connection=postgres://u:pw123@h/db");
+                eprintln!("harmless candidate context remains available");
                 return Ok(23);
             }
             if !home.join("fixture-login").exists() || behavior.start_fail {

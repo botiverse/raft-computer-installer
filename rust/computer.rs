@@ -51,46 +51,43 @@ fn credential_marker(value: &str) -> bool {
         "password",
         "passwd",
         "api_key",
+        "api key",
+        "api-key",
         "apikey",
+        "access_key",
+        "access key",
+        "access-key",
+        "client_secret",
+        "client secret",
+        "client-secret",
         "cookie",
+        "database_url",
+        "database-url",
     ]
     .iter()
     .any(|marker| value.contains(marker))
 }
 
-fn redact_word(word: &str, redact_value: bool, redact_rest: bool) -> (String, bool, bool) {
-    if redact_rest {
-        return ("<redacted>".into(), false, true);
-    }
-    if redact_value {
-        let protocol = word
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_ascii_lowercase();
-        return (
-            "<redacted>".into(),
-            ["basic", "bearer", "token"].contains(&protocol.as_str()),
-            false,
-        );
-    }
-    let lower = word.to_ascii_lowercase();
-    if ["basic", "bearer"].contains(&lower.as_str()) {
-        return (word.into(), true, false);
-    }
-    if credential_marker(word) {
-        let authorization = lower.contains("authorization");
-        for delimiter in ['=', ':'] {
-            if let Some(index) = word.find(delimiter) {
-                let end = index + delimiter.len_utf8();
-                let value = lower[end..].trim_matches(|c: char| !c.is_ascii_alphanumeric());
-                return (
-                    format!("{}<redacted>", &word[..end]),
-                    value.is_empty() && !authorization,
-                    authorization,
-                );
-            }
+fn contains_url_userinfo(value: &str) -> bool {
+    let mut remainder = value;
+    while let Some(index) = remainder.find("://") {
+        let after_scheme = &remainder[index + 3..];
+        let authority = after_scheme
+            .split(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+            .next()
+            .unwrap_or_default();
+        if authority
+            .rfind('@')
+            .is_some_and(|at| authority[..at].contains(':'))
+        {
+            return true;
         }
-        return (word.into(), !authorization, authorization);
+        remainder = after_scheme;
     }
+    false
+}
+
+fn redact_opaque_word(word: &str) -> String {
     let opaque = word.len() >= 24
         && !word.contains('/')
         && !word.contains('\\')
@@ -98,9 +95,9 @@ fn redact_word(word: &str, redact_value: bool, redact_rest: bool) -> (String, bo
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-+".contains(c));
     if opaque {
-        ("<redacted>".into(), false, false)
+        "<redacted>".into()
     } else {
-        (word.into(), false, false)
+        word.into()
     }
 }
 
@@ -112,13 +109,15 @@ fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect::<String>();
-        let mut redact_value = false;
-        let mut redact_rest = false;
+        // A diagnostic does not need partial fidelity on a credential-bearing
+        // line. Redacting the entire line avoids delimiter, quoting, multi-word
+        // header, cookie-list, and URL-userinfo variants leaking short values.
+        if credential_marker(&normalized) || contains_url_userinfo(&normalized) {
+            redacted.push("<redacted>".into());
+            continue;
+        }
         for word in normalized.split_whitespace() {
-            let (word, next_value, next_rest) = redact_word(word, redact_value, redact_rest);
-            redacted.push(word);
-            redact_value = next_value;
-            redact_rest = next_rest;
+            redacted.push(redact_opaque_word(word));
         }
     }
     let redacted = redacted.join(" ");

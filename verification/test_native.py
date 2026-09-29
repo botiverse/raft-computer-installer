@@ -186,6 +186,10 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("basic-short-value", result.stdout + result.stderr)
         self.assertNotIn("compact-secret", result.stdout + result.stderr)
         self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        self.assertNotIn("spaced-password", result.stdout + result.stderr)
+        self.assertNotIn("spaced-token", result.stdout + result.stderr)
+        self.assertNotIn("cookie-secret", result.stdout + result.stderr)
+        self.assertNotIn("pw123", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
         self.assertEqual(receipt["outcome"], "rolled-back")
         self.assertEqual(
@@ -214,7 +218,12 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("basic-short-value", diagnostic["stderrTail"])
         self.assertNotIn("fixture-token", diagnostic["stderrTail"])
         self.assertNotIn("compact-secret", diagnostic["stderrTail"])
+        self.assertNotIn("spaced-password", diagnostic["stderrTail"])
+        self.assertNotIn("spaced-token", diagnostic["stderrTail"])
+        self.assertNotIn("cookie-secret", diagnostic["stderrTail"])
+        self.assertNotIn("pw123", diagnostic["stderrTail"])
         self.assertIn("<redacted>", diagnostic["stderrTail"])
+        self.assertIn("harmless candidate context remains available", diagnostic["stderrTail"])
         if not WINDOWS:
             self.assertEqual(diagnostic_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(machine.live()["version"], "1.0.38")
