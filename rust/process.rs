@@ -74,24 +74,259 @@ pub fn observe(pid: u32) -> Result<Option<Identity>> {
     native::observe(pid)
 }
 
+const PROCESS_EXIT_SETTLE_ATTEMPTS: usize = 10;
+const PROCESS_EXIT_SETTLE_INTERVAL: Duration = Duration::from_millis(20);
+
+fn observe_until_known_with<O, E, W>(
+    identity: &Identity,
+    mut observe: O,
+    mut definitely_exited: E,
+    mut wait: W,
+    unobservable_message: &'static str,
+) -> Result<Option<Identity>>
+where
+    O: FnMut(u32) -> Result<Option<Identity>>,
+    E: FnMut(u32) -> Result<bool>,
+    W: FnMut(Duration),
+{
+    for attempt in 0..=PROCESS_EXIT_SETTLE_ATTEMPTS {
+        match observe(identity.pid)? {
+            Some(current) => return Ok(Some(current)),
+            None if definitely_exited(identity.pid)? => return Ok(None),
+            None if attempt == PROCESS_EXIT_SETTLE_ATTEMPTS => {
+                return Err(Error::Uncertain(unobservable_message.into()));
+            }
+            // On macOS, libproc can stop exposing the executable before the
+            // kernel reports the exiting instance as a zombie. Give that
+            // bounded transition a chance to settle without treating an
+            // inaccessible live process as gone.
+            None => wait(PROCESS_EXIT_SETTLE_INTERVAL),
+        }
+    }
+    unreachable!("bounded caller identity loop always returns")
+}
+
+fn instance_matches_with<O, E, W>(
+    identity: &Identity,
+    observe: O,
+    definitely_exited: E,
+    wait: W,
+) -> Result<bool>
+where
+    O: FnMut(u32) -> Result<Option<Identity>>,
+    E: FnMut(u32) -> Result<bool>,
+    W: FnMut(Duration),
+{
+    Ok(observe_until_known_with(
+        identity,
+        observe,
+        definitely_exited,
+        wait,
+        "recorded caller identity is no longer observable",
+    )?
+    .is_some_and(|current| same_instance(identity, &current)))
+}
+
 pub fn instance_matches(identity: &Identity) -> Result<bool> {
-    match observe(identity.pid)? {
-        Some(current) => Ok(same_instance(identity, &current)),
-        None if native::definitely_exited(identity.pid)? => Ok(false),
-        None => Err(Error::Uncertain(
-            "recorded caller identity is no longer observable".into(),
-        )),
+    instance_matches_with(
+        identity,
+        observe,
+        native::definitely_exited,
+        std::thread::sleep,
+    )
+}
+
+#[cfg(test)]
+mod caller_exit_tests {
+    use super::*;
+
+    fn identity() -> Identity {
+        Identity {
+            pid: 42,
+            executable: PathBuf::from("/fixture/caller"),
+            created: "fixture-created".into(),
+        }
+    }
+
+    #[test]
+    fn transient_unobservable_exit_settles_before_returning_false() {
+        let identity = identity();
+        let mut exit_checks = 0;
+        let mut waits = Vec::new();
+
+        assert!(
+            !instance_matches_with(
+                &identity,
+                |_| Ok(None),
+                |_| {
+                    exit_checks += 1;
+                    Ok(exit_checks == 3)
+                },
+                |duration| waits.push(duration),
+            )
+            .unwrap()
+        );
+        assert_eq!(exit_checks, 3);
+        assert_eq!(waits, vec![PROCESS_EXIT_SETTLE_INTERVAL; 2]);
+    }
+
+    #[test]
+    fn transient_unobservable_live_caller_must_reappear_with_the_same_identity() {
+        let identity = identity();
+        let current = identity.clone();
+        let mut observations = 0;
+        let mut waits = Vec::new();
+
+        assert!(
+            instance_matches_with(
+                &identity,
+                |_| {
+                    observations += 1;
+                    Ok((observations == 2).then(|| current.clone()))
+                },
+                |_| Ok(false),
+                |duration| waits.push(duration),
+            )
+            .unwrap()
+        );
+        assert_eq!(observations, 2);
+        assert_eq!(waits, vec![PROCESS_EXIT_SETTLE_INTERVAL]);
+    }
+
+    #[test]
+    fn unobservable_live_caller_stays_uncertain_after_bounded_wait() {
+        let identity = identity();
+        let mut exit_checks = 0;
+        let mut waits = Vec::new();
+
+        let result = instance_matches_with(
+            &identity,
+            |_| Ok(None),
+            |_| {
+                exit_checks += 1;
+                Ok(false)
+            },
+            |duration| waits.push(duration),
+        );
+        assert!(matches!(result, Err(Error::Uncertain(_))));
+        assert_eq!(exit_checks, PROCESS_EXIT_SETTLE_ATTEMPTS + 1);
+        assert_eq!(
+            waits,
+            vec![PROCESS_EXIT_SETTLE_INTERVAL; PROCESS_EXIT_SETTLE_ATTEMPTS]
+        );
     }
 }
 
+fn matches_with<O, E, W>(
+    identity: &Identity,
+    observe: O,
+    definitely_exited: E,
+    wait: W,
+) -> Result<bool>
+where
+    O: FnMut(u32) -> Result<Option<Identity>>,
+    E: FnMut(u32) -> Result<bool>,
+    W: FnMut(Duration),
+{
+    Ok(observe_until_known_with(
+        identity,
+        observe,
+        definitely_exited,
+        wait,
+        "recorded process identity is no longer observable",
+    )?
+    .is_some_and(|current| {
+        current.created == identity.created && same_path(&current.executable, &identity.executable)
+    }))
+}
+
 pub fn matches(identity: &Identity) -> Result<bool> {
-    match observe(identity.pid)? {
-        Some(current) => Ok(current.created == identity.created
-            && same_path(&current.executable, &identity.executable)),
-        None if native::definitely_exited(identity.pid)? => Ok(false),
-        None => Err(Error::Uncertain(
-            "recorded process identity is no longer observable".into(),
-        )),
+    matches_with(
+        identity,
+        observe,
+        native::definitely_exited,
+        std::thread::sleep,
+    )
+}
+
+#[cfg(test)]
+mod process_exit_tests {
+    use super::*;
+
+    fn identity() -> Identity {
+        Identity {
+            pid: 43,
+            executable: PathBuf::from("/fixture/product"),
+            created: "fixture-created".into(),
+        }
+    }
+
+    #[test]
+    fn transient_unobservable_exit_settles_before_process_returns_false() {
+        let identity = identity();
+        let mut exit_checks = 0;
+        let mut waits = Vec::new();
+
+        assert!(
+            !matches_with(
+                &identity,
+                |_| Ok(None),
+                |_| {
+                    exit_checks += 1;
+                    Ok(exit_checks == 3)
+                },
+                |duration| waits.push(duration),
+            )
+            .unwrap()
+        );
+        assert_eq!(exit_checks, 3);
+        assert_eq!(waits, vec![PROCESS_EXIT_SETTLE_INTERVAL; 2]);
+    }
+
+    #[test]
+    fn transient_unobservable_process_must_reappear_with_the_same_identity() {
+        let identity = identity();
+        let current = identity.clone();
+        let mut observations = 0;
+        let mut waits = Vec::new();
+
+        assert!(
+            matches_with(
+                &identity,
+                |_| {
+                    observations += 1;
+                    Ok((observations == 2).then(|| current.clone()))
+                },
+                |_| Ok(false),
+                |duration| waits.push(duration),
+            )
+            .unwrap()
+        );
+        assert_eq!(observations, 2);
+        assert_eq!(waits, vec![PROCESS_EXIT_SETTLE_INTERVAL]);
+    }
+
+    #[test]
+    fn unobservable_live_process_stays_uncertain_after_bounded_wait() {
+        let identity = identity();
+        let mut exit_checks = 0;
+        let mut waits = Vec::new();
+
+        let result = matches_with(
+            &identity,
+            |_| Ok(None),
+            |_| {
+                exit_checks += 1;
+                Ok(false)
+            },
+            |duration| waits.push(duration),
+        );
+        assert!(matches!(result, Err(Error::Uncertain(_))));
+        assert_eq!(exit_checks, PROCESS_EXIT_SETTLE_ATTEMPTS + 1);
+        assert_eq!(
+            waits,
+            vec![PROCESS_EXIT_SETTLE_INTERVAL; PROCESS_EXIT_SETTLE_ATTEMPTS]
+        );
     }
 }
 
