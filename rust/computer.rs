@@ -15,11 +15,121 @@ use tokio::{
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
 
 pub struct CommandResult {
     pub success: bool,
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: Option<i32>,
     pub pid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleFailure {
+    pub kind: String,
+    pub argv: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub stderr_tail: String,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LifecycleResult {
+    pub success: bool,
+    pub failure: Option<LifecycleFailure>,
+}
+
+fn credential_marker(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "authorization",
+        "bearer",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "cookie",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn redact_word(word: &str, redact_value: bool, redact_rest: bool) -> (String, bool, bool) {
+    if redact_rest {
+        return ("<redacted>".into(), false, true);
+    }
+    if redact_value {
+        let protocol = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+        return (
+            "<redacted>".into(),
+            ["basic", "bearer", "token"].contains(&protocol.as_str()),
+            false,
+        );
+    }
+    let lower = word.to_ascii_lowercase();
+    if ["basic", "bearer"].contains(&lower.as_str()) {
+        return (word.into(), true, false);
+    }
+    if credential_marker(word) {
+        let authorization = lower.contains("authorization");
+        for delimiter in ['=', ':'] {
+            if let Some(index) = word.find(delimiter) {
+                let end = index + delimiter.len_utf8();
+                let value = lower[end..].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                return (
+                    format!("{}<redacted>", &word[..end]),
+                    value.is_empty() && !authorization,
+                    authorization,
+                );
+            }
+        }
+        return (word.into(), !authorization, authorization);
+    }
+    let opaque = word.len() >= 24
+        && !word.contains('/')
+        && !word.contains('\\')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-+".contains(c));
+    if opaque {
+        ("<redacted>".into(), false, false)
+    } else {
+        (word.into(), false, false)
+    }
+}
+
+fn diagnostic_stderr(bytes: &[u8]) -> (String, bool) {
+    let original_truncated = bytes.len() > DIAGNOSTIC_STDERR_LIMIT;
+    let mut redacted = Vec::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let normalized = line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>();
+        let mut redact_value = false;
+        let mut redact_rest = false;
+        for word in normalized.split_whitespace() {
+            let (word, next_value, next_rest) = redact_word(word, redact_value, redact_rest);
+            redacted.push(word);
+            redact_value = next_value;
+            redact_rest = next_rest;
+        }
+    }
+    let redacted = redacted.join(" ");
+    if redacted.len() <= DIAGNOSTIC_STDERR_LIMIT {
+        return (redacted, original_truncated);
+    }
+    let mut start = redacted.len() - DIAGNOSTIC_STDERR_LIMIT;
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    (redacted[start..].into(), true)
 }
 
 async fn bounded_read(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
@@ -74,9 +184,11 @@ pub async fn run(
     })
     .await;
     match result {
-        Ok(Ok((status, stdout, _stderr))) => Ok(CommandResult {
+        Ok(Ok((status, stdout, stderr))) => Ok(CommandResult {
             success: status.success(),
             stdout,
+            stderr,
+            exit_code: status.code(),
             pid,
         }),
         failure => {
@@ -218,6 +330,8 @@ struct LifecycleResponse {
     protocol_version: u32,
     completed: bool,
     success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<LifecycleFailure>,
 }
 
 fn command_path(cfg: &Config, id: &str) -> Result<std::path::PathBuf> {
@@ -234,7 +348,7 @@ fn command_path(cfg: &Config, id: &str) -> Result<std::path::PathBuf> {
 /// it may invoke Computer, and it survives the calling host controller. That
 /// closes the late-effect window when K kills a timed-out controller while a
 /// product `start` or `stop` is still in flight.
-pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
+pub async fn lifecycle(cfg: &Config, action: &str) -> Result<LifecycleResult> {
     if !["start", "stop"].contains(&action) {
         return Err(invalid("invalid product lifecycle action"));
     }
@@ -301,6 +415,20 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
             "product lifecycle command has not settled".into(),
         ));
     }
+    let valid_failure = response.failure.as_ref().is_some_and(|failure| {
+        !response.success
+            && ["nonzero-exit", "command-error"].contains(&failure.kind.as_str())
+            && failure.argv == [action]
+            && failure.stderr_tail.len() <= DIAGNOSTIC_STDERR_LIMIT
+            && !failure.stderr_tail.chars().any(char::is_control)
+    });
+    if response.success != response.failure.is_none()
+        || (response.failure.is_some() && !valid_failure)
+    {
+        return Err(Error::Uncertain(
+            "product lifecycle diagnostic is invalid".into(),
+        ));
+    }
     let record: CommandRecord = serde_json::from_slice(&fs::read(&path)?)?;
     if !record.completed {
         return Err(Error::Uncertain(
@@ -312,7 +440,10 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<bool> {
         path.parent()
             .ok_or_else(|| invalid("command directory missing"))?,
     )?;
-    Ok(response.success)
+    Ok(LifecycleResult {
+        success: response.success,
+        failure: response.failure,
+    })
 }
 
 pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
@@ -350,7 +481,33 @@ pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
     )
     .await;
     let completed = !result.as_ref().is_err_and(|e| e.is_uncertain());
-    let success = result.is_ok_and(|result| result.success);
+    let (success, failure) = match result {
+        Ok(result) if result.success => (true, None),
+        Ok(result) => {
+            let (stderr_tail, stderr_truncated) = diagnostic_stderr(&result.stderr);
+            (
+                false,
+                Some(LifecycleFailure {
+                    kind: "nonzero-exit".into(),
+                    argv: vec![request.action.clone()],
+                    exit_code: result.exit_code,
+                    stderr_tail,
+                    stderr_truncated,
+                }),
+            )
+        }
+        Err(error) if error.is_uncertain() => (false, None),
+        Err(_) => (
+            false,
+            Some(LifecycleFailure {
+                kind: "command-error".into(),
+                argv: vec![request.action.clone()],
+                exit_code: None,
+                stderr_tail: String::new(),
+                stderr_truncated: false,
+            }),
+        ),
+    };
     if completed {
         record.completed = true;
         write_json(&path, &record)?;
@@ -359,6 +516,7 @@ pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
         protocol_version: 1,
         completed,
         success,
+        failure,
     })?;
     bytes.push(b'\n');
     let mut output = tokio::io::stdout();

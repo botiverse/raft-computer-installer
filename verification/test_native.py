@@ -149,6 +149,94 @@ class InstallerContract(unittest.TestCase):
                 self.assertEqual(machine.live()["version"], expected_version)
                 self.assertNotEqual(machine.live()["pid"], before["pid"])
 
+    def test_failed_candidate_start_preserves_private_bounded_diagnostic(self):
+        self.server.publish("1.0.38")
+        self.server.publish("1.0.39", startDiagnostic=True)
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.38"])
+        machine.login_start()
+        diagnostics = machine.state / "diagnostics"
+        diagnostics.mkdir()
+        for index in range(20):
+            (diagnostics / f"00000000-0000-4000-8000-{index:012d}.json").write_text(
+                json.dumps(
+                    {
+                        "formatVersion": 1,
+                        "operationId": f"older-{index}",
+                        "slot": "experiment",
+                        "version": "1.0.39",
+                        "action": "start",
+                        "argv": ["start"],
+                        "failure": "nonzero-exit",
+                        "exitCode": 1,
+                        "stderrTail": "older failure",
+                        "stderrTruncated": False,
+                        "recordedAtMs": index,
+                    }
+                )
+            )
+
+        result = machine.run(
+            ["upgrade", "--version", "1.0.39", "--json"],
+            extra={"RAFT_COMPUTER_OPERATION_ID": "diagnostic-upgrade"},
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("short-password", result.stdout + result.stderr)
+        self.assertNotIn("json-short-value", result.stdout + result.stderr)
+        self.assertNotIn("basic-short-value", result.stdout + result.stderr)
+        self.assertNotIn("compact-secret", result.stdout + result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)["receipt"]
+        self.assertEqual(receipt["outcome"], "rolled-back")
+        self.assertEqual(
+            receipt["detail"]["reason"],
+            "experiment probe failed: HOST_COMMAND_FAILED: probe",
+        )
+        reference = receipt["detail"]["startFailureDiagnostic"]
+        self.assertRegex(reference, r"^diagnostics/[0-9a-f-]+\.json$")
+
+        diagnostic_path = machine.state / reference
+        self.assertEqual(len(list(diagnostics.glob("*.json"))), 16)
+        diagnostic = json.loads(diagnostic_path.read_text())
+        self.assertEqual(diagnostic["formatVersion"], 1)
+        self.assertEqual(diagnostic["operationId"], "diagnostic-upgrade")
+        self.assertEqual(diagnostic["slot"], "experiment")
+        self.assertEqual(diagnostic["version"], "1.0.39")
+        self.assertEqual(diagnostic["action"], "start")
+        self.assertEqual(diagnostic["argv"], ["start"])
+        self.assertEqual(diagnostic["failure"], "nonzero-exit")
+        self.assertEqual(diagnostic["exitCode"], 23)
+        self.assertTrue(diagnostic["stderrTruncated"])
+        self.assertLessEqual(len(diagnostic["stderrTail"].encode()), 2048)
+        self.assertFalse(any(ord(char) < 32 or ord(char) == 127 for char in diagnostic["stderrTail"]))
+        self.assertNotIn("short-password", diagnostic["stderrTail"])
+        self.assertNotIn("json-short-value", diagnostic["stderrTail"])
+        self.assertNotIn("basic-short-value", diagnostic["stderrTail"])
+        self.assertNotIn("fixture-token", diagnostic["stderrTail"])
+        self.assertNotIn("compact-secret", diagnostic["stderrTail"])
+        self.assertIn("<redacted>", diagnostic["stderrTail"])
+        if not WINDOWS:
+            self.assertEqual(diagnostic_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(machine.live()["version"], "1.0.38")
+
+    def test_unwritable_diagnostic_surface_does_not_block_rollback(self):
+        self.server.publish("1.0.38")
+        self.server.publish("1.0.39", startDiagnostic=True)
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.38"])
+        machine.login_start()
+        (machine.state / "diagnostics").write_bytes(b"not a directory")
+
+        result = machine.run(
+            ["upgrade", "--version", "1.0.39", "--json"],
+            extra={"RAFT_COMPUTER_OPERATION_ID": "diagnostic-write-failure"},
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)["receipt"]
+        self.assertEqual(receipt["outcome"], "rolled-back")
+        self.assertNotIn("startFailureDiagnostic", receipt["detail"])
+        self.assertEqual(machine.live()["version"], "1.0.38")
+
     def test_remote_service_parent_is_still_stopped_and_replaced(self):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])

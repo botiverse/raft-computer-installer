@@ -5,7 +5,7 @@ use crate::{Error, Result, artifact, computer, config::Config, process, version}
 use k_carrier::{
     error::invalid,
     state::{Evidence, OperationRead, Slot},
-    storage::{FileStore, ensure_dir, sync_dir, write_durable, write_json},
+    storage::{FileStore, ensure_dir, now_ms, sync_dir, write_durable, write_json},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,7 +38,32 @@ pub struct Start {
     pub slot: Slot,
     pub version: String,
     pub succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_diagnostic: Option<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartDiagnostic {
+    format_version: u32,
+    operation_id: String,
+    slot: Slot,
+    version: String,
+    action: String,
+    argv: Vec<String>,
+    failure: String,
+    exit_code: Option<i32>,
+    stderr_tail: String,
+    stderr_truncated: bool,
+    recorded_at_ms: u64,
+}
+
+struct ProductStartError {
+    error: Error,
+    failure: computer::LifecycleFailure,
+}
+
+const START_DIAGNOSTIC_LIMIT: usize = 16;
 
 pub struct Answer {
     pub running: bool,
@@ -278,22 +303,179 @@ pub fn publish(cfg: &Config, slot: Slot) -> Result<String> {
     Ok(version)
 }
 
-pub async fn start_product(cfg: &Config) -> Result<Evidence> {
-    if !computer::lifecycle(cfg, "start").await? {
-        return Err(invalid("product start failed"));
+async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, ProductStartError> {
+    let lifecycle = computer::lifecycle(cfg, "start")
+        .await
+        .map_err(|error| ProductStartError {
+            error,
+            failure: computer::LifecycleFailure {
+                kind: "lifecycle-unsettled".into(),
+                argv: vec!["start".into()],
+                exit_code: None,
+                stderr_tail: String::new(),
+                stderr_truncated: false,
+            },
+        })?;
+    if !lifecycle.success {
+        return Err(ProductStartError {
+            error: invalid("product start failed"),
+            failure: lifecycle.failure.unwrap_or(computer::LifecycleFailure {
+                kind: "command-error".into(),
+                argv: vec!["start".into()],
+                exit_code: None,
+                stderr_tail: String::new(),
+                stderr_truncated: false,
+            }),
+        });
     }
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match live_evidence(cfg).await {
             Ok(evidence) => return Ok(evidence),
-            Err(error) if error.is_uncertain() => return Err(error),
+            Err(error) if error.is_uncertain() => {
+                return Err(ProductStartError {
+                    error,
+                    failure: computer::LifecycleFailure {
+                        kind: "readiness-uncertain".into(),
+                        argv: vec!["start".into()],
+                        exit_code: Some(0),
+                        stderr_tail: String::new(),
+                        stderr_truncated: false,
+                    },
+                });
+            }
             Err(_) => {}
         }
         if Instant::now() >= deadline {
-            return Err(invalid("product did not become ready"));
+            return Err(ProductStartError {
+                error: invalid("product did not become ready"),
+                failure: computer::LifecycleFailure {
+                    kind: "readiness-timeout".into(),
+                    argv: vec!["start".into()],
+                    exit_code: Some(0),
+                    stderr_tail: String::new(),
+                    stderr_truncated: false,
+                },
+            });
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+pub async fn start_product(cfg: &Config) -> Result<Evidence> {
+    start_product_attempt(cfg)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+fn preserve_start_failure(
+    cfg: &Config,
+    record: &ProductState,
+    slot: Slot,
+    version: &str,
+    failure: &computer::LifecycleFailure,
+) -> Result<String> {
+    let directory = cfg.installer_dir.join("diagnostics");
+    ensure_dir(&directory)?;
+    let name = format!("{}.json", uuid::Uuid::new_v4());
+    write_json(
+        &directory.join(&name),
+        &StartDiagnostic {
+            format_version: 1,
+            operation_id: record.operation_id.clone(),
+            slot,
+            version: version.into(),
+            action: "start".into(),
+            argv: failure.argv.clone(),
+            failure: failure.kind.clone(),
+            exit_code: failure.exit_code,
+            stderr_tail: failure.stderr_tail.clone(),
+            stderr_truncated: failure.stderr_truncated,
+            recorded_at_ms: now_ms(),
+        },
+    )?;
+    // Keep the private evidence useful without turning repeated failures into
+    // unbounded state. Cleanup is best-effort and never changes rollback.
+    let _ = prune_start_diagnostics(&directory);
+    Ok(format!("diagnostics/{name}"))
+}
+
+fn prune_start_diagnostics(directory: &std::path::Path) -> Result<()> {
+    let mut diagnostics = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !entry.file_type()?.is_file()
+            || !name.ends_with(".json")
+            || uuid::Uuid::parse_str(name.trim_end_matches(".json")).is_err()
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(diagnostic) = serde_json::from_slice::<StartDiagnostic>(&bytes) else {
+            continue;
+        };
+        diagnostics.push((diagnostic.recorded_at_ms, entry.path()));
+    }
+    diagnostics.sort_by_key(|(recorded_at_ms, _)| *recorded_at_ms);
+    let excess = diagnostics.len().saturating_sub(START_DIAGNOSTIC_LIMIT);
+    for (_, path) in diagnostics.into_iter().take(excess) {
+        fs::remove_file(path)?;
+    }
+    if excess > 0 {
+        sync_dir(directory)?;
+    }
+    Ok(())
+}
+
+pub fn latest_start_failure_diagnostic(cfg: &Config, operation_id: &str) -> Result<Option<String>> {
+    let directory = cfg.installer_dir.join("diagnostics");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut latest: Option<(u64, String)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !entry.file_type()?.is_file()
+            || !name.ends_with(".json")
+            || uuid::Uuid::parse_str(name.trim_end_matches(".json")).is_err()
+        {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        if bytes.len() > 65536 {
+            return Err(Error::Uncertain("start diagnostic is too large".into()));
+        }
+        let diagnostic: StartDiagnostic = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Uncertain("start diagnostic is invalid".into()))?;
+        if diagnostic.format_version != 1
+            || diagnostic.action != "start"
+            || diagnostic.argv != ["start"]
+            || diagnostic.stderr_tail.len() > 2048
+            || diagnostic.stderr_tail.chars().any(char::is_control)
+        {
+            return Err(Error::Uncertain("start diagnostic is invalid".into()));
+        }
+        if diagnostic.operation_id == operation_id
+            && latest
+                .as_ref()
+                .is_none_or(|(recorded, _)| diagnostic.recorded_at_ms >= *recorded)
+        {
+            latest = Some((diagnostic.recorded_at_ms, format!("diagnostics/{name}")));
+        }
+    }
+    Ok(latest.map(|(_, reference)| reference))
 }
 
 async fn start(cfg: &Config, slot: Slot) -> Result<()> {
@@ -305,6 +487,7 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
         slot,
         version: expected.clone(),
         succeeded: false,
+        failure_diagnostic: None,
     });
     save(cfg, &record)?;
     let attempt = async {
@@ -317,7 +500,24 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
         }
         publish(cfg, slot)?;
         let evidence = if record.running {
-            start_product(cfg).await?
+            match start_product_attempt(cfg).await {
+                Ok(evidence) => evidence,
+                Err(failure) => {
+                    if let Ok(reference) =
+                        preserve_start_failure(cfg, &record, slot, &expected, &failure.failure)
+                    {
+                        record
+                            .last_start
+                            .as_mut()
+                            .expect("start intent written above")
+                            .failure_diagnostic = Some(reference);
+                        // Observability failure must not turn an ordinary
+                        // candidate failure into an unresolved upgrade.
+                        let _ = save(cfg, &record);
+                    }
+                    return Err(failure.error);
+                }
+            }
         } else {
             computer::self_report(&cfg.binary, cfg).await?
         };
@@ -347,12 +547,15 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
 
 async fn probe(cfg: &Config) -> Result<Evidence> {
     let record = read(cfg)?;
-    if record
-        .last_start
-        .as_ref()
-        .is_some_and(|start| !start.succeeded)
-    {
-        return Err(invalid("candidate was not started successfully"));
+    if let Some(start) = record.last_start.as_ref().filter(|start| !start.succeeded) {
+        let suffix = start
+            .failure_diagnostic
+            .as_ref()
+            .map(|reference| format!("; private diagnostic {reference}"))
+            .unwrap_or_default();
+        return Err(invalid(format!(
+            "candidate was not started successfully{suffix}"
+        )));
     }
     if record.running {
         live_evidence(cfg).await

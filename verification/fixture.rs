@@ -35,6 +35,8 @@ struct Behavior {
     live_version: Option<String>,
     #[serde(default)]
     start_fail: bool,
+    #[serde(default, rename = "startDiagnostic")]
+    start_diagnostic: bool,
     #[serde(default)]
     stop_broken: bool,
     #[serde(default)]
@@ -209,6 +211,14 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             fs::write(home.join("fixture-login"), b"configured")?;
         }
         Some("start") => {
+            if behavior.start_diagnostic {
+                eprintln!(
+                    "candidate start rejected {}\u{1b}[31m password: short-password \"token\": \"json-short-value\" Authorization: Basic basic-short-value",
+                    "diagnostic-tail-".repeat(200),
+                );
+                eprintln!("Authorization=Bearer compact-secret token=fixture-token");
+                return Ok(23);
+            }
             if !home.join("fixture-login").exists() || behavior.start_fail {
                 return Ok(1);
             }
