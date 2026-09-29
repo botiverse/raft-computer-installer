@@ -20,7 +20,9 @@ not repeatedly run one check after each small edit or claim an unrun case passed
 
 `fixture.rs` is a native Computer-shaped executable with independent versions and
 behaviors embedded in its bytes. It implements login, start, stop, status and a
-real TCP service with a per-start identity. The Python harness serves immutable
+real TCP service with a per-start identity. Installation never invokes login or
+setup; those remain explicit product actions on the surface that knows the
+target server and workspace. The Python harness serves immutable
 fixture releases and release-authority metadata on loopback, and launches the
 actual installer or shell/PowerShell bootstrap in isolated temporary homes.
 
@@ -31,7 +33,7 @@ rollback, sidecars, forced-stop identity, external-manager ownership, damaged K
 state and repair, failed-repair preservation, proxy/NO_PROXY, bootstrap pinning,
 integrity, cleanup and a PATH without Node. Worker-kill scenarios interrupt a real
 handover and require supervisor recovery to restore the original running/stopped
-mode. First setup uses a real Unix PTY or a Windows console.
+mode. Attended consent uses a real Unix PTY or a Windows console.
 
 Windows PATH mutation runs only in a disposable GitHub Actions account, saves the
 prior registry value and restores it afterwards. On other Windows hosts that

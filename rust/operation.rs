@@ -259,13 +259,14 @@ fn finish(
     outcome: Outcome,
     line: impl Into<String>,
 ) -> Result<Reply> {
+    // Installation and account/workspace setup are separate product actions.
+    // Keep the persisted field for backwards-compatible plan decoding, but
+    // never carry a product-provided login/setup hint into a current receipt.
+    plan.next_step = None;
     let mut line = line.into();
     if outcome.exit_code() == 0 || outcome == Outcome::RolledBack {
         if plan.detail.get("readback").map(String::as_str) == Some("service") {
             line.push_str(" It is running.");
-        }
-        if let Some(hint) = &plan.next_step {
-            line.push_str(&format!(" Next: {hint}"));
         }
         if let Some(hint) = plan.detail.get("pathHint") {
             line.push(' ');
@@ -280,7 +281,6 @@ fn finish(
         line,
     );
     result.detail = plan.detail.clone();
-    result.next_step = plan.next_step.clone();
     result.preserve_unresolved(plan.inherited_unresolved);
     let result = result.finish(cfg)?;
     if result.outcome != Outcome::Unresolved {
@@ -489,10 +489,17 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 serde_json::to_string(&dead)?,
             );
         }
-        plan.next_step = state.next_step;
     }
     let target = &plan.manifest.version;
     let line = match outcome {
+        Outcome::Promoted
+            if plan.detail.get("readback").map(String::as_str) == Some("candidate") =>
+        {
+            format!(
+                "Upgraded {} to {target}. The service remains stopped. Run raft-computer start to start it.",
+                operation.from_version
+            )
+        }
         Outcome::Promoted => format!("Upgraded {} to {target}.", operation.from_version),
         Outcome::RolledBack => rollback_line(
             target,
@@ -510,12 +517,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     finish(cfg, plan, outcome, line)
 }
 
-async fn install(
-    cfg: &Config,
-    plan: &mut Plan,
-    recovery: bool,
-    interaction: &Interaction,
-) -> Result<Reply> {
+async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
         if recovery {
             return finish(
@@ -555,7 +557,6 @@ async fn install(
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
-        plan.next_step = answer.next_step;
         transition(
             cfg,
             plan,
@@ -650,23 +651,11 @@ async fn install(
         if let Some(hint) = shell_path::ensure(cfg).await? {
             plan.detail.insert("pathHint".into(), hint);
         }
-        let status = computer::status(cfg).await.ok();
-        plan.next_step = status.as_ref().and_then(|s| s.next_step.clone());
-        if status.is_none() {
-            plan.next_step = Some("Run raft-computer status to check first setup.".into());
-        }
-        if plan.next_step.is_some()
-            && status.is_some()
-            && plan.request.presence == Presence::Attended
-            && !recovery
-        {
-            transition(cfg, plan, Phase::Setup)?;
-            plan.setup_succeeded = computer::first_setup(cfg, interaction).await?;
-            // Setup is intentionally not retried after a worker crash.
-            transition(cfg, plan, Phase::Starting)?;
-        } else {
-            transition(cfg, plan, Phase::Starting)?;
-        }
+        // Installation and account/workspace setup are separate product
+        // actions. The surface that knows the target server and workspace
+        // prints the exact setup command; the installer neither guesses it nor
+        // starts an interactive login of its own.
+        transition(cfg, plan, Phase::Starting)?;
     }
     if plan.phase == Phase::Setup {
         plan.setup_succeeded = computer::status(cfg)
@@ -694,9 +683,6 @@ async fn install(
             }
             plan.detail.insert("readback".into(), "candidate".into());
         }
-        if let Ok(status) = computer::status(cfg).await {
-            plan.next_step = status.next_step;
-        }
         let outcome = if plan.kind == Kind::Repair {
             Outcome::Repaired
         } else {
@@ -716,12 +702,7 @@ async fn install(
     Err(invalid("unexpected operation phase"))
 }
 
-async fn resume(
-    cfg: &Config,
-    plan: &mut Plan,
-    recovery: bool,
-    interaction: &Interaction,
-) -> Result<Reply> {
+async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if let Some(old) = report::read(cfg, &plan.request.id)?
         && old.outcome != Outcome::Unresolved
     {
@@ -739,7 +720,7 @@ async fn resume(
         host::bind_recovery_caller(cfg, &plan.request.id).await?;
     }
     let result = match plan.kind {
-        Kind::Fresh | Kind::Repair => install(cfg, plan, recovery, interaction).await,
+        Kind::Fresh | Kind::Repair => install(cfg, plan, recovery).await,
         Kind::Adopt | Kind::Upgrade => upgrade(cfg, plan, recovery).await,
     };
     match result {
@@ -865,7 +846,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 "This request ID already belongs to a different operation.",
             ));
         }
-        let resumed = resume(cfg, &mut previous, true, &interaction).await;
+        let resumed = resume(cfg, &mut previous, true).await;
         if matches!(&resumed, Err(Error::Locked(_))) {
             return resumed;
         }
@@ -1085,7 +1066,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             id: request.id.clone(),
         },
     )?;
-    resume(cfg, &mut plan, false, &interaction).await
+    resume(cfg, &mut plan, false).await
 }
 
 #[cfg(test)]

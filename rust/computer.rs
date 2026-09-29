@@ -1,6 +1,6 @@
 //! Bounded native product calls. Output is never copied into public errors:
-//! Computer may print authentication material during setup or diagnostics.
-use crate::{Error, Result, config::Config, presence::Interaction, process, version};
+//! Computer may print authentication material during diagnostics.
+use crate::{Error, Result, config::Config, process, version};
 use k_carrier::{
     error::invalid,
     state::Evidence,
@@ -192,36 +192,6 @@ pub async fn status(cfg: &Config) -> Result<Status> {
         evidence,
         next_step,
     })
-}
-
-pub async fn first_setup(cfg: &Config, interaction: &Interaction) -> Result<bool> {
-    let Some((input, output, error)) = interaction.setup_stdio()? else {
-        return Ok(false);
-    };
-    let mut child = Command::new(&cfg.binary)
-        .arg("login")
-        .envs(cfg.environment())
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(error))
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| invalid("first setup could not start"))?;
-    match timeout(Duration::from_secs(600), child.wait()).await {
-        Ok(result) => Ok(result?.success()),
-        Err(_) => {
-            child.start_kill()?;
-            if !matches!(
-                timeout(Duration::from_secs(5), child.wait()).await,
-                Ok(Ok(_))
-            ) {
-                return Err(crate::Error::Uncertain(
-                    "first setup could not be reaped".into(),
-                ));
-            }
-            Ok(false)
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

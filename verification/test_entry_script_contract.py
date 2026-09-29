@@ -40,6 +40,12 @@ class EntryScriptContract(unittest.TestCase):
         self.assertIn("$env:PROCESSOR_ARCHITECTURE", text)
         self.assertIn("-ne 'AMD64'", text)
 
+    def test_windows_entry_script_enables_progress_for_the_executable_only(self):
+        text = (ROOT / "bootstrap" / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("$ProgressPreference = if ($showProgress) { 'Continue' }", text)
+        self.assertIn("Download $sumsUrl $sums $false", text)
+        self.assertIn("Download $binaryUrl $cli $true", text)
+
     def test_scanner_sees_a_planted_offender(self):
         planted = "  $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()\n"
         self.assertEqual(len(runtime_information_offenders(planted)), 1)

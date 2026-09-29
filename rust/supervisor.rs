@@ -68,8 +68,8 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
             .stdout
             .take()
             .ok_or_else(|| invalid("worker stdout missing"))?;
-        // The first operation may include interactive login. Recovery never
-        // repeats login and receives a shorter, independent deadline.
+        // The first operation includes preparation and artifact transfer.
+        // Recovery receives a shorter, independent deadline.
         let budget = Duration::from_secs(if attempt == 0 { 1200 } else { 360 });
         let result = timeout(budget, async {
             input.write_all(&serde_json::to_vec(&next)?).await?;
