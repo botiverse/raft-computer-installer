@@ -95,7 +95,7 @@ def make_plan(mode, candidate=None):
         selections = {}
         for target in TARGETS:
             platform, arch = target.split('-')
-            query = urllib.parse.urlencode(dict(product_type='cli-binary', current_version='0.0.0', version=version, platform=platform, arch=arch))
+            query = urllib.parse.urlencode(dict(product_type='cli-binary', current_version='0.0.0', current_version_code=0, version=version, platform=platform, arch=arch))
             _, selection = fetch_json(HANDS + '/public/v2/apps/raft-computer-cli/updates/check?' + query)
             if not selection.get('update_available') or selection.get('release', {}).get('version') != version:
                 raise ValueError('version identity changed: ' + version)

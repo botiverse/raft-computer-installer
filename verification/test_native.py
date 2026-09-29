@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 import unittest
+import urllib.parse
 
 from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
 
@@ -78,6 +79,8 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(sha(machine.binary.read_bytes()), sha(self.server.releases["1.1.0"]))
         requests = self.server.requests
         self.assertEqual(sum("/updates/check?" in p for p in requests), 1)
+        selection = next(p for p in requests if "/updates/check?" in p)
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(selection).query).get("current_version_code"), ["0"])
         self.assertTrue(any(p.endswith(TARGET + ".gz") for p in requests), requests)
         self.assertTrue(any(p.endswith("?kind=photon-wasm") for p in requests), requests)
         self.assertFalse(any("/computer/" in p or "manifest.json" in p for p in requests), requests)

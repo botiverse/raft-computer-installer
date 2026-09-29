@@ -201,6 +201,7 @@ impl Source {
         url.query_pairs_mut()
             .append_pair("product_type", "cli-binary")
             .append_pair("current_version", "0.0.0")
+            .append_pair("current_version_code", "0")
             .append_pair("platform", os)
             .append_pair("arch", arch);
         if let Some(channel) = channel {
