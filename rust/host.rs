@@ -737,7 +737,21 @@ mod legacy_layout_tests {
         fs::create_dir_all(&cfg.install_dir).unwrap();
         fs::copy("/bin/sleep", &slot_artifact).unwrap();
         fs::write(&cfg.binary, b"#!/bin/sh\nexit 0\n").unwrap();
-        let child = Killed(Command::new(&slot_artifact).arg("30").spawn().unwrap());
+        // A parallel test's fork can briefly inherit the writable handle from
+        // the copy above, so exec may see ETXTBSY until that child execs too.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let child = Killed(loop {
+            match Command::new(&slot_artifact).arg("30").spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("slot fixture did not start: {error}"),
+            }
+        });
         let pid = child.0.id();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
