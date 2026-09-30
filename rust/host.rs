@@ -100,12 +100,49 @@ pub async fn bind_recovery_caller(cfg: &Config, operation_id: &str) -> Result<()
     save(cfg, &record)
 }
 
+/// Executables an existing product process may run from. Besides the installed
+/// binary, a legacy two-layer installation keeps a launcher at the binary path
+/// that execs into K's slot artifact, so its live processes run from the slot.
+/// Post-install proof (`live_evidence`) still requires the installed binary.
+fn product_executables(cfg: &Config) -> [PathBuf; 3] {
+    let store = FileStore::new(&cfg.k_state);
+    [
+        cfg.binary.clone(),
+        store.artifact(Slot::Stable),
+        store.artifact(Slot::Experiment),
+    ]
+}
+
 pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity>> {
     let caller = cfg.waiting_caller.as_ref();
-    Ok(process::installed(&cfg.binary)?
-        .into_iter()
-        .filter(|p| !caller.is_some_and(|c| process::same_instance(c, p)))
-        .collect())
+    let mut processes = Vec::new();
+    for executable in product_executables(cfg) {
+        for identity in process::installed(&executable)? {
+            if !caller.is_some_and(|c| process::same_instance(c, &identity))
+                && !processes.contains(&identity)
+            {
+                processes.push(identity);
+            }
+        }
+    }
+    processes.sort_by_key(|p| p.pid);
+    Ok(processes)
+}
+
+/// Attest a status-reported product pid against any executable a product
+/// process may run from, preferring the installed binary's diagnostic.
+fn attest_product(cfg: &Config, pid: u32) -> Result<process::Identity> {
+    let mut first_error = None;
+    for executable in product_executables(cfg) {
+        match process::attest(pid, &executable) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if error.is_uncertain() => return Err(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.expect("product_executables is non-empty"))
 }
 
 pub async fn answer(cfg: &Config) -> Result<Answer> {
@@ -116,7 +153,7 @@ pub async fn answer(cfg: &Config) -> Result<Answer> {
     };
     let mut processes = installed_product_processes(cfg)?;
     if let Some(evidence) = status.as_ref().and_then(|s| s.evidence.as_ref()) {
-        let identity = process::attest(evidence.pid, &cfg.binary)?;
+        let identity = attest_product(cfg, evidence.pid)?;
         if !processes.contains(&identity) {
             processes.push(identity);
         }
@@ -658,4 +695,84 @@ pub async fn serve(cfg: &Config) -> Result<u8> {
     output.write_all(&bytes).await?;
     output.flush().await?;
     Ok(code)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod legacy_layout_tests {
+    use super::*;
+    use std::process::{Child, Command};
+
+    struct Killed(Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn config(root: &std::path::Path) -> Config {
+        let state_home = root.join("state");
+        Config {
+            user_home: root.to_path_buf(),
+            k_state: state_home.join("computer/k"),
+            installer_dir: state_home.join("computer/installer"),
+            state_home,
+            install_dir: root.join("bin"),
+            binary: root.join("bin/raft-computer"),
+            sidecar: root.join("bin/photon_rs_bg.wasm"),
+            hands_origin: String::new(),
+            hands_app: String::new(),
+            waiting_caller: None,
+        }
+    }
+
+    // A legacy two-layer install keeps a launcher at the binary path that execs
+    // into K's stable slot, so the live product runs from the slot artifact.
+    #[test]
+    fn product_running_from_the_stable_slot_is_found_and_attested() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let slot_artifact = FileStore::new(&cfg.k_state).artifact(Slot::Stable);
+        fs::create_dir_all(slot_artifact.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cfg.install_dir).unwrap();
+        fs::copy("/bin/sleep", &slot_artifact).unwrap();
+        fs::write(&cfg.binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        let child = Killed(Command::new(&slot_artifact).arg("30").spawn().unwrap());
+        let pid = child.0.id();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let identity = loop {
+            if let Ok(identity) = attest_product(&cfg, pid) {
+                break identity;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slot process was not attested"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(identity.pid, pid);
+        assert!(
+            installed_product_processes(&cfg)
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == pid),
+            "a live slot process must count as a running product before quarantine",
+        );
+    }
+
+    #[test]
+    fn unrelated_process_is_not_attested() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let child = Killed(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(attest_product(&cfg, child.0.id()).is_err());
+        assert!(
+            !installed_product_processes(&cfg)
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == child.0.id())
+        );
+    }
 }
