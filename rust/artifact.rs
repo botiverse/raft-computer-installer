@@ -18,7 +18,72 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+const PROGRESS_BAR_WIDTH: u64 = 30;
+
+/// One redrawn terminal line: `Downloading Raft Computer [#######·····]  42%`.
+fn progress_line(label: &str, percent: u64) -> String {
+    let percent = percent.min(100);
+    let filled = (percent * PROGRESS_BAR_WIDTH / 100) as usize;
+    let empty = PROGRESS_BAR_WIDTH as usize - filled;
+    format!(
+        "Downloading {label} [{}{}] {percent:>3}%",
+        "#".repeat(filled),
+        "-".repeat(empty)
+    )
+}
+
+/// Ends an unfinished redrawn line when the download stops early (error or
+/// abort), so the next message starts on its own line.
+struct TerminalLine {
+    open: Mutex<bool>,
+}
+
+impl Drop for TerminalLine {
+    fn drop(&mut self) {
+        if self.open.lock().map(|open| *open).unwrap_or(false) {
+            eprintln!();
+        }
+    }
+}
+
 fn download_progress(label: &'static str) -> Progress {
+    use std::io::{IsTerminal, Write};
+    // A terminal gets one line redrawn in place; logs, CI and redirected
+    // output keep one plain line per 10% so they stay readable.
+    if std::io::stderr().is_terminal() {
+        eprint!("\r{}", progress_line(label, 0));
+        let _ = std::io::stderr().flush();
+        let line = Arc::new(TerminalLine {
+            open: Mutex::new(true),
+        });
+        let last_percent = Arc::new(Mutex::new(0_u64));
+        return Arc::new(move |received, total| {
+            if total == 0 {
+                return;
+            }
+            let percent = received
+                .saturating_mul(100)
+                .checked_div(total)
+                .unwrap_or(0)
+                .min(100);
+            let Ok(mut last) = last_percent.lock() else {
+                return;
+            };
+            if percent <= *last {
+                return;
+            }
+            *last = percent;
+            let mut stderr = std::io::stderr();
+            let _ = write!(stderr, "\r{}", progress_line(label, percent));
+            if percent == 100 {
+                let _ = writeln!(stderr);
+                if let Ok(mut open) = line.open.lock() {
+                    *open = false;
+                }
+            }
+            let _ = stderr.flush();
+        });
+    }
     eprintln!("Downloading {label}: 0%");
     let last_bucket = Arc::new(Mutex::new(0_u64));
     Arc::new(move |received, total| {
@@ -470,4 +535,26 @@ pub async fn check_candidate(cfg: &Config, path: &Path, release: &Release) -> Re
         return Err(invalid("candidate self-report version mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progress_line;
+
+    #[test]
+    fn progress_line_draws_a_fixed_width_bar() {
+        assert_eq!(
+            progress_line("Raft Computer", 0),
+            "Downloading Raft Computer [------------------------------]   0%"
+        );
+        assert_eq!(
+            progress_line("Raft Computer", 42),
+            "Downloading Raft Computer [############------------------]  42%"
+        );
+        assert_eq!(
+            progress_line("Raft Computer", 100),
+            "Downloading Raft Computer [##############################] 100%"
+        );
+        assert_eq!(progress_line("x", 250), progress_line("x", 100));
+    }
 }
