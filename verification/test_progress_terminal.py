@@ -2,7 +2,6 @@
 percentage); redirected output keeps one plain line per 10%."""
 import faulthandler
 import os
-import pty
 import subprocess
 import unittest
 
@@ -27,6 +26,8 @@ class TerminalProgress(unittest.TestCase):
         self.addCleanup(self.machine.close)
 
     def test_terminal_gets_one_redrawn_bar(self):
+        import pty  # POSIX-only; a module-level import breaks discovery on Windows
+
         primary, secondary = pty.openpty()
         try:
             process = subprocess.Popen(
