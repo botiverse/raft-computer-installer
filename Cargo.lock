@@ -515,9 +515,9 @@ dependencies = [
 
 [[package]]
 name = "k-carrier"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c22c098943ddc0fd2686e3a72a8d6a47e116c0c2083574fd4e8e0e90957e414"
+checksum = "6bb0d2b7434439f31c814d5f44cd42e94006423c1541fa85138205a776852946"
 dependencies = [
  "async-trait",
  "base64",
@@ -701,7 +701,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raft-computer-installer"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "async-trait",
  "k-carrier",
