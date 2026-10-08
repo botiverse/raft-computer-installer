@@ -70,12 +70,26 @@ jobs:
           if os.environ['CANDIDATE']:
               args += ['--candidate', os.environ['CANDIDATE']]
           subprocess.run(args, check=True)
-      - uses: actions/upload-artifact@v4
+      # Every platform job downloads this plan: blocking, but one transient
+      # artifact-service failure (e.g. CreateArtifact timeout) gets a retry.
+      - id: upload_plan
+        uses: actions/upload-artifact@v4
         if: steps.select.outputs.mode != 'none'
+        continue-on-error: true
         with:
           name: published-matrix-plan
           path: matrix-plan.json
           if-no-files-found: error
+      - name: Wait before retrying the plan upload
+        if: steps.upload_plan.outcome == 'failure'
+        run: sleep 30
+      - uses: actions/upload-artifact@v4
+        if: steps.upload_plan.outcome == 'failure'
+        with:
+          name: published-matrix-plan
+          path: matrix-plan.json
+          if-no-files-found: error
+          overwrite: true
   native:
     needs: plan
     strategy:
@@ -113,14 +127,38 @@ jobs:
       - name: Published Computer independent cold scenarios
         if: ${{ !cancelled() && needs.plan.outputs.mode != 'none' }}
         run: python verification/matrix.py run --plan matrix-plan.json --output matrix-results/${{ matrix.target }}.json
-      - uses: actions/upload-artifact@v4
+      # Diagnostic only: the matrix verdict is the step above. A failed upload
+      # must not block a release (v0.3.12 shipped nothing over one
+      # CreateArtifact timeout); it is surfaced as a warning instead.
+      - id: upload_results
+        uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && needs.plan.outputs.mode != 'none' }}
+        continue-on-error: true
         with:
           name: matrix-results-${{ matrix.target }}
           path: matrix-results/*.json
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - name: Report a missing diagnostic upload
+        if: ${{ !cancelled() && steps.upload_results.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning title=matrix results not uploaded::matrix-results-${{ matrix.target }} upload failed; the matrix verdict above is unaffected"
+      # The release job assembles from this artifact: it stays blocking, with
+      # one retry so a transient artifact-service failure does not kill it.
+      - id: upload_native
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: native-${{ matrix.target }}
           path: dist/native/${{ matrix.target }}/
           if-no-files-found: error
+      - name: Wait before retrying the native artifact upload
+        if: steps.upload_native.outcome == 'failure'
+        shell: bash
+        run: echo "::warning title=native artifact upload retried::first upload of native-${{ matrix.target }} failed" && sleep 30
+      - uses: actions/upload-artifact@v4
+        if: steps.upload_native.outcome == 'failure'
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/native/${{ matrix.target }}/
+          if-no-files-found: error
+          overwrite: true
