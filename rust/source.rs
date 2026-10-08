@@ -171,13 +171,15 @@ fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) ->
 
 fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
     let cause = if error.is_timeout() {
-        "the request timed out"
+        "the request timed out".into()
+    } else if let Some(failure) = crate::network::classify(error, url) {
+        failure.sentence()
     } else if error.is_connect() {
-        "the connection failed"
+        "the connection failed".into()
     } else if error.is_redirect() {
-        "it redirected too many times"
+        "it redirected too many times".into()
     } else {
-        "the request failed"
+        "the request failed".into()
     };
     invalid(format!("could not reach {}: {cause}", shown_url(url)))
 }

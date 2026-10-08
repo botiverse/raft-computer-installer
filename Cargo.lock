@@ -739,6 +739,8 @@ name = "raft-computer-installer"
 version = "0.3.13"
 dependencies = [
  "async-trait",
+ "http",
+ "hyper-util",
  "k-carrier",
  "libc",
  "reqwest",

@@ -37,9 +37,12 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     let host = url.host_str().unwrap_or_default().to_owned();
     let cause = match &error {
         crate::Error::Http(error) if error.is_timeout() => "the download timed out".into(),
-        crate::Error::Http(error) if error.is_connect() => "the connection failed".into(),
-        crate::Error::Http(error) if error.is_redirect() => "it redirected too many times".into(),
-        crate::Error::Http(_) => "the download failed".into(),
+        crate::Error::Http(error) => match crate::network::classify(error, &url) {
+            Some(failure) => failure.sentence(),
+            None if error.is_connect() => "the connection failed".into(),
+            None if error.is_redirect() => "it redirected too many times".into(),
+            None => "the download failed".into(),
+        },
         crate::Error::Invalid(message) => {
             if message.starts_with("SHA256_MISMATCH") || message.starts_with("SIZE_MISMATCH") {
                 format!(
