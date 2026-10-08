@@ -104,7 +104,7 @@ pub async fn bind_recovery_caller(cfg: &Config, operation_id: &str) -> Result<()
 /// binary, a legacy two-layer installation keeps a launcher at the binary path
 /// that execs into K's slot artifact, so its live processes run from the slot.
 /// Post-install proof (`live_evidence`) still requires the installed binary.
-fn product_executables(cfg: &Config) -> [PathBuf; 3] {
+pub fn product_executables(cfg: &Config) -> [PathBuf; 3] {
     let store = FileStore::new(&cfg.k_state);
     [
         cfg.binary.clone(),

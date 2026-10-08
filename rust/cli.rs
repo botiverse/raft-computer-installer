@@ -200,7 +200,9 @@ pub async fn run() -> Result<u8> {
         if marker.as_deref().is_some_and(|v| v != "waiting-cli-v1") {
             return Err(invalid("invalid caller declaration"));
         }
-        let parent = crate::process::immediate_parent(&cfg.binary)?;
+        // The waiting CLI may run from the installed binary or, on a legacy
+        // two-layer install, from the slot artifact its launcher execs into.
+        let parent = crate::process::immediate_parent(&host::product_executables(&cfg))?;
         if marker.is_some() && parent.is_none() {
             return Err(invalid(
                 "waiting caller is not the installed immediate parent",

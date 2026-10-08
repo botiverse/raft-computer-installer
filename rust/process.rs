@@ -36,7 +36,11 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
+/// The immediate parent when it runs from one of `executables`, else `None`.
+/// A legacy two-layer installation keeps a launcher at the installed path that
+/// execs into K's slot artifact, so a waiting product CLI may run from the
+/// slot rather than the installed binary; callers pass every product image.
+pub fn immediate_parent(executables: &[PathBuf]) -> Result<Option<Identity>> {
     let first = native::parent()?;
     let identity = observe(first)?;
     if first != native::parent()? {
@@ -64,7 +68,7 @@ pub fn immediate_parent(binary: &Path) -> Result<Option<Identity>> {
             return Err(Error::Uncertain("parent process id was reused".into()));
         }
     }
-    Ok(identity.filter(|p| same_path(&p.executable, binary)))
+    Ok(identity.filter(|p| executables.iter().any(|e| same_path(&p.executable, e))))
 }
 
 pub fn observe(pid: u32) -> Result<Option<Identity>> {
@@ -1091,6 +1095,25 @@ mod tests {
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         assert!(!matches(&identity).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod immediate_parent_tests {
+    use super::*;
+
+    // The test process's own parent stands in for a waiting product CLI: it
+    // is attested only when its image is in the list, whatever else is listed.
+    #[test]
+    fn parent_is_attested_against_any_listed_executable() {
+        let Some(parent) = observe(native::parent().unwrap()).unwrap() else {
+            return;
+        };
+        let unrelated = PathBuf::from("/fixture/not-a-product-image");
+        let listed = immediate_parent(&[unrelated.clone(), parent.executable.clone()]).unwrap();
+        assert_eq!(listed.map(|p| p.pid), Some(parent.pid));
+        assert!(immediate_parent(&[unrelated]).unwrap().is_none());
+        assert!(immediate_parent(&[]).unwrap().is_none());
     }
 }
 
