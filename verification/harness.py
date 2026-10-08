@@ -84,6 +84,8 @@ class ReleaseServer:
         self.intercepted = False
         # Release downloads redirect to a signed URL that refuses them.
         self.download_redirect = False
+        # The checksum list downloads; only the installer binary is refused.
+        self.refuse_installer_binary = False
         self.html_authority = False
         self.machines = []
         self.sidecar = b"isolated native fixture wasm\n"
@@ -223,6 +225,8 @@ class ReleaseServer:
                 time.sleep(self.slow_checksums)
                 relative = f"native/{TARGET}/raft-computer-installer{SUFFIX}"
                 body = b"" if self.missing_checksums else f"{sha(self.installer_bytes)}  {relative}\n".encode()
+            elif self.refuse_installer_binary:
+                status, body = 403, b""
             else:
                 body = self.installer_bytes + (b"tampered" if self.tamper_installer else b"")
         else:

@@ -54,6 +54,7 @@ class InstallerContract(unittest.TestCase):
         self.server.mutable_redirect = False
         self.server.intercepted = False
         self.server.download_redirect = False
+        self.server.refuse_installer_binary = False
         self.server.html_authority = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
         self.server.wrong_hash.clear()
@@ -1207,6 +1208,23 @@ class InstallerContract(unittest.TestCase):
                 self.assertNotIn("curl:", result.stderr)
                 self.assertNotIn("bad range", result.stderr)
                 self.assertFalse(machine.binary.exists())
+
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_reports_the_binary_download_failure_when_checksums_succeed(self):
+        # The checksum list downloads; only the installer binary is refused
+        # (HTTP 403). The progress download runs in the background under
+        # set -e: its curl status must still be captured and reported as an
+        # HTTP error, not as an unreadable status file.
+        self.server.refuse_installer_binary = True
+        machine = self.machine()
+        result = machine.run(["install", "--version", "1.0.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("could not download the installation files from ", result.stderr)
+        self.assertIn("the server returned an HTTP error", result.stderr)
+        self.assertNotIn("exited with code", result.stderr)
+        self.assertNotIn("cannot open", result.stderr)
+        self.assertNotIn(".code", result.stderr)
+        self.assertFalse(machine.binary.exists())
 
     def test_download_redirect_failure_names_the_requested_url(self):
         # Downloads legitimately redirect to signed object-storage URLs. When

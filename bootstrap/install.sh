@@ -44,9 +44,11 @@ if command -v curl >/dev/null 2>&1; then
   # the bar's own updates ("###  42.0%"), drop everything else, and keep
   # curl's exit code.
   dl_progress() {
-    { curl -fL --globoff --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2" 2>&1 >/dev/null; echo $? > "$2.code"; } |
+    # set -e would end this group at a failing curl before its status is
+    # written: capture the status explicitly.
+    { dl_status=0; curl -fL --globoff --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2" 2>&1 >/dev/null || dl_status=$?; echo "$dl_status" > "$2.code"; } |
       awk 'BEGIN { RS = "\r" } { gsub(/\n/, ""); if ($0 ~ /^[#=O. -]*[0-9]+(\.[0-9]+)?%$/) { printf "\r%s", $0; shown = 1; fflush() } } END { if (shown) printf "\n" }' >&2
-    dl_code=1; read -r dl_code < "$2.code" || true; return "$dl_code"
+    dl_code=1; { read -r dl_code < "$2.code"; } 2>/dev/null || true; return "$dl_code"
   }
   # Prints "<HTTP status> <Location>" of one request without following it.
   location() { curl -s --globoff --connect-timeout 30 --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "$1" 2>/dev/null; }
