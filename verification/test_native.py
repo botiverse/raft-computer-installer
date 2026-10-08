@@ -1194,6 +1194,24 @@ class InstallerContract(unittest.TestCase):
                 self.assertFalse(machine.binary.exists())
                 self.assertFalse(any("sha256sums" in p or path in p for p in self.server.requests), self.server.requests)
 
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_transfer_tool_errors_never_print_url_secrets(self):
+        # curl reports some failures (a "[" in the URL: "bad range
+        # specification") with the URL it was given, before any network
+        # request. The entry script must not pass that through, on the Hands
+        # channel path and on the explicit static mirror path alike.
+        host = self.server.base.split("://", 1)[1]
+        bad = f"http://synthetic-user:synthetic-password@{host}/dl?token=synthetic-token["
+        for name in ("RAFT_COMPUTER_INSTALLER_DL_BASE", "RAFT_COMPUTER_INSTALLER_RELEASE_BASE"):
+            with self.subTest(base=name):
+                machine = self.machine()
+                result = machine.run([], extra={name: bad}, bootstrap=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Could not start the installation:", result.stderr)
+                for secret in ("synthetic-password", "synthetic-token", "synthetic-user"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                self.assertFalse(machine.binary.exists())
+
     def test_download_redirect_secrets_are_never_printed(self):
         # Downloads legitimately redirect to signed object-storage URLs. When
         # one fails, the message names the Hands URL's host and path only.

@@ -30,22 +30,47 @@ shown() {
   shown_marker=; [ "$shown_path" = "$shown_tail" ] || shown_marker='?...'
   printf '%s' "$shown_prefix$shown_authority$shown_path$shown_marker"
 }
+# A fixed description of a transfer tool's exit code.
+transfer_failure() {
+  case "$transfer:$1" in
+    curl:3) printf 'the address is not valid' ;;
+    curl:6|wget:4) printf 'the host could not be resolved or reached' ;;
+    curl:7) printf 'the connection failed' ;;
+    curl:22|wget:8) printf 'the server returned an HTTP error' ;;
+    curl:28) printf 'the request timed out' ;;
+    curl:35|curl:60|wget:5) printf 'the secure connection failed; a company firewall or proxy may be intercepting it' ;;
+    *:0) printf 'no HTTP response was received' ;;
+    *) printf '%s exited with code %s' "$transfer" "$1" ;;
+  esac
+}
 need mktemp
 need uname
 need awk
+# The transfer tool's own messages never reach the terminal: curl and wget
+# echo the URL they were given (credentials and query included) in some of
+# their errors. Failures are reported from the exit code instead
+# (transfer_failure), with every URL shown through shown().
 if command -v curl >/dev/null 2>&1; then
-  dl_quiet() { curl -fsSL --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
-  dl_progress() { curl -fL --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
+  transfer=curl
+  dl_quiet() { curl -fsL --globoff --connect-timeout 30 --max-time 180 "$1" -o "$2" 2>/dev/null; }
+  # curl's progress bar and its error messages share stderr: pass on only
+  # the bar's own updates ("###  42.0%"), drop everything else, and keep
+  # curl's exit code.
+  dl_progress() {
+    { curl -fL --globoff --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2" 2>&1 >/dev/null; echo $? > "$2.code"; } |
+      awk 'BEGIN { RS = "\r" } { gsub(/\n/, ""); if ($0 ~ /^[#=O. -]*[0-9]+(\.[0-9]+)?%$/) { printf "\r%s", $0; shown = 1; fflush() } } END { if (shown) printf "\n" }' >&2
+    dl_code=1; read -r dl_code < "$2.code" || true; return "$dl_code"
+  }
   # Prints "<HTTP status> <Location>" of one request without following it.
-  location() { curl -sS --connect-timeout 30 --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "$1"; }
+  location() { curl -s --globoff --connect-timeout 30 --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "$1" 2>/dev/null; }
 elif command -v wget >/dev/null 2>&1; then
-  dl_quiet() { wget -q --timeout=30 --tries=1 -O "$2" "$1"; }
-  # GNU wget logs every URL it visits, redirect targets (signed URLs)
-  # included: keep it quiet and show only its progress bar. BusyBox wget's
-  # progress names the file and host only.
+  transfer=wget
+  dl_quiet() { wget -q --timeout=30 --tries=1 -O "$2" "$1" 2>/dev/null; }
+  # GNU wget -q --show-progress prints only the bar (file name, not URL) and
+  # no errors; BusyBox wget's progress names the URL, so it gets none.
   case "$(wget --version 2>/dev/null || true)" in
     *'GNU Wget'*) dl_progress() { wget -q --show-progress --timeout=30 --tries=1 -O "$2" "$1"; } ;;
-    *) dl_progress() { wget --timeout=30 --tries=1 -O "$2" "$1"; } ;;
+    *) dl_progress() { dl_quiet "$@"; } ;;
   esac
   location() { wget -q --timeout=30 --tries=1 --max-redirect=0 -S -O /dev/null "$1" 2>&1 | tr -d '\r' | awk '$1 ~ /^HTTP\// {code=$2} tolower($1)=="location:" {loc=$2} END {print code, loc}'; }
 else err "curl or wget is required"; fi
@@ -72,10 +97,11 @@ else
   [ -z "${RAFT_COMPUTER_INSTALLER_VERSION:-}" ] || err "use INSTALLER_RELEASE_BASE for an exact static release, or INSTALLER_CHANNEL for Hands"
   base=${RAFT_COMPUTER_INSTALLER_DL_BASE%/}
   channel_url="$base/$RAFT_COMPUTER_INSTALLER_CHANNEL/$target"
-  hop=$(location "$channel_url" || true)
+  hop_code=0
+  hop=$(location "$channel_url") || hop_code=$?
   status=$(printf '%s\n' "$hop" | awk '{print $1}')
   release_url=$(printf '%s\n' "$hop" | awk '{print $2}')
-  case "$status" in ''|000) err "could not reach $(shown "$channel_url")" ;; esac
+  case "$status" in ''|000) err "could not reach $(shown "$channel_url"): $(transfer_failure "$hop_code")" ;; esac
   [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $(shown "$channel_url"))"
   origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')
   case "$release_url" in
@@ -104,11 +130,15 @@ fi
 # release: download them concurrently and verify once both are complete.
 printf 'Downloading the installation files...\n' >&2
 dl_progress "$binary_url" "$tmp/installer" & download_pid=$!
-dl_quiet "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums from $(shown "$sums_url")"
+sums_code=0
+dl_quiet "$sums_url" "$tmp/SHA256SUMS" || sums_code=$?
+[ "$sums_code" -eq 0 ] || err "could not download installation checksums from $(shown "$sums_url"): $(transfer_failure "$sums_code")"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
 [ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
 case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac
-wait "$download_pid" || err "could not download the installation files from $(shown "$binary_url")"
+binary_code=0
+wait "$download_pid" || binary_code=$?
+[ "$binary_code" -eq 0 ] || err "could not download the installation files from $(shown "$binary_url"): $(transfer_failure "$binary_code")"
 download_pid=
 [ "$(sha "$tmp/installer")" = "$expected" ] || err "installation download does not match its published checksum"
 chmod 0755 "$tmp/installer"
