@@ -11,7 +11,7 @@ import time
 import unittest
 import urllib.parse
 
-from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
+from harness import DIST, SUFFIX, TARGET, URL_SECRETS, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
 from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
@@ -53,6 +53,7 @@ class InstallerContract(unittest.TestCase):
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
         self.server.intercepted = False
+        self.server.download_redirect = False
         self.server.html_authority = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
         self.server.wrong_hash.clear()
@@ -1135,42 +1136,84 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["world"]["kind"], "fresh")
         self.assertFalse(machine.binary.exists())
 
-    def assert_names_the_network_redirect(self, text):
+    def assert_no_url_secrets(self, text):
+        for secret in (*URL_SECRETS, "user:", "ori_url", "X-Amz", "token="):
+            self.assertNotIn(secret, text)
+        self.assertNotIn("ori_url=", text)
+
+    def assert_names_the_network_redirect(self, text, path):
         # A company web filter answered for Hands (real report): the user is
         # told that the network redirected Hands elsewhere, with the HTTP
-        # status and the exact target, and which hosts to allow; never a bare
-        # "run it again", which can only fail the same way.
+        # status, the target's host and path (never its credentials, query
+        # or fragment), and which hosts to allow; never a bare "run it
+        # again", which can only fail the same way.
         self.assertIn("redirected 127.0.0.1 to localhost", text)
         self.assertIn("HTTP 302", text)
-        self.assertRegex(text, r"http://localhost:\d+/proxycontrolwarn/httpwarning_3318\.html\?ori_url=[A-Za-z0-9+/=]+&uid=0")
+        self.assertRegex(text, r"HTTP 302 to http://localhost:\d+" + re.escape(path) + r"\?\.\.\.\)")
         self.assertIn("company firewall or proxy", text)
         self.assertIn("allow 127.0.0.1 and *.r2.cloudflarestorage.com", text)
+        self.assert_no_url_secrets(text)
+
+    INTERCEPTIONS = {"filter": "/proxycontrolwarn/httpwarning_3318.html", "signed": "/r2bucket/object"}
 
     def test_network_redirect_off_hands_is_named_before_any_download(self):
-        self.server.intercepted = True
-        machine = self.machine()
-        failed = machine.json(["install"], expected=1)
-        self.assert_failure_contract(failed)
-        self.assertEqual(failed["code"], "release_resolution_failed")
-        self.assert_names_the_network_redirect(failed["line"])
-        self.assertNotIn("Run the same install command again", failed["line"])
-        self.assertFalse(machine.binary.exists())
-        # The release request is not followed onto the other host.
-        self.assertFalse(any("proxycontrolwarn" in path for path in self.server.requests), self.server.requests)
-        plain = machine.run(["install"])
-        self.assertEqual(plain.returncode, 1, plain.stdout + plain.stderr)
-        self.assert_names_the_network_redirect(plain.stdout)
-        self.assertEqual(runtime_offenders(plain.stdout + plain.stderr), [])
+        for kind, path in self.INTERCEPTIONS.items():
+            with self.subTest(kind=kind):
+                self.server.intercepted = kind
+                self.server.requests.clear()
+                machine = self.machine()
+                result = machine.run(["install", "--json"])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                failed = json.loads(result.stdout)
+                self.assert_failure_contract(failed)
+                self.assertEqual(failed["code"], "release_resolution_failed")
+                self.assert_names_the_network_redirect(failed["line"], path)
+                self.assert_no_url_secrets(result.stdout + result.stderr)
+                self.assert_no_url_secrets(json.dumps(failed["receipt"]))
+                self.assertNotIn("Run the same install command again", failed["line"])
+                self.assertFalse(machine.binary.exists())
+                # The release request is not followed onto the other host.
+                self.assertFalse(any(path in p for p in self.server.requests), self.server.requests)
+                plain = machine.run(["install"])
+                self.assertEqual(plain.returncode, 1, plain.stdout + plain.stderr)
+                self.assert_names_the_network_redirect(plain.stdout, path)
+                self.assert_no_url_secrets(plain.stdout + plain.stderr)
+                self.assertEqual(runtime_offenders(plain.stdout + plain.stderr), [])
 
     def test_bootstrap_names_a_network_redirect_off_hands(self):
-        self.server.intercepted = True
+        for kind, path in self.INTERCEPTIONS.items():
+            with self.subTest(kind=kind):
+                self.server.intercepted = kind
+                self.server.requests.clear()
+                machine = self.machine()
+                result = machine.run([], bootstrap=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assert_names_the_network_redirect(result.stderr, path)
+                self.assert_no_url_secrets(result.stdout + result.stderr)
+                self.assertNotIn("invalid installation release redirect", result.stderr)
+                self.assertFalse(machine.binary.exists())
+                self.assertFalse(any("sha256sums" in p or path in p for p in self.server.requests), self.server.requests)
+
+    def test_download_redirect_secrets_are_never_printed(self):
+        # Downloads legitimately redirect to signed object-storage URLs. When
+        # one fails, the message names the Hands URL's host and path only.
+        self.server.download_redirect = True
         machine = self.machine()
-        result = machine.run([], bootstrap=True)
+        result = machine.run(["install", "--json"])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assert_names_the_network_redirect(result.stderr)
-        self.assertNotIn("invalid installation release redirect", result.stderr)
+        failed = json.loads(result.stdout)
+        self.assert_failure_contract(failed)
+        self.assertRegex(failed["line"], r"Could not download Raft Computer( support file)? from "
+            + re.escape(self.server.base + "/dl/raft-computer-cli/releases/") + r"[0-9a-f]+/" + re.escape(TARGET)
+            + r"(\?\.\.\.)?: the server returned HTTP 403")
+        self.assert_no_url_secrets(result.stdout + result.stderr)
+        self.assert_no_url_secrets(json.dumps(machine.receipt(failed["id"])))
         self.assertFalse(machine.binary.exists())
-        self.assertFalse(any("sha256sums" in path or "proxycontrolwarn" in path for path in self.server.requests), self.server.requests)
+        boot = self.machine().run([], bootstrap=True)
+        self.assertEqual(boot.returncode, 1, boot.stdout + boot.stderr)
+        self.assertIn("could not download", boot.stderr)
+        self.assertIn(self.server.base + "/dl/raft-computer-installer/releases/frozen-1/" + TARGET, boot.stderr)
+        self.assert_no_url_secrets(boot.stdout + boot.stderr)
 
     def test_release_resolution_failure_says_why(self):
         self.server.html_authority = True
@@ -1179,13 +1222,13 @@ class InstallerContract(unittest.TestCase):
         self.assert_failure_contract(failed)
         self.assertEqual(failed["code"], "release_resolution_failed")
         self.assertIn("returned an HTML page instead of the release document", failed["line"])
-        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?", failed["line"])
+        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?... returned an HTML page", failed["line"])
         self.assertTrue(failed["line"].endswith("Run the same install command again."), failed["line"])
         self.server.html_authority = False
         missing = machine.json(["install", "--version", "9.9.9"], expected=1)
         self.assert_failure_contract(missing)
-        self.assertIn("returned HTTP 404", missing["line"])
-        self.assertIn("version=9.9.9", missing["line"])
+        self.assertIn("/updates/check?... returned HTTP 404", missing["line"])
+        self.assertNotIn("version=9.9.9", missing["line"])
 
     def test_download_failure_says_why(self):
         # Bytes that do not match the release (a filter's HTML page, a cut

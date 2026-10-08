@@ -26,6 +26,9 @@ TARGET = target_key()
 DIST = Path(os.environ.get("RCI_DIST", ROOT / "dist")).resolve()
 TEMPLATE_TEXT = b'{"version":"0.0.0","marker":"RAFT_NATIVE_FIXTURE_CONFIGURATION_V1"}'
 TEMPLATE = TEMPLATE_TEXT + b"\0" * (512 - len(TEMPLATE_TEXT))
+# Synthetic secrets carried by redirect targets (userinfo, query values,
+# fragment, object-storage signature). None may reach printed output.
+URL_SECRETS = ("SECRETPW", "SECRET123", "SECRETFRAG", "SECRETSIG", "SECRETCRED")
 
 
 def sha(data):
@@ -79,7 +82,11 @@ class ReleaseServer:
         self.mutable_redirect = False
         # A company web filter answering for Hands: every Hands request is
         # redirected to a warning page on another host (real report shape).
+        # "filter" carries credentials, a token and a fragment; "signed" is an
+        # object-storage signed URL.
         self.intercepted = False
+        # Release downloads redirect to a signed URL that refuses them.
+        self.download_redirect = False
         self.html_authority = False
         self.machines = []
         self.sidecar = b"isolated native fixture wasm\n"
@@ -140,6 +147,17 @@ class ReleaseServer:
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
+            return
+        if path == "/r2bucket/object":
+            handler.send_response(403)
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return
+        if self.download_redirect and path.startswith(("/dl/raft-computer-cli/releases/", "/dl/raft-computer-installer/releases/")):
+            handler.send_response(302)
+            handler.send_header("Location", f"http://user:SECRETPW@127.0.0.1:{self.server.server_port}/r2bucket/object"
+                "?X-Amz-Credential=SECRETCRED&X-Amz-Signature=SECRETSIG&token=SECRET123#SECRETFRAG")
+            handler.end_headers()
             return
         if self.intercepted and not path.startswith("/installer/"):
             handler.send_response(302)
@@ -221,8 +239,13 @@ class ReleaseServer:
             pass
 
     def interception_url(self, original):
-        ori = base64.b64encode((self.base + original).encode()).decode()
-        return f"http://localhost:{self.server.server_port}/proxycontrolwarn/httpwarning_3318.html?ori_url={ori}&uid=0"
+        if self.intercepted == "signed":
+            return f"http://localhost:{self.server.server_port}/r2bucket/object?X-Amz-Credential=SECRETCRED&X-Amz-Signature=SECRETSIG"
+        return (f"http://user:SECRETPW@localhost:{self.server.server_port}/proxycontrolwarn/httpwarning_3318.html"
+            f"?token=SECRET123&ori_url={self.interception_ori(original)}&uid=0#SECRETFRAG")
+
+    def interception_ori(self, original):
+        return base64.b64encode((self.base + original).encode()).decode()
 
     def proxy(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.handler)

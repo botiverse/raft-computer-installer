@@ -14,9 +14,22 @@ err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
 # Host of an absolute URL, lowercased, without credentials or port.
 host_of() { printf '%s\n' "$1" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?\#].*$##; s#^.*@##; s#:[0-9]*$##' | tr 'A-Z' 'a-z'; }
-# A URL as shown to the user: a signed object-storage URL (X-Amz-* query) is
-# shown without its signature.
-shown() { case "$1" in *[?\&][Xx]-[Aa][Mm][Zz]-*) printf '%s' "${1%%\?*}" ;; *) printf '%s' "$1" ;; esac; }
+# A URL as shown to the user: scheme, host, port and path only. Userinfo,
+# query and fragment may carry credentials or signatures, so they are never
+# shown; "?..." marks that something was omitted.
+shown() {
+  shown_prefix=; shown_rest=$1
+  case "$1" in
+    //*) shown_prefix=//; shown_rest=${1#//} ;;
+    *://*) case "${1%%://*}" in [A-Za-z]*) case "${1%%://*}" in *[!A-Za-z0-9+.-]*) ;; *) shown_prefix=${1%%://*}://; shown_rest=${1#*://} ;; esac ;; esac ;;
+  esac
+  shown_authority=${shown_rest%%[/?#]*}
+  shown_tail=${shown_rest#"$shown_authority"}
+  shown_authority=${shown_authority##*@}
+  shown_path=${shown_tail%%[?#]*}
+  shown_marker=; [ "$shown_path" = "$shown_tail" ] || shown_marker='?...'
+  printf '%s' "$shown_prefix$shown_authority$shown_path$shown_marker"
+}
 need mktemp
 need uname
 need awk
@@ -27,7 +40,13 @@ if command -v curl >/dev/null 2>&1; then
   location() { curl -sS --connect-timeout 30 --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
   dl_quiet() { wget -q --timeout=30 --tries=1 -O "$2" "$1"; }
-  dl_progress() { wget --timeout=30 --tries=1 -O "$2" "$1"; }
+  # GNU wget logs every URL it visits, redirect targets (signed URLs)
+  # included: keep it quiet and show only its progress bar. BusyBox wget's
+  # progress names the file and host only.
+  case "$(wget --version 2>/dev/null || true)" in
+    *'GNU Wget'*) dl_progress() { wget -q --show-progress --timeout=30 --tries=1 -O "$2" "$1"; } ;;
+    *) dl_progress() { wget --timeout=30 --tries=1 -O "$2" "$1"; } ;;
+  esac
   location() { wget -q --timeout=30 --tries=1 --max-redirect=0 -S -O /dev/null "$1" 2>&1 | tr -d '\r' | awk '$1 ~ /^HTTP\// {code=$2} tolower($1)=="location:" {loc=$2} END {print code, loc}'; }
 else err "curl or wget is required"; fi
 if command -v sha256sum >/dev/null 2>&1; then sha() { sha256sum "$1" | awk '{print $1}'; }
@@ -56,8 +75,8 @@ else
   hop=$(location "$channel_url" || true)
   status=$(printf '%s\n' "$hop" | awk '{print $1}')
   release_url=$(printf '%s\n' "$hop" | awk '{print $2}')
-  case "$status" in ''|000) err "could not reach $channel_url" ;; esac
-  [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $channel_url)"
+  case "$status" in ''|000) err "could not reach $(shown "$channel_url")" ;; esac
+  [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $(shown "$channel_url"))"
   origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')
   case "$release_url" in
     //*) err "invalid installation release redirect (HTTP $status to $(shown "$release_url"))" ;;

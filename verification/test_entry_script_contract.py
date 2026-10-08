@@ -25,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN = re.compile(r"RuntimeInformation", re.IGNORECASE)
 EXIT = re.compile(r"(?<![\w$-])exit(?![\w-])", re.IGNORECASE)
 GUARDED_EXIT = "if ($runAsFile) { exit $code }"
+# A .NET exception message may name the URL it failed on, credentials and
+# signed query included; the Windows script prints it only through Redacted.
+EXCEPTION_MESSAGE = re.compile(r"(?<!Redacted )\$_\.Exception\.Message")
 
 
 def production_lines(text):
@@ -36,6 +39,10 @@ def production_lines(text):
 
 def runtime_information_offenders(text):
     return [f"{number}: {line.strip()}" for number, line in production_lines(text) if FORBIDDEN.search(line)]
+
+
+def unredacted_messages(text):
+    return [f"{number}: {line.strip()}" for number, line in production_lines(text) if EXCEPTION_MESSAGE.search(line)]
 
 
 def unguarded_exits(text):
@@ -68,6 +75,16 @@ class EntryScriptContract(unittest.TestCase):
         # the last decision, and a pasted run ends by setting the code.
         self.assertIn("try { $runAsFile = [bool]$PSCommandPath } catch { }", lines)
         self.assertEqual(lines[-2:], [GUARDED_EXIT, "$global:LASTEXITCODE = $code"])
+
+    def test_windows_entry_script_prints_exception_messages_only_redacted(self):
+        text = (ROOT / "bootstrap" / "install.ps1").read_text(encoding="utf-8")
+        self.assertEqual(unredacted_messages(text), [])
+        self.assertGreaterEqual(text.count("Redacted $_.Exception.Message"), 3)
+
+    def test_exception_message_scanner_sees_a_planted_offender(self):
+        planted = "  [Console]::Error.WriteLine('failed: ' + $_.Exception.Message)\n"
+        self.assertEqual(len(unredacted_messages(planted)), 1)
+        self.assertEqual(unredacted_messages("  Fail \"x $(Redacted $_.Exception.Message)\"\n"), [])
 
     def test_exit_scanner_sees_a_planted_offender(self):
         self.assertEqual(len(unguarded_exits("exit $code\n")), 1)

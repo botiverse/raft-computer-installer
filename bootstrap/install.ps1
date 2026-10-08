@@ -15,10 +15,24 @@ $tmp = $null
 $code = 1
 # The catch below prefixes "Could not start the installation: " once.
 function Fail($message) { throw "$message." }
-# A URL as shown to the user: a signed object-storage URL (X-Amz-* query) is
-# shown without its signature.
+# A URL as shown to the user: scheme, host, port and path only. Userinfo,
+# query and fragment may carry credentials or signatures, so they are never
+# shown; "?..." marks that something was omitted.
 function Shown([Uri]$uri) {
-  if ($uri.Query -match '(?i)[?&]x-amz-') { return $uri.GetLeftPart([UriPartial]::Path) }
+  $shown = $uri.Scheme + '://' + $uri.Authority + $uri.AbsolutePath
+  if ($uri.Query -or $uri.Fragment) { $shown += '?...' }
+  return $shown
+}
+# Text this script did not write (a .NET exception message) may name a URL:
+# every absolute URL in it is shown by the same rule.
+function Redacted($text) {
+  return [Regex]::Replace([string]$text, '[A-Za-z][A-Za-z0-9+.-]*://[^\s''"<>]+', {
+    param($match)
+    $uri = $null
+    if ([Uri]::TryCreate($match.Value, [UriKind]::Absolute, [ref]$uri)) { return (Shown $uri) }
+    return '<URL>'
+  })
+}
   return $uri.AbsoluteUri
 }
 # Say something before the first network round trip (see install.sh).
@@ -44,7 +58,7 @@ function Download($url, $out, [bool]$showProgress = $false) {
   $beforeDownloadProgress = $ProgressPreference
   try {
     $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
-    try { Invoke-WebRequest @options } catch { throw ('could not download ' + (Shown ([Uri]$url)) + ': ' + $_.Exception.Message) }
+    try { Invoke-WebRequest @options } catch { throw ('could not download ' + (Shown ([Uri]$url)) + ': ' + (Redacted $_.Exception.Message)) }
   } finally {
     $ProgressPreference = $beforeDownloadProgress
   }
@@ -79,14 +93,14 @@ try {
       # 4xx/5xx arrive as a WebException that still carries the response.
       $webError = $_.Exception
       while ($webError -and -not ($webError -is [Net.WebException])) { $webError = $webError.InnerException }
-      if (-not $webError -or -not $webError.Response) { Fail "could not reach ${channelUrl}: $($_.Exception.Message)" }
+      if (-not $webError -or -not $webError.Response) { Fail "could not reach $(Shown ([Uri]$channelUrl)): $(Redacted $_.Exception.Message)" }
       $response = $webError.Response
     }
     try {
       $status = [int]$response.StatusCode
       $location = [string]$response.Headers['Location']
     } finally { $response.Close() }
-    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $channelUrl)" }
+    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $(Shown ([Uri]$channelUrl)))" }
     $release = New-Object Uri([Uri]$channelUrl, $location)
     $redirect = "HTTP $status to " + (Shown $release)
     if ($release.Scheme -notin @('http', 'https')) { Fail "invalid installation release redirect ($redirect)" }
@@ -134,7 +148,7 @@ try {
     $code = $LASTEXITCODE
   }
 } catch {
-  [Console]::Error.WriteLine('Could not start the installation: ' + $_.Exception.Message)
+  [Console]::Error.WriteLine('Could not start the installation: ' + (Redacted $_.Exception.Message))
   $code = 1
 } finally {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
