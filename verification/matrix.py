@@ -13,7 +13,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-from harness import ReleaseServer, ROOT, TARGET, DIST, SUFFIX
+from harness import ReleaseServer, ROOT, TARGET, DIST, SUFFIX, processes_under, terminate
 from http_client import public_request
 from real import assert_stopped, HANDS
 
@@ -206,6 +206,54 @@ class FrozenServer(ReleaseServer):
             super().respond(handler)
 
 
+def clean_up(machine, stop_and_prove):
+    """Settle one cold case's isolated home; return (row fields, case_failed).
+
+    Rule: the cold matrix never logs in or starts a service, so after the
+    product's own `stop` and a proven stopped status NO process may run from
+    an image inside the case home (product, service, runner or installer
+    worker). Any such process is product evidence -- something the case
+    should have stopped outlived it -- so it is recorded as
+    leftoverProcesses, terminated so later cases stay independent, the home
+    is retained for evidence, and the case FAILS.
+
+    With no such process (the table is positive-controlled, see
+    process_table), a file that stays busy is held by something outside the
+    case (e.g. a malware scanner opening a just-executed image). Removal
+    retries with backoff; if it still cannot complete, the home is retained
+    and reported as cleanupWarning without changing the product verdict.
+    Anything unproven (stop/status failure, unreadable process table) FAILS.
+    """
+    fields = {}
+    try:
+        stop_and_prove()
+        leftovers = processes_under(machine.home)
+        if not leftovers:
+            try:
+                attempts = machine.close()
+                fields['cleanup'] = 'removed'
+                if attempts > 1:
+                    fields['cleanupRetries'] = attempts - 1
+                return fields, False
+            except OSError as error:
+                removal_error = error
+                # Re-check: a process that appeared meanwhile is still ours.
+                leftovers = processes_under(machine.home)
+        if leftovers:
+            fields['leftoverProcesses'] = leftovers
+            terminate(leftovers)
+            raise AssertionError('processes from the case home outlived a proven stop: ' + json.dumps(leftovers))
+        machine.directory._finalizer.detach()
+        fields['cleanup'] = 'retained: ' + str(machine.home)
+        fields['cleanupWarning'] = 'no process from the case home is running; removal still blocked: ' + str(removal_error)
+        return fields, False
+    except Exception as error:
+        machine.directory._finalizer.detach()
+        fields['cleanup'] = 'retained: ' + str(machine.home)
+        fields['cleanupError'] = str(error)
+        return fields, True
+
+
 def execute(plan_path, output):
     plan_bytes = plan_path.read_bytes()
     plan = json.loads(plan_bytes)
@@ -285,21 +333,23 @@ def execute(plan_path, output):
                 failures.append(index)
             finally:
                 # Verify stopped before deleting; retain evidence if uncertain.
-                try:
+                def stop_and_prove():
                     if machine.binary.exists():
                         subprocess.run([str(machine.binary), 'stop'], env=machine.env(extra), capture_output=True, timeout=60)
                         assert_stopped(machine, extra)
-                    machine.close()
-                    row['cleanup'] = 'removed'
-                except Exception as error:
-                    machine.directory._finalizer.detach()
-                    row['cleanup'] = 'retained: ' + str(machine.home)
-                    row['cleanupError'] = str(error)
+                fields, cleanup_failed = clean_up(machine, stop_and_prove)
+                row.update(fields)
+                if cleanup_failed:
                     row['status'] = 'FAIL'
-                    failures.append(index)
+                    if index not in failures:
+                        failures.append(index)
                 server.machines.remove(machine)
                 save()
             print(TARGET, index, kind, source, '->', target, row['status'], flush=True)
+            for key in ('cleanupError', 'cleanupWarning'):
+                if key in row:
+                    level = 'error' if key == 'cleanupError' else 'warning'
+                    print(f'::{level} title=matrix case {index} {kind} cleanup::{row[key]}', flush=True)
     except Exception as error:
         report['error'] = str(error)
         failures.append('setup')

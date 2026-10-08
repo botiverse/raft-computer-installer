@@ -42,6 +42,100 @@ def wait_for(predicate, timeout=15):
     raise AssertionError("timed out waiting for the expected process state")
 
 
+def process_table():
+    """Every visible (pid, executable path). Raises if the table is unreadable.
+
+    An unreadable table must never read as "no processes": the caller's own
+    pid is the positive control that the enumeration actually ran.
+    """
+    table = []
+    if WINDOWS:
+        script = ("Get-CimInstance Win32_Process | Where-Object ExecutablePath | "
+            "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress")
+        result = subprocess.run([str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"),
+            "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60, check=True)
+        rows = json.loads(result.stdout)
+        for row in rows if isinstance(rows, list) else [rows]:
+            table.append((int(row["ProcessId"]), row["ExecutablePath"]))
+    elif Path("/proc/self/exe").exists():
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                try:
+                    table.append((int(entry.name), os.readlink(entry / "exe").removesuffix(" (deleted)")))
+                except OSError:
+                    pass  # exited, kernel thread, or another user's process
+    else:
+        # macOS `comm` is the full executable path for path-launched images.
+        result = subprocess.run(["/bin/ps", "-axo", "pid=,comm="], capture_output=True, text=True, timeout=60, check=True)
+        for line in result.stdout.splitlines():
+            pid, _, image = line.strip().partition(" ")
+            table.append((int(pid), image.strip()))
+    if os.getpid() not in {pid for pid, _ in table}:
+        raise AssertionError("process table does not contain this process; enumeration is unproven")
+    return table
+
+
+def processes_under(root):
+    """Live processes whose executable image lies inside root."""
+    root = Path(root).resolve()
+    found = []
+    for pid, image in process_table():
+        # Compare resolved paths: Windows may report 8.3 short names.
+        if image and root.name.lower() in image.lower():
+            try:
+                resolved = Path(os.path.realpath(image))
+            except OSError:
+                continue
+            if resolved == root or root in resolved.parents:
+                found.append({"pid": pid, "image": str(resolved)})
+    return found
+
+
+def terminate(processes, timeout=15):
+    """Force-stop the listed processes and wait until none remains."""
+    for process in processes:
+        if WINDOWS:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process["pid"])], capture_output=True, timeout=30)
+        else:
+            try:
+                os.kill(process["pid"], 9)
+            except ProcessLookupError:
+                pass
+    pids = {p["pid"] for p in processes}
+    wait_for(lambda: not pids & {pid for pid, _ in process_table()}, timeout)
+
+
+def remove_tree(path, timeout=30):
+    """Remove path, retrying with bounded backoff while Windows reports the
+    files busy (WinError 32 sharing violation / WinError 5 access denied).
+
+    A just-exited image or a scanner (e.g. Defender) can hold an executable
+    for a moment after its last process exits. Returns the attempt count;
+    raises the last error once the deadline passes.
+    """
+    def writable(function, target, _):
+        os.chmod(target, 0o700)
+        function(target)
+    deadline = time.monotonic() + timeout
+    delay, attempts = 0.1, 0
+    while True:
+        attempts += 1
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path, onexc=writable)
+            else:
+                shutil.rmtree(path, onerror=writable)
+            return attempts
+        except FileNotFoundError:
+            return attempts
+        except OSError as error:
+            busy = isinstance(error, PermissionError) or getattr(error, "winerror", None) in (5, 32)
+            if not busy or time.monotonic() + delay > deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
+
 def exchange(home, action="probe"):
     try:
         record = json.loads((home / "fixture-service.json").read_text())
@@ -345,4 +439,6 @@ class Machine:
             time.sleep(0.05)
         if self.live():
             raise AssertionError("fixture service did not stop during cleanup")
-        self.directory.cleanup()
+        attempts = remove_tree(self.home)
+        self.directory._finalizer.detach()
+        return attempts

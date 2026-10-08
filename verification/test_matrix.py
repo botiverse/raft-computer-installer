@@ -88,3 +88,94 @@ class MatrixContract(unittest.TestCase):
                 latest['assets'][-1]['sha256'] = 'b' * 64
                 with self.assertRaisesRegex(ValueError, 'authority and artifact disagree'):
                     make_plan('full')
+
+
+class CleanupRule(unittest.TestCase):
+    """matrix.clean_up: leftover case processes FAIL; outside file locks warn."""
+
+    @classmethod
+    def setUpClass(cls):
+        from harness import ReleaseServer
+        cls.server = ReleaseServer()
+        cls.server.publish('1.0.0')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.close()
+
+    def machine(self):
+        machine = self.server.machine()
+        self.server.machines.remove(machine)
+        return machine
+
+    def test_process_outliving_a_claimed_stop_fails_and_is_terminated(self):
+        from harness import processes_under
+        from matrix import clean_up
+        machine = self.machine()
+        machine.preinstall('1.0.0', running=True)
+        self.assertTrue(processes_under(machine.home), 'positive control: the running service is visible')
+        # A product that claims it stopped while its service still runs.
+        fields, failed = clean_up(machine, lambda: None)
+        self.assertTrue(failed)
+        self.assertTrue(fields['leftoverProcesses'])
+        self.assertIn('outlived', fields['cleanupError'])
+        self.assertEqual(processes_under(machine.home), [])
+        self.assertTrue(machine.home.exists(), 'evidence is retained')
+        import shutil
+        shutil.rmtree(machine.home)
+
+    def test_stopped_case_is_removed(self):
+        from matrix import clean_up
+        machine = self.machine()
+        machine.preinstall('1.0.0')
+        fields, failed = clean_up(machine, lambda: None)
+        self.assertEqual((fields, failed), ({'cleanup': 'removed'}, False))
+        self.assertFalse(machine.home.exists())
+
+    def test_transient_busy_file_is_retried(self):
+        import shutil
+        from matrix import clean_up
+        machine = self.machine()
+        machine.preinstall('1.0.0')
+        real, calls = shutil.rmtree, []
+        def busy_twice(*args, **kwargs):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise PermissionError(13, 'The process cannot access the file because it is being used by another process')
+            return real(*args, **kwargs)
+        with patch('harness.shutil.rmtree', side_effect=busy_twice):
+            fields, failed = clean_up(machine, lambda: None)
+        self.assertEqual((fields, failed), ({'cleanup': 'removed', 'cleanupRetries': 2}, False))
+
+    def test_lock_without_case_process_warns_without_failing(self):
+        import shutil
+        from matrix import clean_up
+        machine = self.machine()
+        machine.preinstall('1.0.0')
+        always_busy = PermissionError(13, 'busy')
+        with patch('harness.shutil.rmtree', side_effect=always_busy), patch('harness.time.monotonic', side_effect=[0, 0, 100]):
+            fields, failed = clean_up(machine, lambda: None)
+        self.assertFalse(failed)
+        self.assertIn('cleanupWarning', fields)
+        self.assertTrue(fields['cleanup'].startswith('retained'))
+        shutil.rmtree(machine.home)
+
+    def test_unreadable_process_table_or_unproven_stop_fails(self):
+        import shutil
+        from matrix import clean_up
+        for broken in ('table', 'stop'):
+            machine = self.machine()
+            machine.preinstall('1.0.0')
+            def stop():
+                if broken == 'stop':
+                    raise AssertionError('product status failed; stopped state is unproven')
+            with patch('matrix.processes_under', side_effect=OSError('ps unavailable')):
+                fields, failed = clean_up(machine, stop)
+            self.assertTrue(failed, broken)
+            self.assertIn('cleanupError', fields)
+            shutil.rmtree(machine.home)
+
+    def test_process_table_sees_this_process(self):
+        import os
+        from harness import process_table
+        self.assertIn(os.getpid(), {pid for pid, _ in process_table()})
