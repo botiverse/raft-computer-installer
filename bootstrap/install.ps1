@@ -1,4 +1,8 @@
 # One native executable; resolve a channel once, then fetch only that release.
+# Pasted as `irm ... | iex` this runs in the user's own session: preferences
+# changed here are restored at the end, and the script never exits that
+# session (see the end of this file).
+$savedErrorAction = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 $savedProgress = $ProgressPreference
 $ProgressPreference = 'SilentlyContinue'
@@ -136,5 +140,15 @@ try {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   $ProgressPreference = $savedProgress
   $env:PSModulePath = $savedModulePath
+  $ErrorActionPreference = $savedErrorAction
 }
-exit $code
+# Run as a file (powershell -File install.ps1, or & .\install.ps1) the code
+# is the process exit code, as automation expects. Pasted as
+# `irm ... | iex` or run as `& ([scriptblock]::Create((irm ...)))` there is no
+# script file, and exit would end the user's PowerShell session: the window
+# closes and the message above vanishes with it. Report the code the way a
+# native command does instead; nothing follows in this script.
+$runAsFile = $false
+try { $runAsFile = [bool]$PSCommandPath } catch { }
+if ($runAsFile) { exit $code }
+$global:LASTEXITCODE = $code
