@@ -409,7 +409,7 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
                 let bytes = download(
-                    &Downloader::new()?,
+                    &crate::network::downloader()?,
                     release,
                     &dir,
                     "Raft Computer support file",
@@ -440,7 +440,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
     ensure_dir(&scratch)?;
     let sidecar = acquire_sidecar(cfg, manifest).await?;
     let bytes = download(
-        &Downloader::new()?,
+        &crate::network::downloader()?,
         &manifest.release,
         &scratch,
         "Raft Computer",
@@ -477,7 +477,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
 pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
-    let downloader = Downloader::new()?;
+    let downloader = crate::network::downloader()?;
     let bytes = download(
         &downloader,
         &manifest.release,

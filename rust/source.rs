@@ -199,18 +199,20 @@ impl Source {
             // A redirect off the Hands host is never followed: release
             // selection only comes from Hands, and a network filter that
             // answers for Hands is reported by its exact redirect instead.
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    if attempt.url().host_str() != hands_host.as_deref() {
-                        attempt.stop()
-                    } else if attempt.previous().len() > 5 {
-                        attempt.error("too many redirects")
-                    } else {
-                        attempt.follow()
-                    }
-                }))
-                .build()?,
+            client: crate::network::client(|builder| {
+                let hands_host = hands_host.clone();
+                builder.timeout(Duration::from_secs(30)).redirect(
+                    reqwest::redirect::Policy::custom(move |attempt| {
+                        if attempt.url().host_str() != hands_host.as_deref() {
+                            attempt.stop()
+                        } else if attempt.previous().len() > 5 {
+                            attempt.error("too many redirects")
+                        } else {
+                            attempt.follow()
+                        }
+                    }),
+                )
+            })?,
             hands_origin,
             hands_app: cfg.hands_app.clone(),
         })
