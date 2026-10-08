@@ -389,7 +389,15 @@ mod tests {
         let url = reqwest::Url::parse(&std::env::var("RCI_NETWORK_URL").unwrap()).unwrap();
         let timeout =
             std::env::var("RCI_NETWORK_TIMEOUT_MS").map_or(10_000, |ms| ms.parse().unwrap());
-        let built = client(|builder| builder.timeout(Duration::from_millis(timeout)));
+        let no_such_host = std::env::var_os("RCI_NETWORK_NO_SUCH_HOST").is_some();
+        let built = client(|builder| {
+            let builder = builder.timeout(Duration::from_millis(timeout));
+            if no_such_host {
+                builder.dns_resolver(Arc::new(NoSuchHost))
+            } else {
+                builder
+            }
+        });
         let result = match built {
             Err(_) => "build-error".to_owned(),
             Ok(client) => match client.get(url.clone()).send().await {
@@ -407,6 +415,19 @@ mod tests {
             },
         };
         println!("\nRCI_RESULT={result}");
+    }
+
+    /// A resolver that answers every lookup with "not found" at once, the
+    /// way the OS resolver does for an unknown name, without depending on
+    /// how long a platform resolver takes to give up.
+    struct NoSuchHost;
+
+    impl reqwest::dns::Resolve for NoSuchHost {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such host").into())
+            })
+        }
     }
 
     fn closed_port() -> u16 {
@@ -556,8 +577,15 @@ mod tests {
 
     #[test]
     fn a_name_that_does_not_resolve_is_a_dns_failure() {
+        // The injected resolver's error travels reqwest's real resolver path
+        // (hyper-util wraps it as its "dns error"); a real `.invalid` lookup
+        // can outlast any test timeout on macOS and would then, correctly,
+        // be reported as a timeout.
         assert_eq!(
-            fetch_in_child("https://raft-computer.invalid/", &[]),
+            fetch_in_child(
+                "https://raft-computer.invalid/",
+                &[("RCI_NETWORK_NO_SUCH_HOST", "1")]
+            ),
             "error:dns_failed"
         );
     }
@@ -565,10 +593,20 @@ mod tests {
     #[test]
     fn a_tls_server_that_rejects_the_handshake_is_a_handshake_failure() {
         // Garbage instead of a ServerHello: TLS fails without a certificate.
+        // The whole ClientHello record is read first and the socket is
+        // half-closed, not dropped: closing with unread input sends RST, and
+        // Windows then reports the reset before the client reads the alert.
         let port = server(|mut stream| {
-            let mut hello = [0_u8; 5];
-            let _ = stream.read_exact(&mut hello);
+            let mut header = [0_u8; 5];
+            if stream.read_exact(&mut header).is_err() {
+                return;
+            }
+            let mut body = vec![0_u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+            let _ = stream.read_exact(&mut body);
             let _ = stream.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
         });
         let url = format!("https://localhost:{port}/");
         assert_eq!(fetch_in_child(&url, &[]), "error:tls_handshake_failed");
