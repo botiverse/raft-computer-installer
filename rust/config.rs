@@ -57,6 +57,24 @@ fn setting(name: &str, default: &str) -> Result<String> {
     }
 }
 
+/// Entries only a machine actually using `~/.slock` has (agent workspaces,
+/// Computer state, daemon machine state, CLI profiles, agent ledgers).
+const LEGACY_STATE_ENTRIES: [&str; 5] =
+    ["agents", "computer", "machines", "profiles", "agent-state"];
+
+/// The default Raft home, mirroring `@botiverse/raft-shared` `raftHome.ts`
+/// (botiverse/slock#9189) so the installer and the Computer it installs pick
+/// the same directory: `~/.slock` while it holds Raft state (machines set up
+/// before the rename keep it), else `~/.raft`.
+fn default_state_home(user_home: &Path) -> PathBuf {
+    let legacy = user_home.join(".slock");
+    if LEGACY_STATE_ENTRIES.iter().any(|entry| legacy.join(entry).exists()) {
+        legacy
+    } else {
+        user_home.join(".raft")
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -71,7 +89,7 @@ impl Config {
             &env::var_os("RAFT_HOME")
                 .or_else(|| env::var_os("SLOCK_HOME"))
                 .map(PathBuf::from)
-                .unwrap_or_else(|| user_home.join(".slock")),
+                .unwrap_or_else(|| default_state_home(&user_home)),
             &user_home,
         )?;
         let install_dir = absolute(
@@ -156,4 +174,32 @@ pub fn platform() -> Result<(&'static str, &'static str)> {
 pub fn platform_key() -> Result<String> {
     let (os, arch) = platform()?;
     Ok(format!("{os}-{arch}"))
+}
+
+#[cfg(test)]
+mod default_state_home_tests {
+    use super::default_state_home;
+    use std::fs;
+
+    #[test]
+    fn new_machine_uses_raft() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(default_state_home(home.path()), home.path().join(".raft"));
+    }
+
+    #[test]
+    fn existing_slock_with_state_is_kept_even_next_to_raft() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".slock/computer")).unwrap();
+        fs::create_dir_all(home.path().join(".raft/computer")).unwrap();
+        assert_eq!(default_state_home(home.path()), home.path().join(".slock"));
+    }
+
+    #[test]
+    fn slock_with_only_a_notice_file_does_not_count() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".slock")).unwrap();
+        fs::write(home.path().join(".slock/.cli-rename-notice"), "").unwrap();
+        assert_eq!(default_state_home(home.path()), home.path().join(".raft"));
+    }
 }
