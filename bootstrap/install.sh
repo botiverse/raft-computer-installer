@@ -12,17 +12,23 @@ INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_DL_BASE:=https://hands.build/dl/raft-computer-installer}"
 err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
+# Host of an absolute URL, lowercased, without credentials or port.
+host_of() { printf '%s\n' "$1" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?\#].*$##; s#^.*@##; s#:[0-9]*$##' | tr 'A-Z' 'a-z'; }
+# A URL as shown to the user: a signed object-storage URL (X-Amz-* query) is
+# shown without its signature.
+shown() { case "$1" in *[?\&][Xx]-[Aa][Mm][Zz]-*) printf '%s' "${1%%\?*}" ;; *) printf '%s' "$1" ;; esac; }
 need mktemp
 need uname
 need awk
 if command -v curl >/dev/null 2>&1; then
   dl_quiet() { curl -fsSL --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
   dl_progress() { curl -fL --progress-bar --connect-timeout 30 --max-time 180 "$1" -o "$2"; }
-  location() { curl -fsS --connect-timeout 30 --max-time 30 -o /dev/null -w '%{redirect_url}' "$1"; }
+  # Prints "<HTTP status> <Location>" of one request without following it.
+  location() { curl -sS --connect-timeout 30 --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
   dl_quiet() { wget -q --timeout=30 --tries=1 -O "$2" "$1"; }
   dl_progress() { wget --timeout=30 --tries=1 -O "$2" "$1"; }
-  location() { wget -q --timeout=30 --tries=1 --max-redirect=0 -S -O /dev/null "$1" 2>&1 | awk 'tolower($1)=="location:" {print $2}' | tail -1 | tr -d '\r'; }
+  location() { wget -q --timeout=30 --tries=1 --max-redirect=0 -S -O /dev/null "$1" 2>&1 | tr -d '\r' | awk '$1 ~ /^HTTP\// {code=$2} tolower($1)=="location:" {loc=$2} END {print code, loc}'; }
 else err "curl or wget is required"; fi
 if command -v sha256sum >/dev/null 2>&1; then sha() { sha256sum "$1" | awk '{print $1}'; }
 elif command -v shasum >/dev/null 2>&1; then sha() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -47,19 +53,31 @@ else
   [ -z "${RAFT_COMPUTER_INSTALLER_VERSION:-}" ] || err "use INSTALLER_RELEASE_BASE for an exact static release, or INSTALLER_CHANNEL for Hands"
   base=${RAFT_COMPUTER_INSTALLER_DL_BASE%/}
   channel_url="$base/$RAFT_COMPUTER_INSTALLER_CHANNEL/$target"
-  release_url=$(location "$channel_url" || true)
-  [ -n "$release_url" ] || err "no installation release resolves for $target"
+  hop=$(location "$channel_url" || true)
+  status=$(printf '%s\n' "$hop" | awk '{print $1}')
+  release_url=$(printf '%s\n' "$hop" | awk '{print $2}')
+  case "$status" in ''|000) err "could not reach $channel_url" ;; esac
+  [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $channel_url)"
+  origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')
   case "$release_url" in
-    //*) err "invalid installation release redirect" ;;
-    /*) origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#'); release_url="$origin$release_url" ;;
+    //*) err "invalid installation release redirect (HTTP $status to $(shown "$release_url"))" ;;
+    /*) release_url="$origin$release_url" ;;
   esac
-  case "$release_url" in http://*|https://*) ;; *) err "invalid installation release URL" ;; esac
-  case "$release_url" in *\?*|*\#*) err "installation release redirect must not contain a query or fragment" ;; esac
-  case "$release_url" in */releases/*/"$target") ;; *) err "installation release redirect did not freeze a release" ;; esac
+  case "$release_url" in http://*|https://*) ;; *) err "invalid installation release URL (HTTP $status to $(shown "$release_url"))" ;; esac
+  # A redirect off the Hands host is a network (often a company web filter)
+  # answering for Hands. Say so with the exact redirect: a retry cannot help.
+  hands_host=$(host_of "$base")
+  redirect_host=$(host_of "$release_url")
+  if [ "$redirect_host" != "$hands_host" ]; then
+    err "the network redirected $hands_host to $redirect_host (HTTP $status to $(shown "$release_url")); a company firewall or proxy may be blocking it. Ask your network administrator to allow $hands_host and *.r2.cloudflarestorage.com, then run the same command again"
+  fi
+  redirect="HTTP $status to $(shown "$release_url")"
+  case "$release_url" in *\?*|*\#*) err "installation release redirect must not contain a query or fragment ($redirect)" ;; esac
+  case "$release_url" in */releases/*/"$target") ;; *) err "installation release redirect did not freeze a release ($redirect)" ;; esac
   release_prefix=${release_url%/"$target"}
   release_id=${release_prefix##*/}
-  case "$release_id" in ''|*[!a-zA-Z0-9_-]*) err "invalid immutable release identity" ;; esac
-  case "${release_prefix%/*}" in */releases) ;; *) err "invalid immutable release path" ;; esac
+  case "$release_id" in ''|*[!a-zA-Z0-9_-]*) err "invalid immutable release identity ($redirect)" ;; esac
+  case "${release_prefix%/*}" in */releases) ;; *) err "invalid immutable release path ($redirect)" ;; esac
   sums_url="$release_url?kind=sha256sums"
   binary_url="$release_url"
 fi
@@ -67,11 +85,11 @@ fi
 # release: download them concurrently and verify once both are complete.
 printf 'Downloading the installation files...\n' >&2
 dl_progress "$binary_url" "$tmp/installer" & download_pid=$!
-dl_quiet "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums"
+dl_quiet "$sums_url" "$tmp/SHA256SUMS" || err "could not download installation checksums from $(shown "$sums_url")"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
 [ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
 case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac
-wait "$download_pid" || err "could not download the installation files"
+wait "$download_pid" || err "could not download the installation files from $(shown "$binary_url")"
 download_pid=
 [ "$(sha "$tmp/installer")" = "$expected" ] || err "installation download does not match its published checksum"
 chmod 0755 "$tmp/installer"

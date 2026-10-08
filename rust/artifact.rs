@@ -19,6 +19,63 @@ use std::{
 };
 
 const PROGRESS_BAR_WIDTH: u64 = 30;
+/// A download failure is user-facing and starts with this text, so the
+/// operation can print why the download failed instead of a bare retry.
+const DOWNLOAD_FAILURE: &str = "Could not download ";
+
+pub fn is_download_failure(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Invalid(message) if message.starts_with(DOWNLOAD_FAILURE))
+}
+
+/// Name the failed download, its URL and the cause in user language. Errors
+/// that are not transfer failures pass through unchanged.
+fn download_failure(label: &str, release: &Release, error: crate::Error) -> crate::Error {
+    let url = release.gzip.as_ref().map_or(&release.url, |gzip| &gzip.url);
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return error;
+    };
+    let host = url.host_str().unwrap_or_default().to_owned();
+    let cause = match &error {
+        crate::Error::Http(error) if error.is_timeout() => "the download timed out".into(),
+        crate::Error::Http(error) if error.is_connect() => "the connection failed".into(),
+        crate::Error::Http(error) if error.is_redirect() => "it redirected too many times".into(),
+        crate::Error::Http(_) => "the download failed".into(),
+        crate::Error::Invalid(message) => {
+            if message.starts_with("SHA256_MISMATCH") || message.starts_with("SIZE_MISMATCH") {
+                format!(
+                    "the downloaded file does not match the published release; a company firewall or proxy may have replaced it. Ask your network administrator to allow {host} and *.r2.cloudflarestorage.com"
+                )
+            } else if let Some(detail) = message.strip_prefix("DOWNLOAD_FAILED: ") {
+                if detail.ends_with("timeout") {
+                    "the download timed out".into()
+                } else if let Some(status) = detail.strip_prefix("HTTP ") {
+                    format!("the server returned HTTP {status}")
+                } else {
+                    format!("the download failed ({detail})")
+                }
+            } else {
+                return error;
+            }
+        }
+        _ => return error,
+    };
+    invalid(format!(
+        "{DOWNLOAD_FAILURE}{label} from {}: {cause}",
+        crate::source::shown_url(&url)
+    ))
+}
+
+async fn download(
+    downloader: &Downloader,
+    release: &Release,
+    resume_dir: &Path,
+    label: &'static str,
+) -> Result<Vec<u8>> {
+    downloader
+        .download(release, Some(resume_dir), Some(download_progress(label)))
+        .await
+        .map_err(|error| download_failure(label, release, error))
+}
 
 /// One redrawn terminal line: `Downloading Raft Computer [#######·····]  42%`.
 fn progress_line(label: &str, percent: u64) -> String {
@@ -351,13 +408,13 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
         (Some(release), Some(identity)) => {
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
-                let bytes = Downloader::new()?
-                    .download(
-                        release,
-                        Some(&dir),
-                        Some(download_progress("Raft Computer support file")),
-                    )
-                    .await?;
+                let bytes = download(
+                    &Downloader::new()?,
+                    release,
+                    &dir,
+                    "Raft Computer support file",
+                )
+                .await?;
                 write_durable(&path, &bytes, false)?;
             }
             Some(path)
@@ -382,13 +439,13 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
     let scratch = cfg.scratch();
     ensure_dir(&scratch)?;
     let sidecar = acquire_sidecar(cfg, manifest).await?;
-    let bytes = Downloader::new()?
-        .download(
-            &manifest.release,
-            Some(&scratch),
-            Some(download_progress("Raft Computer")),
-        )
-        .await?;
+    let bytes = download(
+        &Downloader::new()?,
+        &manifest.release,
+        &scratch,
+        "Raft Computer",
+    )
+    .await?;
     check_platform(&bytes)?;
     let directory = tempfile::Builder::new()
         .prefix("candidate-")
@@ -421,13 +478,13 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
     let downloader = Downloader::new()?;
-    let bytes = downloader
-        .download(
-            &manifest.release,
-            Some(&cfg.scratch()),
-            Some(download_progress("Raft Computer")),
-        )
-        .await?;
+    let bytes = download(
+        &downloader,
+        &manifest.release,
+        &cfg.scratch(),
+        "Raft Computer",
+    )
+    .await?;
     check_platform(&bytes)?;
     let directory = tempfile::Builder::new()
         .prefix("repair-candidate-")
@@ -436,13 +493,13 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
     write_durable(&path, &bytes, true)?;
     let sidecar = match &manifest.sidecar {
         Some(release) => {
-            let bytes = downloader
-                .download(
-                    release,
-                    Some(&cfg.scratch()),
-                    Some(download_progress("Raft Computer support file")),
-                )
-                .await?;
+            let bytes = download(
+                &downloader,
+                release,
+                &cfg.scratch(),
+                "Raft Computer support file",
+            )
+            .await?;
             write_durable(&directory.path().join(SIDECAR_NAME), &bytes, false)?;
             Some(bytes)
         }

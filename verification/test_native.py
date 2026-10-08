@@ -23,6 +23,11 @@ FAILURE_CODES = {
 }
 
 
+# Matches the fake credential in verification/fixture.rs. Built at runtime so
+# this file does not itself contain a token-shaped literal.
+FAKE_GITHUB_TOKEN = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 class InstallerContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -47,6 +52,8 @@ class InstallerContract(unittest.TestCase):
         self.server.slow_checksums = 0.0
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
+        self.server.intercepted = False
+        self.server.html_authority = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
         self.server.wrong_hash.clear()
         self.server.authority_lies.clear()
@@ -225,7 +232,7 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", result.stdout + result.stderr)
         self.assertNotIn("cookie-secret", result.stdout + result.stderr)
         self.assertNotIn("pw123", result.stdout + result.stderr)
-        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", result.stdout + result.stderr)
+        self.assertNotIn(FAKE_GITHUB_TOKEN, result.stdout + result.stderr)
         self.assertNotIn("glpat-shortTok", result.stdout + result.stderr)
         self.assertNotIn("multiline-short-value", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
@@ -262,7 +269,7 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", diagnostic["stderrTail"])
         self.assertNotIn("cookie-secret", diagnostic["stderrTail"])
         self.assertNotIn("pw123", diagnostic["stderrTail"])
-        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", diagnostic["stderrTail"])
+        self.assertNotIn(FAKE_GITHUB_TOKEN, diagnostic["stderrTail"])
         self.assertNotIn("glpat-shortTok", diagnostic["stderrTail"])
         self.assertNotIn("multiline-short-value", diagnostic["stderrTail"])
         self.assertIn("<redacted>", diagnostic["stderrTail"])
@@ -1126,6 +1133,72 @@ class InstallerContract(unittest.TestCase):
         result = machine.run(["status", "--json"], bootstrap=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["world"]["kind"], "fresh")
+        self.assertFalse(machine.binary.exists())
+
+    def assert_names_the_network_redirect(self, text):
+        # A company web filter answered for Hands (real report): the user is
+        # told that the network redirected Hands elsewhere, with the HTTP
+        # status and the exact target, and which hosts to allow; never a bare
+        # "run it again", which can only fail the same way.
+        self.assertIn("redirected 127.0.0.1 to localhost", text)
+        self.assertIn("HTTP 302", text)
+        self.assertRegex(text, r"http://localhost:\d+/proxycontrolwarn/httpwarning_3318\.html\?ori_url=[A-Za-z0-9+/=]+&uid=0")
+        self.assertIn("company firewall or proxy", text)
+        self.assertIn("allow 127.0.0.1 and *.r2.cloudflarestorage.com", text)
+
+    def test_network_redirect_off_hands_is_named_before_any_download(self):
+        self.server.intercepted = True
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["code"], "release_resolution_failed")
+        self.assert_names_the_network_redirect(failed["line"])
+        self.assertNotIn("Run the same install command again", failed["line"])
+        self.assertFalse(machine.binary.exists())
+        # The release request is not followed onto the other host.
+        self.assertFalse(any("proxycontrolwarn" in path for path in self.server.requests), self.server.requests)
+        plain = machine.run(["install"])
+        self.assertEqual(plain.returncode, 1, plain.stdout + plain.stderr)
+        self.assert_names_the_network_redirect(plain.stdout)
+        self.assertEqual(runtime_offenders(plain.stdout + plain.stderr), [])
+
+    def test_bootstrap_names_a_network_redirect_off_hands(self):
+        self.server.intercepted = True
+        machine = self.machine()
+        result = machine.run([], bootstrap=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assert_names_the_network_redirect(result.stderr)
+        self.assertNotIn("invalid installation release redirect", result.stderr)
+        self.assertFalse(machine.binary.exists())
+        self.assertFalse(any("sha256sums" in path or "proxycontrolwarn" in path for path in self.server.requests), self.server.requests)
+
+    def test_release_resolution_failure_says_why(self):
+        self.server.html_authority = True
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["code"], "release_resolution_failed")
+        self.assertIn("returned an HTML page instead of the release document", failed["line"])
+        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?", failed["line"])
+        self.assertTrue(failed["line"].endswith("Run the same install command again."), failed["line"])
+        self.server.html_authority = False
+        missing = machine.json(["install", "--version", "9.9.9"], expected=1)
+        self.assert_failure_contract(missing)
+        self.assertIn("returned HTTP 404", missing["line"])
+        self.assertIn("version=9.9.9", missing["line"])
+
+    def test_download_failure_says_why(self):
+        # Bytes that do not match the release (a filter's HTML page, a cut
+        # transfer) are named with the download URL, not a bare retry line.
+        self.server.authority_lies.add("1.1.0")
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertIn("Could not download Raft Computer from " + self.server.base + "/dl/raft-computer-cli/releases/", failed["line"])
+        self.assertIn("does not match the published release", failed["line"])
+        self.assertIn("company firewall or proxy", failed["line"])
+        self.assertTrue(failed["line"].endswith("Nothing was changed. Run the same install command again."), failed["line"])
+        self.assertEqual(runtime_offenders(failed["line"]), [])
         self.assertFalse(machine.binary.exists())
 
     def test_invalid_channel_is_rejected_without_release_downloads(self):

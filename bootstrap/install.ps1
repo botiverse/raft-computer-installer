@@ -9,7 +9,14 @@ $channel = if ($env:RAFT_COMPUTER_INSTALLER_CHANNEL) { $env:RAFT_COMPUTER_INSTAL
 $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALLER_DL_BASE.TrimEnd('/') } else { 'https://hands.build/dl/raft-computer-installer' }
 $tmp = $null
 $code = 1
-function Fail($message) { throw "Could not start the installation: $message." }
+# The catch below prefixes "Could not start the installation: " once.
+function Fail($message) { throw "$message." }
+# A URL as shown to the user: a signed object-storage URL (X-Amz-* query) is
+# shown without its signature.
+function Shown([Uri]$uri) {
+  if ($uri.Query -match '(?i)[?&]x-amz-') { return $uri.GetLeftPart([UriPartial]::Path) }
+  return $uri.AbsoluteUri
+}
 # Say something before the first network round trip (see install.sh).
 [Console]::Error.WriteLine('Preparing the Raft Computer installation...')
 function ProxyFor([Uri]$uri) {
@@ -33,7 +40,7 @@ function Download($url, $out, [bool]$showProgress = $false) {
   $beforeDownloadProgress = $ProgressPreference
   try {
     $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
-    Invoke-WebRequest @options
+    try { Invoke-WebRequest @options } catch { throw ('could not download ' + (Shown ([Uri]$url)) + ': ' + $_.Exception.Message) }
   } finally {
     $ProgressPreference = $beforeDownloadProgress
   }
@@ -64,14 +71,27 @@ try {
     $probe.Timeout = 30000
     $proxy = ProxyFor ([Uri]$channelUrl)
     if ($proxy) { $probe.Proxy = New-Object Net.WebProxy($proxy) }
-    $response = $probe.GetResponse()
+    try { $response = $probe.GetResponse() } catch {
+      # 4xx/5xx arrive as a WebException that still carries the response.
+      $webError = $_.Exception
+      while ($webError -and -not ($webError -is [Net.WebException])) { $webError = $webError.InnerException }
+      if (-not $webError -or -not $webError.Response) { Fail "could not reach ${channelUrl}: $($_.Exception.Message)" }
+      $response = $webError.Response
+    }
     try {
+      $status = [int]$response.StatusCode
       $location = [string]$response.Headers['Location']
-      if (-not $location) { Fail 'the installation channel did not name an immutable release' }
-      $release = New-Object Uri([Uri]$channelUrl, $location)
     } finally { $response.Close() }
-    if ($release.Scheme -notin @('http', 'https') -or $release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail 'invalid installation release redirect' }
-    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail 'installation release redirect did not freeze a release' }
+    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $channelUrl)" }
+    $release = New-Object Uri([Uri]$channelUrl, $location)
+    $redirect = "HTTP $status to " + (Shown $release)
+    if ($release.Scheme -notin @('http', 'https')) { Fail "invalid installation release redirect ($redirect)" }
+    # A redirect off the Hands host is a network (often a company web filter)
+    # answering for Hands. Say so with the exact redirect: a retry cannot help.
+    $handsHost = ([Uri]$channelUrl).Host
+    if ($release.Host -ne $handsHost) { Fail "the network redirected $handsHost to $($release.Host) ($redirect); a company firewall or proxy may be blocking it. Ask your network administrator to allow $handsHost and *.r2.cloudflarestorage.com, then run the same command again" }
+    if ($release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail "invalid installation release redirect ($redirect)" }
+    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail "installation release redirect did not freeze a release ($redirect)" }
     $releaseUrl = $release.AbsoluteUri
     $sumsUrl = "${releaseUrl}?kind=sha256sums"
     $binaryUrl = $releaseUrl

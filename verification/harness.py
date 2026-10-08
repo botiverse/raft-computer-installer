@@ -1,5 +1,6 @@
 import gzip
 """Real native processes, isolated homes, loopback release authority and CDN."""
+import base64
 import hashlib
 import http.server
 import json
@@ -76,6 +77,10 @@ class ReleaseServer:
         self.missing_checksums = False
         self.channel_resolutions = 0
         self.mutable_redirect = False
+        # A company web filter answering for Hands: every Hands request is
+        # redirected to a warning page on another host (real report shape).
+        self.intercepted = False
+        self.html_authority = False
         self.machines = []
         self.sidecar = b"isolated native fixture wasm\n"
         self.installer = DIST / "native" / TARGET / ("raft-computer-installer" + SUFFIX)
@@ -128,6 +133,27 @@ class ReleaseServer:
         self.request_times.append((handler.path, time.monotonic()))
         status, body = 200, b""
         parts = path.strip("/").split("/")
+        if path == "/proxycontrolwarn/httpwarning_3318.html":
+            body = b"<html><body>This site is blocked by your network policy.</body></html>"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+        if self.intercepted and not path.startswith("/installer/"):
+            handler.send_response(302)
+            handler.send_header("Location", self.interception_url(handler.path))
+            handler.end_headers()
+            return
+        if self.html_authority and path == "/public/v2/apps/raft-computer-cli/updates/check":
+            body = b"<!DOCTYPE html><html><body>Sign in to continue</body></html>"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
         if path == "/public/v2/apps/raft-computer-cli/updates/check":
             version = query.get("version", [self.channels.get(query.get("channel", ["main"])[0])])[0]
             if version not in self.releases:
@@ -193,6 +219,10 @@ class ReleaseServer:
             handler.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def interception_url(self, original):
+        ori = base64.b64encode((self.base + original).encode()).decode()
+        return f"http://localhost:{self.server.server_port}/proxycontrolwarn/httpwarning_3318.html?ori_url={ori}&uid=0"
 
     def proxy(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.handler)
