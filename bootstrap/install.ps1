@@ -33,8 +33,6 @@ function Redacted($text) {
     return '<URL>'
   })
 }
-  return $uri.AbsoluteUri
-}
 # Say something before the first network round trip (see install.sh).
 [Console]::Error.WriteLine('Preparing the Raft Computer installation...')
 function ProxyFor([Uri]$uri) {
