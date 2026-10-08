@@ -62,3 +62,45 @@ jobs:
             "raft-computer-installer-${GITHUB_REF_NAME}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" --title "Installer $GITHUB_REF_NAME" \
             --generate-notes "${args[@]}"
+  # A failed tag release used to be silent (v0.3.12 shipped nothing for two
+  # days). Keep one open `release-failure` issue per tag: open or comment on
+  # failure, close it once a rerun of that tag publishes.
+  report:
+    needs: [native, release]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Open, update or close the release-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          RESULTS: native=${{ needs.native.result }} release=${{ needs.release.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          title="Installer release $TAG failed"
+          existing=$(gh issue list --label release-failure --state open --limit 100 --json number,title \
+            --jq "map(select(.title == \"$title\")) | first | .number // empty")
+          if [ "$FAILED" != true ]; then
+            if [ -n "$existing" ] && [ "$RELEASE_RESULT" = success ]; then
+              gh issue close "$existing" --comment "Published by $RUN_URL."
+            fi
+            exit 0
+          fi
+          failed=$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" --paginate \
+            --jq '.jobs[] | select(.conclusion == "failure") | "- [\(.name)](\(.html_url))"')
+          body=$(printf 'Tag `%s` was **not published**.\n\nRun: %s\nResults: %s\n\nFailed jobs:\n%s\n\nRerun failed jobs once the cause is understood; this issue closes when a run of this tag publishes.\n' \
+            "$TAG" "$RUN_URL" "$RESULTS" "${failed:-"(none reported; read the run)"}")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh label create release-failure --color B60205 --description "Tag release workflow failed" --force
+            gh issue create --title "$title" --label release-failure --body "$body"
+          fi
+          echo "::error title=release $TAG not published::$RUN_URL"

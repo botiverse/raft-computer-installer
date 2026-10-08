@@ -69,6 +69,11 @@ prove authenticated live-service behavior. Fixture lifecycle tests prove actual
 process behavior against the fixture contract; they do not replace real product
 or target-platform verification. A failed real-product cleanup retains its own
 temporary home for inspection instead of deleting state underneath a service.
+After the product's own stop and a proven stopped status, any process whose
+image lies inside a cold case's home is recorded as `leftoverProcesses`,
+terminated, and fails the case. With no such process, removal retries busy files
+(Windows sharing violations) with bounded backoff; a home that still cannot be
+removed is retained as `cleanupWarning` without changing the product verdict.
 
 Linux's Rust process test creates a same-user non-dumpable child. Inventory must
 skip its inaccessible executable while a previously recorded identity remains
