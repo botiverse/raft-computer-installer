@@ -14,7 +14,13 @@ $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALL
 $tmp = $null
 $code = 1
 # The catch below prefixes "Could not start the installation: " once.
-function Fail($message) { throw "$message." }
+# Fail messages are already safe to show (every URL in them went through
+# Shown or Redacted); the catch below prints them as they are.
+function Fail($message) {
+  $failure = New-Object Exception("$message.")
+  $failure.Data['RaftShown'] = $true
+  throw $failure
+}
 # A URL as shown to the user: scheme, host, port and path only. Userinfo,
 # query and fragment may carry credentials or signatures, so they are never
 # shown; "?..." marks that something was omitted.
@@ -25,7 +31,10 @@ function Shown([Uri]$uri) {
 }
 # Text this script did not write (a .NET exception message) may name a URL:
 # every absolute URL in it is shown by the same rule.
-function Redacted($text) {
+# A Fail message was built from Shown/Redacted parts already; redacting it
+# again would cut the text that follows its URLs ("...?...); a company...").
+function Redacted($text, [bool]$AlreadyShown = $false) {
+  if ($AlreadyShown) { return [string]$text }
   return [Regex]::Replace([string]$text, '[A-Za-z][A-Za-z0-9+.-]*://[^\s''"<>]+', {
     param($match)
     $uri = $null
@@ -56,7 +65,7 @@ function Download($url, $out, [bool]$showProgress = $false) {
   $beforeDownloadProgress = $ProgressPreference
   try {
     $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
-    try { Invoke-WebRequest @options } catch { throw ('could not download ' + (Shown ([Uri]$url)) + ': ' + (Redacted $_.Exception.Message)) }
+    try { Invoke-WebRequest @options } catch { Fail ('could not download ' + (Shown ([Uri]$url)) + ': ' + (Redacted $_.Exception.Message)) }
   } finally {
     $ProgressPreference = $beforeDownloadProgress
   }
@@ -146,7 +155,7 @@ try {
     $code = $LASTEXITCODE
   }
 } catch {
-  [Console]::Error.WriteLine('Could not start the installation: ' + (Redacted $_.Exception.Message))
+  [Console]::Error.WriteLine('Could not start the installation: ' + (Redacted $_.Exception.Message -AlreadyShown ([bool]$_.Exception.Data['RaftShown'])))
   $code = 1
 } finally {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
