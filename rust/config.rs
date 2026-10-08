@@ -68,7 +68,10 @@ const LEGACY_STATE_ENTRIES: [&str; 5] =
 /// before the rename keep it), else `~/.raft`.
 fn default_state_home(user_home: &Path) -> PathBuf {
     let legacy = user_home.join(".slock");
-    if LEGACY_STATE_ENTRIES.iter().any(|entry| legacy.join(entry).exists()) {
+    if LEGACY_STATE_ENTRIES
+        .iter()
+        .any(|entry| legacy.join(entry).exists())
+    {
         legacy
     } else {
         user_home.join(".raft")
