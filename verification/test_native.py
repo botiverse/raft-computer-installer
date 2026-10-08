@@ -1215,6 +1215,42 @@ class InstallerContract(unittest.TestCase):
         self.assertIn(self.server.base + "/dl/raft-computer-installer/releases/frozen-1/" + TARGET, boot.stderr)
         self.assert_no_url_secrets(boot.stdout + boot.stderr)
 
+    def run_pasted(self, script, form, extra):
+        # The documented Windows command pastes the script into an
+        # interactive session (irm ... | iex, or a script block). A sentinel
+        # after it shows whether the user's session survived.
+        source = f"(Get-Content -Raw -LiteralPath '{script}')"
+        invoke = f"iex {source}" if form == "iex" else f"& ([scriptblock]::Create({source}))"
+        command = invoke + "; Write-Output ('SESSION-SURVIVED ' + $LASTEXITCODE)"
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        machine = self.machine()
+        return subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=machine.env(extra), text=True, capture_output=True, timeout=180)
+
+    @unittest.skipUnless(WINDOWS, "pasting into Windows PowerShell is the Windows entry script's contract")
+    def test_pasted_windows_entry_script_keeps_the_session_open(self):
+        self.server.intercepted = "filter"
+        for form in ("iex", "scriptblock"):
+            with self.subTest(form=form):
+                result = self.run_pasted(DIST / "install.ps1", form, {})
+                self.assertIn("the network redirected", result.stderr, result.stdout + result.stderr)
+                self.assertIn("SESSION-SURVIVED 1", result.stdout, result.stdout + result.stderr)
+        # Negative control in the same run: the old unconditional `exit`
+        # ending closes the pasted session, and this check sees it.
+        text = (DIST / "install.ps1").read_text(encoding="utf-8")
+        ending = "if ($runAsFile) { exit $code }\n$global:LASTEXITCODE = $code\n"
+        self.assertIn(ending, text.replace("\r\n", "\n"))
+        planted = Path(self.machine().home) / "install-planted-exit.ps1"
+        planted.write_text(text.replace("\r\n", "\n").replace(ending, "exit $code\n"), encoding="utf-8")
+        for form in ("iex", "scriptblock"):
+            with self.subTest(form=form, control="planted exit"):
+                result = self.run_pasted(planted, form, {})
+                self.assertIn("the network redirected", result.stderr, result.stdout + result.stderr)
+                self.assertNotIn("SESSION-SURVIVED", result.stdout)
+        # Run as a file, the code is still the process exit code.
+        result = self.machine().run([], bootstrap=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
     def test_release_resolution_failure_says_why(self):
         self.server.html_authority = True
         machine = self.machine()
