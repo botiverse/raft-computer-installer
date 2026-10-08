@@ -9,7 +9,7 @@ use crate::{
     report::{self, FailureCode, Outcome, Receipt},
     request::{Reply, Request},
     runner, shell_path,
-    source::{FrozenSource, Manifest, Source},
+    source::{self, FrozenSource, Manifest, Source},
     version,
     world::{self, World},
 };
@@ -226,6 +226,23 @@ fn clear_active(cfg: &Config, id: &str) -> Result<()> {
         sync_dir(&cfg.installer_dir)?;
     }
     Ok(())
+}
+
+/// Reply lines hold at most 2048 bytes and no control characters.
+fn bounded_line(line: String) -> String {
+    let mut line: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if line.len() > 2048 {
+        let mut end = 2045;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push_str("...");
+    }
+    line
 }
 
 fn receipt(
@@ -821,7 +838,14 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
         Err(error) => {
             plan.detail.insert("diagnostic".into(), error.to_string());
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
-            let (line, reason) = if untouched {
+            let (line, reason) = if untouched && artifact::is_download_failure(&error) {
+                (
+                    bounded_line(format!(
+                        "{error}. Nothing was changed. Run the same install command again."
+                    )),
+                    "The installation could not finish.".into(),
+                )
+            } else if untouched {
                 (
                     "The installation could not finish. Nothing was changed. Run the same install command again."
                         .into(),
@@ -1143,17 +1167,28 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(error) => {
+            // Say why: a retry cannot fix a network that redirects Hands
+            // elsewhere, so that cause names what to allow instead.
+            let line = if source::is_network_redirect(&error) {
+                format!("Could not resolve the requested release. {error}")
+            } else {
+                format!(
+                    "Could not resolve the requested release ({error}). Run the same install command again."
+                )
+            };
             let mut result = receipt(
                 request,
                 request.version.clone(),
                 observed.version().map(str::to_owned),
                 Outcome::Failed,
-                "Could not resolve the requested release. Run the same install command again."
-                    .into(),
+                bounded_line(line),
             );
             result.code = Some(FailureCode::ReleaseResolutionFailed);
-            result.reason =
-                Some("The requested Raft Computer release could not be resolved.".into());
+            result.reason = Some(if source::is_network_redirect(&error) {
+                "The network redirected the release request to another host.".into()
+            } else {
+                "The requested Raft Computer release could not be resolved.".into()
+            });
             result.detail.insert("diagnostic".into(), error.to_string());
             result.preserve_unresolved(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));

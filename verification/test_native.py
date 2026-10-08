@@ -23,6 +23,11 @@ FAILURE_CODES = {
 }
 
 
+# Matches the fake credential in verification/fixture.rs. Built at runtime so
+# this file does not itself contain a token-shaped literal.
+FAKE_GITHUB_TOKEN = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 class InstallerContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -47,6 +52,10 @@ class InstallerContract(unittest.TestCase):
         self.server.slow_checksums = 0.0
         self.server.channel_resolutions = 0
         self.server.mutable_redirect = False
+        self.server.intercepted = False
+        self.server.download_redirect = False
+        self.server.refuse_installer_binary = False
+        self.server.html_authority = False
         self.server.channels = {"main": "1.1.0", "alpha": "1.1.0", "fixture-channel": "1.6.0-fixture.1"}
         self.server.wrong_hash.clear()
         self.server.authority_lies.clear()
@@ -225,7 +234,7 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", result.stdout + result.stderr)
         self.assertNotIn("cookie-secret", result.stdout + result.stderr)
         self.assertNotIn("pw123", result.stdout + result.stderr)
-        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", result.stdout + result.stderr)
+        self.assertNotIn(FAKE_GITHUB_TOKEN, result.stdout + result.stderr)
         self.assertNotIn("glpat-shortTok", result.stdout + result.stderr)
         self.assertNotIn("multiline-short-value", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)["receipt"]
@@ -262,7 +271,7 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("spaced-token", diagnostic["stderrTail"])
         self.assertNotIn("cookie-secret", diagnostic["stderrTail"])
         self.assertNotIn("pw123", diagnostic["stderrTail"])
-        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", diagnostic["stderrTail"])
+        self.assertNotIn(FAKE_GITHUB_TOKEN, diagnostic["stderrTail"])
         self.assertNotIn("glpat-shortTok", diagnostic["stderrTail"])
         self.assertNotIn("multiline-short-value", diagnostic["stderrTail"])
         self.assertIn("<redacted>", diagnostic["stderrTail"])
@@ -1126,6 +1135,178 @@ class InstallerContract(unittest.TestCase):
         result = machine.run(["status", "--json"], bootstrap=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["world"]["kind"], "fresh")
+        self.assertFalse(machine.binary.exists())
+
+    def assert_names_the_network_redirect(self, text, requested_path):
+        # A company web filter answered for Hands (real report): the user is
+        # told which request the network redirected, with the HTTP status and
+        # the redirect target, both in full (product decision, artin
+        # 2026-10-08: the exact URL identifies the filter), and which hosts
+        # to allow; never a bare "run it again", which can only fail the
+        # same way.
+        requested = self.server.base + requested_path
+        target = self.server.interception_url(requested_path)
+        self.assertIn(f"he network redirected the request for {requested} (HTTP 302) to {target}; "
+            "a company firewall or proxy may be blocking 127.0.0.1. "
+            "Ask your network administrator to allow 127.0.0.1 and *.r2.cloudflarestorage.com, then run the same", text)
+
+    def requested(self, prefix):
+        return next(p for p in self.server.requests if p.startswith(prefix))
+
+    INTERCEPTIONS = {"filter": "/proxycontrolwarn/httpwarning_3318.html", "signed": "/r2bucket/object"}
+
+    def test_network_redirect_off_hands_is_named_before_any_download(self):
+        for kind, path in self.INTERCEPTIONS.items():
+            with self.subTest(kind=kind):
+                self.server.intercepted = kind
+                self.server.requests.clear()
+                machine = self.machine()
+                failed = machine.json(["install"], expected=1)
+                self.assert_failure_contract(failed)
+                self.assertEqual(failed["code"], "release_resolution_failed")
+                check = self.requested("/public/v2/apps/raft-computer-cli/updates/check?")
+                self.assert_names_the_network_redirect(failed["line"], check)
+                self.assertEqual(failed["receipt"]["line"], failed["line"])
+                self.assertNotIn("Run the same install command again", failed["line"])
+                self.assertFalse(machine.binary.exists())
+                # The release request is not followed onto the other host.
+                self.assertFalse(any(path in p for p in self.server.requests), self.server.requests)
+                plain = machine.run(["install"])
+                self.assertEqual(plain.returncode, 1, plain.stdout + plain.stderr)
+                self.assert_names_the_network_redirect(plain.stdout, check)
+                self.assertEqual(runtime_offenders(plain.stdout + plain.stderr), [])
+
+    def test_bootstrap_names_a_network_redirect_off_hands(self):
+        for kind, path in self.INTERCEPTIONS.items():
+            with self.subTest(kind=kind):
+                self.server.intercepted = kind
+                self.server.requests.clear()
+                machine = self.machine()
+                result = machine.run([], bootstrap=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assert_names_the_network_redirect(result.stderr, "/dl/raft-computer-installer/main/" + TARGET)
+                self.assertNotIn("invalid installation release redirect", result.stderr)
+                self.assertFalse(machine.binary.exists())
+                self.assertFalse(any("sha256sums" in p or path in p for p in self.server.requests), self.server.requests)
+
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_reports_transfer_failures_in_its_own_words(self):
+        # curl reports some failures (a "[" in the URL: "bad range
+        # specification") in its own words, before any network request. The
+        # entry script prints its own message with the full URL instead, on
+        # the Hands channel path and on the explicit static mirror path alike.
+        host = self.server.base.split("://", 1)[1]
+        bad = f"http://synthetic-user:synthetic-password@{host}/dl?token=synthetic-token["
+        for name, url in (("RAFT_COMPUTER_INSTALLER_DL_BASE", bad + "/main/" + TARGET),
+                          ("RAFT_COMPUTER_INSTALLER_RELEASE_BASE", bad + "/SHA256SUMS")):
+            with self.subTest(base=name):
+                machine = self.machine()
+                result = machine.run([], extra={name: bad}, bootstrap=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Could not start the installation:", result.stderr)
+                self.assertIn(url, result.stderr)
+                self.assertNotIn("curl:", result.stderr)
+                self.assertNotIn("bad range", result.stderr)
+                self.assertFalse(machine.binary.exists())
+
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_reports_the_binary_download_failure_when_checksums_succeed(self):
+        # The checksum list downloads; only the installer binary is refused
+        # (HTTP 403). The progress download runs in the background under
+        # set -e: its curl status must still be captured and reported as an
+        # HTTP error, not as an unreadable status file.
+        self.server.refuse_installer_binary = True
+        machine = self.machine()
+        result = machine.run(["install", "--version", "1.0.0"], bootstrap=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("could not download the installation files from ", result.stderr)
+        self.assertIn("the server returned an HTTP error", result.stderr)
+        self.assertNotIn("exited with code", result.stderr)
+        self.assertNotIn("cannot open", result.stderr)
+        self.assertNotIn(".code", result.stderr)
+        self.assertFalse(machine.binary.exists())
+
+    def test_download_redirect_failure_names_the_requested_url(self):
+        # Downloads legitimately redirect to signed object-storage URLs. When
+        # one fails, the message names the Hands URL that was requested.
+        self.server.download_redirect = True
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertRegex(failed["line"], r"Could not download Raft Computer( support file)? from "
+            + re.escape(self.server.base + "/dl/raft-computer-cli/releases/") + r"[0-9a-f]+/" + re.escape(TARGET)
+            + r"(\?kind=photon-wasm)?: the server returned HTTP 403")
+        self.assertFalse(machine.binary.exists())
+        boot = self.machine().run([], bootstrap=True)
+        self.assertEqual(boot.returncode, 1, boot.stdout + boot.stderr)
+        self.assertIn("could not download", boot.stderr)
+        self.assertIn(self.server.base + "/dl/raft-computer-installer/releases/frozen-1/" + TARGET + "?kind=sha256sums", boot.stderr)
+        if not WINDOWS:
+            self.assertNotIn("curl:", boot.stderr)
+
+    def run_pasted(self, script, form, extra):
+        # The documented Windows command pastes the script into an
+        # interactive session (irm ... | iex, or a script block). A sentinel
+        # after it shows whether the user's session survived.
+        source = f"(Get-Content -Raw -LiteralPath '{script}')"
+        invoke = f"iex {source}" if form == "iex" else f"& ([scriptblock]::Create({source}))"
+        command = invoke + "; Write-Output ('SESSION-SURVIVED ' + $LASTEXITCODE)"
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        machine = self.machine()
+        return subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=machine.env(extra), text=True, capture_output=True, timeout=180)
+
+    @unittest.skipUnless(WINDOWS, "pasting into Windows PowerShell is the Windows entry script's contract")
+    def test_pasted_windows_entry_script_keeps_the_session_open(self):
+        self.server.intercepted = "filter"
+        for form in ("iex", "scriptblock"):
+            with self.subTest(form=form):
+                result = self.run_pasted(DIST / "install.ps1", form, {})
+                self.assertIn("the network redirected", result.stderr, result.stdout + result.stderr)
+                self.assertIn("SESSION-SURVIVED 1", result.stdout, result.stdout + result.stderr)
+        # Negative control in the same run: the old unconditional `exit`
+        # ending closes the pasted session, and this check sees it.
+        text = (DIST / "install.ps1").read_text(encoding="utf-8")
+        ending = "if ($runAsFile) { exit $code }\n$global:LASTEXITCODE = $code\n"
+        self.assertIn(ending, text.replace("\r\n", "\n"))
+        planted = Path(self.machine().home) / "install-planted-exit.ps1"
+        planted.write_text(text.replace("\r\n", "\n").replace(ending, "exit $code\n"), encoding="utf-8")
+        for form in ("iex", "scriptblock"):
+            with self.subTest(form=form, control="planted exit"):
+                result = self.run_pasted(planted, form, {})
+                self.assertIn("the network redirected", result.stderr, result.stdout + result.stderr)
+                self.assertNotIn("SESSION-SURVIVED", result.stdout)
+        # Run as a file, the code is still the process exit code.
+        result = self.machine().run([], bootstrap=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_release_resolution_failure_says_why(self):
+        self.server.html_authority = True
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["code"], "release_resolution_failed")
+        self.assertIn("returned an HTML page instead of the release document", failed["line"])
+        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?product_type=cli-binary&", failed["line"])
+        self.assertIn("&channel=main returned an HTML page", failed["line"])
+        self.assertTrue(failed["line"].endswith("Run the same install command again."), failed["line"])
+        self.server.html_authority = False
+        missing = machine.json(["install", "--version", "9.9.9"], expected=1)
+        self.assert_failure_contract(missing)
+        self.assertIn("&version=9.9.9 returned HTTP 404", missing["line"])
+
+    def test_download_failure_says_why(self):
+        # Bytes that do not match the release (a filter's HTML page, a cut
+        # transfer) are named with the download URL, not a bare retry line.
+        self.server.authority_lies.add("1.1.0")
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertIn("Could not download Raft Computer from " + self.server.base + "/dl/raft-computer-cli/releases/", failed["line"])
+        self.assertIn("does not match the published release", failed["line"])
+        self.assertIn("company firewall or proxy", failed["line"])
+        self.assertTrue(failed["line"].endswith("Nothing was changed. Run the same install command again."), failed["line"])
+        self.assertEqual(runtime_offenders(failed["line"]), [])
         self.assertFalse(machine.binary.exists())
 
     def test_invalid_channel_is_rejected_without_release_downloads(self):

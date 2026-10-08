@@ -1,5 +1,6 @@
 import gzip
 """Real native processes, isolated homes, loopback release authority and CDN."""
+import base64
 import hashlib
 import http.server
 import json
@@ -76,6 +77,16 @@ class ReleaseServer:
         self.missing_checksums = False
         self.channel_resolutions = 0
         self.mutable_redirect = False
+        # A company web filter answering for Hands: every Hands request is
+        # redirected to a warning page on another host (real report shape).
+        # "filter" carries userinfo, a token and a fragment; "signed" is an
+        # object-storage signed URL. Both must be printed in full.
+        self.intercepted = False
+        # Release downloads redirect to a signed URL that refuses them.
+        self.download_redirect = False
+        # The checksum list downloads; only the installer binary is refused.
+        self.refuse_installer_binary = False
+        self.html_authority = False
         self.machines = []
         self.sidecar = b"isolated native fixture wasm\n"
         self.installer = DIST / "native" / TARGET / ("raft-computer-installer" + SUFFIX)
@@ -128,6 +139,38 @@ class ReleaseServer:
         self.request_times.append((handler.path, time.monotonic()))
         status, body = 200, b""
         parts = path.strip("/").split("/")
+        if path == "/proxycontrolwarn/httpwarning_3318.html":
+            body = b"<html><body>This site is blocked by your network policy.</body></html>"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+        if path == "/r2bucket/object":
+            handler.send_response(403)
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return
+        if self.download_redirect and path.startswith(("/dl/raft-computer-cli/releases/", "/dl/raft-computer-installer/releases/")):
+            handler.send_response(302)
+            handler.send_header("Location", f"http://user:SECRETPW@127.0.0.1:{self.server.server_port}/r2bucket/object"
+                "?X-Amz-Credential=SECRETCRED&X-Amz-Signature=SECRETSIG&token=SECRET123#SECRETFRAG")
+            handler.end_headers()
+            return
+        if self.intercepted and not path.startswith("/installer/"):
+            handler.send_response(302)
+            handler.send_header("Location", self.interception_url(handler.path))
+            handler.end_headers()
+            return
+        if self.html_authority and path == "/public/v2/apps/raft-computer-cli/updates/check":
+            body = b"<!DOCTYPE html><html><body>Sign in to continue</body></html>"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
         if path == "/public/v2/apps/raft-computer-cli/updates/check":
             version = query.get("version", [self.channels.get(query.get("channel", ["main"])[0])])[0]
             if version not in self.releases:
@@ -182,6 +225,8 @@ class ReleaseServer:
                 time.sleep(self.slow_checksums)
                 relative = f"native/{TARGET}/raft-computer-installer{SUFFIX}"
                 body = b"" if self.missing_checksums else f"{sha(self.installer_bytes)}  {relative}\n".encode()
+            elif self.refuse_installer_binary:
+                status, body = 403, b""
             else:
                 body = self.installer_bytes + (b"tampered" if self.tamper_installer else b"")
         else:
@@ -193,6 +238,15 @@ class ReleaseServer:
             handler.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def interception_url(self, original):
+        if self.intercepted == "signed":
+            return f"http://localhost:{self.server.server_port}/r2bucket/object?X-Amz-Credential=SECRETCRED&X-Amz-Signature=SECRETSIG"
+        return (f"http://user:SECRETPW@localhost:{self.server.server_port}/proxycontrolwarn/httpwarning_3318.html"
+            f"?token=SECRET123&ori_url={self.interception_ori(original)}&uid=0#SECRETFRAG")
+
+    def interception_ori(self, original):
+        return base64.b64encode((self.base + original).encode()).decode()
 
     def proxy(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.handler)

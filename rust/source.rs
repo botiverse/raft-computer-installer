@@ -130,6 +130,58 @@ fn append(base: &Url, parts: &[&str]) -> Result<Url> {
     Ok(url)
 }
 
+/// Every release-resolution error below is user-facing: the operation prints
+/// it as the reason the release could not be resolved. A network redirect off
+/// the Hands host starts with this text so the operation can give network
+/// advice instead of a bare retry.
+const NETWORK_REDIRECT: &str = "The network redirected ";
+/// User-facing text bounds the URLs it names; a reply line holds 2048 bytes.
+const SHOWN_URL_LIMIT: usize = 768;
+
+pub fn is_network_redirect(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Invalid(message) if message.starts_with(NETWORK_REDIRECT))
+}
+
+/// A URL as shown to the user: in full, userinfo, query and fragment
+/// included. URLs are printed in full by product decision (artin,
+/// 2026-10-08): the exact URL is what identifies the network filter or
+/// mirror that answered. Only the length is bounded (a reply line holds 2048
+/// bytes).
+pub fn shown_url(url: &Url) -> String {
+    let mut shown = String::from(url.as_str());
+    if shown.len() > SHOWN_URL_LIMIT {
+        let mut end = SHOWN_URL_LIMIT;
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        shown.truncate(end);
+        shown.push_str("...");
+    }
+    shown
+}
+
+fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) -> crate::Error {
+    let hands = origin.host_str().unwrap_or_default();
+    invalid(format!(
+        "{NETWORK_REDIRECT}the request for {} (HTTP {status}) to {}; a company firewall or proxy may be blocking {hands}. Ask your network administrator to allow {hands} and *.r2.cloudflarestorage.com, then run the same install command again.",
+        shown_url(requested),
+        shown_url(target),
+    ))
+}
+
+fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
+    let cause = if error.is_timeout() {
+        "the request timed out"
+    } else if error.is_connect() {
+        "the connection failed"
+    } else if error.is_redirect() {
+        "it redirected too many times"
+    } else {
+        "the request failed"
+    };
+    invalid(format!("could not reach {}: {cause}", shown_url(url)))
+}
+
 impl Source {
     pub fn new(cfg: &Config) -> Result<Self> {
         if cfg.hands_app.is_empty()
@@ -140,13 +192,26 @@ impl Source {
         {
             return Err(invalid("invalid release authority app"));
         }
+        let hands_origin = base_url(&cfg.hands_origin)?;
+        let hands_host = hands_origin.host_str().map(str::to_owned);
         Ok(Self {
             // Keep reqwest's environment proxy support for every source request.
+            // A redirect off the Hands host is never followed: release
+            // selection only comes from Hands, and a network filter that
+            // answers for Hands is reported by its exact redirect instead.
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::limited(5))
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.url().host_str() != hands_host.as_deref() {
+                        attempt.stop()
+                    } else if attempt.previous().len() > 5 {
+                        attempt.error("too many redirects")
+                    } else {
+                        attempt.follow()
+                    }
+                }))
                 .build()?,
-            hands_origin: base_url(&cfg.hands_origin)?,
+            hands_origin,
             hands_app: cfg.hands_app.clone(),
         })
     }
@@ -156,28 +221,79 @@ impl Source {
         // bounds responses that omit or lie about Content-Length.
         let mut response = self
             .client
-            .get(url)
+            .get(url.clone())
             .send()
             .await
-            .map_err(|_| invalid("release source unreachable"))?;
+            .map_err(|error| unreachable(&url, &error))?;
+        let status = response.status().as_u16();
+        let final_url = response.url().clone();
+        if response.status().is_redirection() {
+            let target = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| final_url.join(value).ok());
+            return Err(match target {
+                Some(target) if target.host_str() != self.hands_origin.host_str() => {
+                    network_redirect(&self.hands_origin, &final_url, status, &target)
+                }
+                Some(target) => invalid(format!(
+                    "{} returned HTTP {status} to {}",
+                    shown_url(&final_url),
+                    shown_url(&target)
+                )),
+                None => invalid(format!(
+                    "{} returned HTTP {status} without a valid redirect target",
+                    shown_url(&final_url)
+                )),
+            });
+        }
+        if final_url.host_str() != self.hands_origin.host_str() {
+            return Err(network_redirect(
+                &self.hands_origin,
+                &url,
+                status,
+                &final_url,
+            ));
+        }
         if !response.status().is_success() {
             return Err(invalid(format!(
-                "release source returned HTTP {}",
-                response.status().as_u16()
+                "{} returned HTTP {status}",
+                shown_url(&final_url)
             )));
         }
+        let html = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("html"));
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| invalid("release source read failed"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            invalid(format!(
+                "reading the release document from {} failed",
+                shown_url(&final_url)
+            ))
+        })? {
             if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
-                return Err(invalid("release document too large"));
+                return Err(invalid(format!(
+                    "{} returned a release document that is too large",
+                    shown_url(&final_url)
+                )));
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid release document"))
+        serde_json::from_slice(&bytes).map_err(|_| {
+            let html = html || bytes.trim_ascii_start().starts_with(b"<");
+            invalid(format!(
+                "{} returned {} instead of the release document",
+                shown_url(&final_url),
+                if html {
+                    "an HTML page"
+                } else {
+                    "unreadable data"
+                }
+            ))
+        })
     }
 
     pub async fn manifest(&self, requested: &str) -> Result<Manifest> {
@@ -312,5 +428,45 @@ impl ReleaseSource for Source {
             return Err(invalid("runner platform mismatch"));
         }
         Ok(self.manifest(requested).await?.release)
+    }
+}
+
+#[cfg(test)]
+mod shown_url_tests {
+    use super::*;
+
+    #[test]
+    fn shown_urls_are_printed_in_full() {
+        for raw in [
+            "https://acct.r2.cloudflarestorage.com/bucket/raft-computer?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=sig",
+            "http://user:pw@114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?token=t&ori_url=aHR0cHM6Ly9oYW5kcy5idWlsZA==&uid=0#frag",
+            "https://hands.build/dl/a/releases/x/linux-x64?kind=sha256sums",
+        ] {
+            assert_eq!(shown_url(&Url::parse(raw).unwrap()), raw);
+        }
+        let long = Url::parse(&format!("https://h/{}", "a".repeat(2000))).unwrap();
+        assert_eq!(shown_url(&long).len(), SHOWN_URL_LIMIT + 3);
+    }
+
+    #[test]
+    fn network_redirect_names_the_request_and_the_full_target() {
+        let origin = Url::parse("https://hands.build").unwrap();
+        let requested = Url::parse(
+            "https://hands.build/public/v2/apps/raft-computer-cli/updates/check?platform=win32",
+        )
+        .unwrap();
+        let target = Url::parse(
+            "http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?ori_url=eA==&uid=0",
+        )
+        .unwrap();
+        let error = network_redirect(&origin, &requested, 302, &target);
+        assert!(is_network_redirect(&error));
+        assert_eq!(
+            error.to_string(),
+            "The network redirected the request for https://hands.build/public/v2/apps/raft-computer-cli/updates/check?platform=win32 (HTTP 302) to http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?ori_url=eA==&uid=0; a company firewall or proxy may be blocking hands.build. Ask your network administrator to allow hands.build and *.r2.cloudflarestorage.com, then run the same install command again."
+        );
+        assert!(!is_network_redirect(&invalid(
+            "release source returned HTTP 404"
+        )));
     }
 }

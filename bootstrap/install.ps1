@@ -1,4 +1,8 @@
 # One native executable; resolve a channel once, then fetch only that release.
+# Pasted as `irm ... | iex` this runs in the user's own session: preferences
+# changed here are restored at the end, and the script never exits that
+# session (see the end of this file).
+$savedErrorAction = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 $savedProgress = $ProgressPreference
 $ProgressPreference = 'SilentlyContinue'
@@ -9,7 +13,11 @@ $channel = if ($env:RAFT_COMPUTER_INSTALLER_CHANNEL) { $env:RAFT_COMPUTER_INSTAL
 $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALLER_DL_BASE.TrimEnd('/') } else { 'https://hands.build/dl/raft-computer-installer' }
 $tmp = $null
 $code = 1
-function Fail($message) { throw "Could not start the installation: $message." }
+# The catch below prefixes "Could not start the installation: " once.
+# URLs are printed in full (userinfo, query and fragment included) by product
+# decision (artin, 2026-10-08): the exact URL identifies the network filter or
+# mirror that answered.
+function Fail($message) { throw "$message." }
 # Say something before the first network round trip (see install.sh).
 [Console]::Error.WriteLine('Preparing the Raft Computer installation...')
 function ProxyFor([Uri]$uri) {
@@ -33,7 +41,7 @@ function Download($url, $out, [bool]$showProgress = $false) {
   $beforeDownloadProgress = $ProgressPreference
   try {
     $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
-    Invoke-WebRequest @options
+    try { Invoke-WebRequest @options } catch { Fail ('could not download ' + $url + ': ' + $_.Exception.Message) }
   } finally {
     $ProgressPreference = $beforeDownloadProgress
   }
@@ -64,14 +72,27 @@ try {
     $probe.Timeout = 30000
     $proxy = ProxyFor ([Uri]$channelUrl)
     if ($proxy) { $probe.Proxy = New-Object Net.WebProxy($proxy) }
-    $response = $probe.GetResponse()
+    try { $response = $probe.GetResponse() } catch {
+      # 4xx/5xx arrive as a WebException that still carries the response.
+      $webError = $_.Exception
+      while ($webError -and -not ($webError -is [Net.WebException])) { $webError = $webError.InnerException }
+      if (-not $webError -or -not $webError.Response) { Fail "could not reach ${channelUrl}: $($_.Exception.Message)" }
+      $response = $webError.Response
+    }
     try {
+      $status = [int]$response.StatusCode
       $location = [string]$response.Headers['Location']
-      if (-not $location) { Fail 'the installation channel did not name an immutable release' }
-      $release = New-Object Uri([Uri]$channelUrl, $location)
     } finally { $response.Close() }
-    if ($release.Scheme -notin @('http', 'https') -or $release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail 'invalid installation release redirect' }
-    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail 'installation release redirect did not freeze a release' }
+    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $channelUrl)" }
+    $release = New-Object Uri([Uri]$channelUrl, $location)
+    $redirect = "HTTP $status to " + $release.AbsoluteUri
+    if ($release.Scheme -notin @('http', 'https')) { Fail "invalid installation release redirect ($redirect)" }
+    # A redirect off the Hands host is a network (often a company web filter)
+    # answering for Hands. Say so with the exact redirect: a retry cannot help.
+    $handsHost = ([Uri]$channelUrl).Host
+    if ($release.Host -ne $handsHost) { Fail "the network redirected the request for $channelUrl (HTTP $status) to $($release.AbsoluteUri); a company firewall or proxy may be blocking $handsHost. Ask your network administrator to allow $handsHost and *.r2.cloudflarestorage.com, then run the same command again" }
+    if ($release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail "invalid installation release redirect ($redirect)" }
+    if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail "installation release redirect did not freeze a release ($redirect)" }
     $releaseUrl = $release.AbsoluteUri
     $sumsUrl = "${releaseUrl}?kind=sha256sums"
     $binaryUrl = $releaseUrl
@@ -116,5 +137,15 @@ try {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   $ProgressPreference = $savedProgress
   $env:PSModulePath = $savedModulePath
+  $ErrorActionPreference = $savedErrorAction
 }
-exit $code
+# Run as a file (powershell -File install.ps1, or & .\install.ps1) the code
+# is the process exit code, as automation expects. Pasted as
+# `irm ... | iex` or run as `& ([scriptblock]::Create((irm ...)))` there is no
+# script file, and exit would end the user's PowerShell session: the window
+# closes and the message above vanishes with it. Report the code the way a
+# native command does instead; nothing follows in this script.
+$runAsFile = $false
+try { $runAsFile = [bool]$PSCommandPath } catch { }
+if ($runAsFile) { exit $code }
+$global:LASTEXITCODE = $code
