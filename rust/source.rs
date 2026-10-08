@@ -142,24 +142,13 @@ pub fn is_network_redirect(error: &crate::Error) -> bool {
     matches!(error, crate::Error::Invalid(message) if message.starts_with(NETWORK_REDIRECT))
 }
 
-/// Marks an omitted query or fragment without naming any part of it.
-pub const OMITTED: &str = "?...";
-
-/// A URL as shown to the user: scheme, host, port and path only. Userinfo,
-/// query and fragment may carry credentials or signatures (a filter's token,
-/// an object-storage signature), so they are never shown; a fixed marker
-/// says that something was omitted.
+/// A URL as shown to the user: in full, userinfo, query and fragment
+/// included. URLs are printed in full by product decision (artin,
+/// 2026-10-08): the exact URL is what identifies the network filter or
+/// mirror that answered. Only the length is bounded (a reply line holds 2048
+/// bytes).
 pub fn shown_url(url: &Url) -> String {
-    let omitted = url.query().is_some() || url.fragment().is_some();
-    let mut url = url.clone();
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
-    let mut shown = String::from(url);
-    if omitted {
-        shown.push_str(OMITTED);
-    }
+    let mut shown = String::from(url.as_str());
     if shown.len() > SHOWN_URL_LIMIT {
         let mut end = SHOWN_URL_LIMIT;
         while !shown.is_char_boundary(end) {
@@ -171,11 +160,11 @@ pub fn shown_url(url: &Url) -> String {
     shown
 }
 
-fn network_redirect(origin: &Url, status: u16, target: &Url) -> crate::Error {
+fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) -> crate::Error {
     let hands = origin.host_str().unwrap_or_default();
     invalid(format!(
-        "{NETWORK_REDIRECT}{hands} to {} (HTTP {status} to {}); a company firewall or proxy may be blocking it. Ask your network administrator to allow {hands} and *.r2.cloudflarestorage.com, then run the same install command again.",
-        target.host_str().unwrap_or_default(),
+        "{NETWORK_REDIRECT}the request for {} (HTTP {status}) to {}; a company firewall or proxy may be blocking {hands}. Ask your network administrator to allow {hands} and *.r2.cloudflarestorage.com, then run the same install command again.",
+        shown_url(requested),
         shown_url(target),
     ))
 }
@@ -246,7 +235,7 @@ impl Source {
                 .and_then(|value| final_url.join(value).ok());
             return Err(match target {
                 Some(target) if target.host_str() != self.hands_origin.host_str() => {
-                    network_redirect(&self.hands_origin, status, &target)
+                    network_redirect(&self.hands_origin, &final_url, status, &target)
                 }
                 Some(target) => invalid(format!(
                     "{} returned HTTP {status} to {}",
@@ -260,7 +249,12 @@ impl Source {
             });
         }
         if final_url.host_str() != self.hands_origin.host_str() {
-            return Err(network_redirect(&self.hands_origin, status, &final_url));
+            return Err(network_redirect(
+                &self.hands_origin,
+                &url,
+                status,
+                &final_url,
+            ));
         }
         if !response.status().is_success() {
             return Err(invalid(format!(
@@ -442,45 +436,34 @@ mod shown_url_tests {
     use super::*;
 
     #[test]
-    fn shown_urls_carry_no_credentials_query_or_fragment() {
-        for (raw, shown) in [
-            (
-                "https://acct.r2.cloudflarestorage.com/bucket/raft-computer?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=SECRETSIG",
-                "https://acct.r2.cloudflarestorage.com/bucket/raft-computer?...",
-            ),
-            (
-                "http://user:SECRETPW@114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?token=SECRET123&ori_url=aHR0cHM6Ly9oYW5kcy5idWlsZA==&uid=0#SECRETFRAG",
-                "http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?...",
-            ),
-            (
-                "https://example.com/path#SECRETFRAG",
-                "https://example.com/path?...",
-            ),
-            (
-                "https://user:SECRETPW@example.com/path",
-                "https://example.com/path",
-            ),
-            (
-                "https://hands.build/dl/a/releases/x/linux-x64",
-                "https://hands.build/dl/a/releases/x/linux-x64",
-            ),
+    fn shown_urls_are_printed_in_full() {
+        for raw in [
+            "https://acct.r2.cloudflarestorage.com/bucket/raft-computer?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=sig",
+            "http://user:pw@114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?token=t&ori_url=aHR0cHM6Ly9oYW5kcy5idWlsZA==&uid=0#frag",
+            "https://hands.build/dl/a/releases/x/linux-x64?kind=sha256sums",
         ] {
-            assert_eq!(shown_url(&Url::parse(raw).unwrap()), shown, "{raw}");
+            assert_eq!(shown_url(&Url::parse(raw).unwrap()), raw);
         }
+        let long = Url::parse(&format!("https://h/{}", "a".repeat(2000))).unwrap();
+        assert_eq!(shown_url(&long).len(), SHOWN_URL_LIMIT + 3);
     }
 
     #[test]
-    fn network_redirect_names_both_hosts_and_the_exact_target() {
+    fn network_redirect_names_the_request_and_the_full_target() {
         let origin = Url::parse("https://hands.build").unwrap();
-        let target = Url::parse(
-            "http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?token=SECRET123&ori_url=eA==&uid=0",
+        let requested = Url::parse(
+            "https://hands.build/public/v2/apps/raft-computer-cli/updates/check?platform=win32",
         )
         .unwrap();
-        let error = network_redirect(&origin, 302, &target);
+        let target = Url::parse(
+            "http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?ori_url=eA==&uid=0",
+        )
+        .unwrap();
+        let error = network_redirect(&origin, &requested, 302, &target);
         assert!(is_network_redirect(&error));
         assert_eq!(
             error.to_string(),
-            "The network redirected hands.build to 114.114.114.114 (HTTP 302 to http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?...); a company firewall or proxy may be blocking it. Ask your network administrator to allow hands.build and *.r2.cloudflarestorage.com, then run the same install command again."
+            "The network redirected the request for https://hands.build/public/v2/apps/raft-computer-cli/updates/check?platform=win32 (HTTP 302) to http://114.114.114.114:9421/proxycontrolwarn/httpwarning_3318.html?ori_url=eA==&uid=0; a company firewall or proxy may be blocking hands.build. Ask your network administrator to allow hands.build and *.r2.cloudflarestorage.com, then run the same install command again."
         );
         assert!(!is_network_redirect(&invalid(
             "release source returned HTTP 404"

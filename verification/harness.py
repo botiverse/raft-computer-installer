@@ -26,9 +26,6 @@ TARGET = target_key()
 DIST = Path(os.environ.get("RCI_DIST", ROOT / "dist")).resolve()
 TEMPLATE_TEXT = b'{"version":"0.0.0","marker":"RAFT_NATIVE_FIXTURE_CONFIGURATION_V1"}'
 TEMPLATE = TEMPLATE_TEXT + b"\0" * (512 - len(TEMPLATE_TEXT))
-# Synthetic secrets carried by redirect targets (userinfo, query values,
-# fragment, object-storage signature). None may reach printed output.
-URL_SECRETS = ("SECRETPW", "SECRET123", "SECRETFRAG", "SECRETSIG", "SECRETCRED")
 
 
 def sha(data):
@@ -82,8 +79,8 @@ class ReleaseServer:
         self.mutable_redirect = False
         # A company web filter answering for Hands: every Hands request is
         # redirected to a warning page on another host (real report shape).
-        # "filter" carries credentials, a token and a fragment; "signed" is an
-        # object-storage signed URL.
+        # "filter" carries userinfo, a token and a fragment; "signed" is an
+        # object-storage signed URL. Both must be printed in full.
         self.intercepted = False
         # Release downloads redirect to a signed URL that refuses them.
         self.download_redirect = False

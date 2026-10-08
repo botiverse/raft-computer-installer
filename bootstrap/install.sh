@@ -14,22 +14,9 @@ err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
 # Host of an absolute URL, lowercased, without credentials or port.
 host_of() { printf '%s\n' "$1" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?\#].*$##; s#^.*@##; s#:[0-9]*$##' | tr 'A-Z' 'a-z'; }
-# A URL as shown to the user: scheme, host, port and path only. Userinfo,
-# query and fragment may carry credentials or signatures, so they are never
-# shown; "?..." marks that something was omitted.
-shown() {
-  shown_prefix=; shown_rest=$1
-  case "$1" in
-    //*) shown_prefix=//; shown_rest=${1#//} ;;
-    *://*) case "${1%%://*}" in [A-Za-z]*) case "${1%%://*}" in *[!A-Za-z0-9+.-]*) ;; *) shown_prefix=${1%%://*}://; shown_rest=${1#*://} ;; esac ;; esac ;;
-  esac
-  shown_authority=${shown_rest%%[/?#]*}
-  shown_tail=${shown_rest#"$shown_authority"}
-  shown_authority=${shown_authority##*@}
-  shown_path=${shown_tail%%[?#]*}
-  shown_marker=; [ "$shown_path" = "$shown_tail" ] || shown_marker='?...'
-  printf '%s' "$shown_prefix$shown_authority$shown_path$shown_marker"
-}
+# URLs are printed in full (userinfo, query and fragment included) by product
+# decision (artin, 2026-10-08): the exact URL identifies the network filter
+# or mirror that answered.
 # A fixed description of a transfer tool's exit code.
 transfer_failure() {
   case "$transfer:$1" in
@@ -49,7 +36,7 @@ need awk
 # The transfer tool's own messages never reach the terminal: curl and wget
 # echo the URL they were given (credentials and query included) in some of
 # their errors. Failures are reported from the exit code instead
-# (transfer_failure), with every URL shown through shown().
+# (transfer_failure), with the URL printed by this script.
 if command -v curl >/dev/null 2>&1; then
   transfer=curl
   dl_quiet() { curl -fsL --globoff --connect-timeout 30 --max-time 180 "$1" -o "$2" 2>/dev/null; }
@@ -101,22 +88,22 @@ else
   hop=$(location "$channel_url") || hop_code=$?
   status=$(printf '%s\n' "$hop" | awk '{print $1}')
   release_url=$(printf '%s\n' "$hop" | awk '{print $2}')
-  case "$status" in ''|000) err "could not reach $(shown "$channel_url"): $(transfer_failure "$hop_code")" ;; esac
-  [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $(shown "$channel_url"))"
+  case "$status" in ''|000) err "could not reach $channel_url: $(transfer_failure "$hop_code")" ;; esac
+  [ -n "$release_url" ] || err "no installation release resolves for $target (HTTP $status from $channel_url)"
   origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')
   case "$release_url" in
-    //*) err "invalid installation release redirect (HTTP $status to $(shown "$release_url"))" ;;
+    //*) err "invalid installation release redirect (HTTP $status to $release_url)" ;;
     /*) release_url="$origin$release_url" ;;
   esac
-  case "$release_url" in http://*|https://*) ;; *) err "invalid installation release URL (HTTP $status to $(shown "$release_url"))" ;; esac
+  case "$release_url" in http://*|https://*) ;; *) err "invalid installation release URL (HTTP $status to $release_url)" ;; esac
   # A redirect off the Hands host is a network (often a company web filter)
   # answering for Hands. Say so with the exact redirect: a retry cannot help.
   hands_host=$(host_of "$base")
   redirect_host=$(host_of "$release_url")
   if [ "$redirect_host" != "$hands_host" ]; then
-    err "the network redirected $hands_host to $redirect_host (HTTP $status to $(shown "$release_url")); a company firewall or proxy may be blocking it. Ask your network administrator to allow $hands_host and *.r2.cloudflarestorage.com, then run the same command again"
+    err "the network redirected the request for $channel_url (HTTP $status) to $release_url; a company firewall or proxy may be blocking $hands_host. Ask your network administrator to allow $hands_host and *.r2.cloudflarestorage.com, then run the same command again"
   fi
-  redirect="HTTP $status to $(shown "$release_url")"
+  redirect="HTTP $status to $release_url"
   case "$release_url" in *\?*|*\#*) err "installation release redirect must not contain a query or fragment ($redirect)" ;; esac
   case "$release_url" in */releases/*/"$target") ;; *) err "installation release redirect did not freeze a release ($redirect)" ;; esac
   release_prefix=${release_url%/"$target"}
@@ -132,13 +119,13 @@ printf 'Downloading the installation files...\n' >&2
 dl_progress "$binary_url" "$tmp/installer" & download_pid=$!
 sums_code=0
 dl_quiet "$sums_url" "$tmp/SHA256SUMS" || sums_code=$?
-[ "$sums_code" -eq 0 ] || err "could not download installation checksums from $(shown "$sums_url"): $(transfer_failure "$sums_code")"
+[ "$sums_code" -eq 0 ] || err "could not download installation checksums from $sums_url: $(transfer_failure "$sums_code")"
 expected=$(awk -v f="$native" '$2==f {n++; hash=$1} END {if(n==1) print tolower(hash)}' "$tmp/SHA256SUMS")
 [ "${#expected}" -eq 64 ] || err "checksums must name exactly one matching installation file"
 case "$expected" in *[!0-9a-f]*) err "invalid installation checksum" ;; esac
 binary_code=0
 wait "$download_pid" || binary_code=$?
-[ "$binary_code" -eq 0 ] || err "could not download the installation files from $(shown "$binary_url"): $(transfer_failure "$binary_code")"
+[ "$binary_code" -eq 0 ] || err "could not download the installation files from $binary_url: $(transfer_failure "$binary_code")"
 download_pid=
 [ "$(sha "$tmp/installer")" = "$expected" ] || err "installation download does not match its published checksum"
 chmod 0755 "$tmp/installer"

@@ -11,7 +11,7 @@ import time
 import unittest
 import urllib.parse
 
-from harness import DIST, SUFFIX, TARGET, URL_SECRETS, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
+from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
 from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
@@ -1136,23 +1136,21 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["world"]["kind"], "fresh")
         self.assertFalse(machine.binary.exists())
 
-    def assert_no_url_secrets(self, text):
-        for secret in (*URL_SECRETS, "user:", "ori_url", "X-Amz", "token="):
-            self.assertNotIn(secret, text)
-        self.assertNotIn("ori_url=", text)
-
-    def assert_names_the_network_redirect(self, text, path):
+    def assert_names_the_network_redirect(self, text, requested_path):
         # A company web filter answered for Hands (real report): the user is
-        # told that the network redirected Hands elsewhere, with the HTTP
-        # status, the target's host and path (never its credentials, query
-        # or fragment), and which hosts to allow; never a bare "run it
-        # again", which can only fail the same way.
-        self.assertIn("redirected 127.0.0.1 to localhost", text)
-        self.assertIn("HTTP 302", text)
-        self.assertRegex(text, r"HTTP 302 to http://localhost:\d+" + re.escape(path) + r"\?\.\.\.\)")
-        self.assertIn("company firewall or proxy", text)
-        self.assertIn("allow 127.0.0.1 and *.r2.cloudflarestorage.com", text)
-        self.assert_no_url_secrets(text)
+        # told which request the network redirected, with the HTTP status and
+        # the redirect target, both in full (product decision, artin
+        # 2026-10-08: the exact URL identifies the filter), and which hosts
+        # to allow; never a bare "run it again", which can only fail the
+        # same way.
+        requested = self.server.base + requested_path
+        target = self.server.interception_url(requested_path)
+        self.assertIn(f"he network redirected the request for {requested} (HTTP 302) to {target}; "
+            "a company firewall or proxy may be blocking 127.0.0.1. "
+            "Ask your network administrator to allow 127.0.0.1 and *.r2.cloudflarestorage.com, then run the same", text)
+
+    def requested(self, prefix):
+        return next(p for p in self.server.requests if p.startswith(prefix))
 
     INTERCEPTIONS = {"filter": "/proxycontrolwarn/httpwarning_3318.html", "signed": "/r2bucket/object"}
 
@@ -1162,22 +1160,19 @@ class InstallerContract(unittest.TestCase):
                 self.server.intercepted = kind
                 self.server.requests.clear()
                 machine = self.machine()
-                result = machine.run(["install", "--json"])
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                failed = json.loads(result.stdout)
+                failed = machine.json(["install"], expected=1)
                 self.assert_failure_contract(failed)
                 self.assertEqual(failed["code"], "release_resolution_failed")
-                self.assert_names_the_network_redirect(failed["line"], path)
-                self.assert_no_url_secrets(result.stdout + result.stderr)
-                self.assert_no_url_secrets(json.dumps(failed["receipt"]))
+                check = self.requested("/public/v2/apps/raft-computer-cli/updates/check?")
+                self.assert_names_the_network_redirect(failed["line"], check)
+                self.assertEqual(failed["receipt"]["line"], failed["line"])
                 self.assertNotIn("Run the same install command again", failed["line"])
                 self.assertFalse(machine.binary.exists())
                 # The release request is not followed onto the other host.
                 self.assertFalse(any(path in p for p in self.server.requests), self.server.requests)
                 plain = machine.run(["install"])
                 self.assertEqual(plain.returncode, 1, plain.stdout + plain.stderr)
-                self.assert_names_the_network_redirect(plain.stdout, path)
-                self.assert_no_url_secrets(plain.stdout + plain.stderr)
+                self.assert_names_the_network_redirect(plain.stdout, check)
                 self.assertEqual(runtime_offenders(plain.stdout + plain.stderr), [])
 
     def test_bootstrap_names_a_network_redirect_off_hands(self):
@@ -1188,50 +1183,48 @@ class InstallerContract(unittest.TestCase):
                 machine = self.machine()
                 result = machine.run([], bootstrap=True)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assert_names_the_network_redirect(result.stderr, path)
-                self.assert_no_url_secrets(result.stdout + result.stderr)
+                self.assert_names_the_network_redirect(result.stderr, "/dl/raft-computer-installer/main/" + TARGET)
                 self.assertNotIn("invalid installation release redirect", result.stderr)
                 self.assertFalse(machine.binary.exists())
                 self.assertFalse(any("sha256sums" in p or path in p for p in self.server.requests), self.server.requests)
 
     @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
-    def test_bootstrap_transfer_tool_errors_never_print_url_secrets(self):
+    def test_bootstrap_reports_transfer_failures_in_its_own_words(self):
         # curl reports some failures (a "[" in the URL: "bad range
-        # specification") with the URL it was given, before any network
-        # request. The entry script must not pass that through, on the Hands
-        # channel path and on the explicit static mirror path alike.
+        # specification") in its own words, before any network request. The
+        # entry script prints its own message with the full URL instead, on
+        # the Hands channel path and on the explicit static mirror path alike.
         host = self.server.base.split("://", 1)[1]
         bad = f"http://synthetic-user:synthetic-password@{host}/dl?token=synthetic-token["
-        for name in ("RAFT_COMPUTER_INSTALLER_DL_BASE", "RAFT_COMPUTER_INSTALLER_RELEASE_BASE"):
+        for name, url in (("RAFT_COMPUTER_INSTALLER_DL_BASE", bad + "/main/" + TARGET),
+                          ("RAFT_COMPUTER_INSTALLER_RELEASE_BASE", bad + "/SHA256SUMS")):
             with self.subTest(base=name):
                 machine = self.machine()
                 result = machine.run([], extra={name: bad}, bootstrap=True)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("Could not start the installation:", result.stderr)
-                for secret in ("synthetic-password", "synthetic-token", "synthetic-user"):
-                    self.assertNotIn(secret, result.stdout + result.stderr)
+                self.assertIn(url, result.stderr)
+                self.assertNotIn("curl:", result.stderr)
+                self.assertNotIn("bad range", result.stderr)
                 self.assertFalse(machine.binary.exists())
 
-    def test_download_redirect_secrets_are_never_printed(self):
+    def test_download_redirect_failure_names_the_requested_url(self):
         # Downloads legitimately redirect to signed object-storage URLs. When
-        # one fails, the message names the Hands URL's host and path only.
+        # one fails, the message names the Hands URL that was requested.
         self.server.download_redirect = True
         machine = self.machine()
-        result = machine.run(["install", "--json"])
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        failed = json.loads(result.stdout)
+        failed = machine.json(["install"], expected=1)
         self.assert_failure_contract(failed)
         self.assertRegex(failed["line"], r"Could not download Raft Computer( support file)? from "
             + re.escape(self.server.base + "/dl/raft-computer-cli/releases/") + r"[0-9a-f]+/" + re.escape(TARGET)
-            + r"(\?\.\.\.)?: the server returned HTTP 403")
-        self.assert_no_url_secrets(result.stdout + result.stderr)
-        self.assert_no_url_secrets(json.dumps(machine.receipt(failed["id"])))
+            + r"(\?kind=photon-wasm)?: the server returned HTTP 403")
         self.assertFalse(machine.binary.exists())
         boot = self.machine().run([], bootstrap=True)
         self.assertEqual(boot.returncode, 1, boot.stdout + boot.stderr)
         self.assertIn("could not download", boot.stderr)
-        self.assertIn(self.server.base + "/dl/raft-computer-installer/releases/frozen-1/" + TARGET, boot.stderr)
-        self.assert_no_url_secrets(boot.stdout + boot.stderr)
+        self.assertIn(self.server.base + "/dl/raft-computer-installer/releases/frozen-1/" + TARGET + "?kind=sha256sums", boot.stderr)
+        if not WINDOWS:
+            self.assertNotIn("curl:", boot.stderr)
 
     def run_pasted(self, script, form, extra):
         # The documented Windows command pastes the script into an
@@ -1276,13 +1269,13 @@ class InstallerContract(unittest.TestCase):
         self.assert_failure_contract(failed)
         self.assertEqual(failed["code"], "release_resolution_failed")
         self.assertIn("returned an HTML page instead of the release document", failed["line"])
-        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?... returned an HTML page", failed["line"])
+        self.assertIn(self.server.base + "/public/v2/apps/raft-computer-cli/updates/check?product_type=cli-binary&", failed["line"])
+        self.assertIn("&channel=main returned an HTML page", failed["line"])
         self.assertTrue(failed["line"].endswith("Run the same install command again."), failed["line"])
         self.server.html_authority = False
         missing = machine.json(["install", "--version", "9.9.9"], expected=1)
         self.assert_failure_contract(missing)
-        self.assertIn("/updates/check?... returned HTTP 404", missing["line"])
-        self.assertNotIn("version=9.9.9", missing["line"])
+        self.assertIn("&version=9.9.9 returned HTTP 404", missing["line"])
 
     def test_download_failure_says_why(self):
         # Bytes that do not match the release (a filter's HTML page, a cut

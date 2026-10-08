@@ -14,34 +14,10 @@ $dlBase = if ($env:RAFT_COMPUTER_INSTALLER_DL_BASE) { $env:RAFT_COMPUTER_INSTALL
 $tmp = $null
 $code = 1
 # The catch below prefixes "Could not start the installation: " once.
-# Fail messages are already safe to show (every URL in them went through
-# Shown or Redacted); the catch below prints them as they are.
-function Fail($message) {
-  $failure = New-Object Exception("$message.")
-  $failure.Data['RaftShown'] = $true
-  throw $failure
-}
-# A URL as shown to the user: scheme, host, port and path only. Userinfo,
-# query and fragment may carry credentials or signatures, so they are never
-# shown; "?..." marks that something was omitted.
-function Shown([Uri]$uri) {
-  $shown = $uri.Scheme + '://' + $uri.Authority + $uri.AbsolutePath
-  if ($uri.Query -or $uri.Fragment) { $shown += '?...' }
-  return $shown
-}
-# Text this script did not write (a .NET exception message) may name a URL:
-# every absolute URL in it is shown by the same rule.
-# A Fail message was built from Shown/Redacted parts already; redacting it
-# again would cut the text that follows its URLs ("...?...); a company...").
-function Redacted($text, [bool]$AlreadyShown = $false) {
-  if ($AlreadyShown) { return [string]$text }
-  return [Regex]::Replace([string]$text, '[A-Za-z][A-Za-z0-9+.-]*://[^\s''"<>]+', {
-    param($match)
-    $uri = $null
-    if ([Uri]::TryCreate($match.Value, [UriKind]::Absolute, [ref]$uri)) { return (Shown $uri) }
-    return '<URL>'
-  })
-}
+# URLs are printed in full (userinfo, query and fragment included) by product
+# decision (artin, 2026-10-08): the exact URL identifies the network filter or
+# mirror that answered.
+function Fail($message) { throw "$message." }
 # Say something before the first network round trip (see install.sh).
 [Console]::Error.WriteLine('Preparing the Raft Computer installation...')
 function ProxyFor([Uri]$uri) {
@@ -65,7 +41,7 @@ function Download($url, $out, [bool]$showProgress = $false) {
   $beforeDownloadProgress = $ProgressPreference
   try {
     $ProgressPreference = if ($showProgress) { 'Continue' } else { 'SilentlyContinue' }
-    try { Invoke-WebRequest @options } catch { Fail ('could not download ' + (Shown ([Uri]$url)) + ': ' + (Redacted $_.Exception.Message)) }
+    try { Invoke-WebRequest @options } catch { Fail ('could not download ' + $url + ': ' + $_.Exception.Message) }
   } finally {
     $ProgressPreference = $beforeDownloadProgress
   }
@@ -100,21 +76,21 @@ try {
       # 4xx/5xx arrive as a WebException that still carries the response.
       $webError = $_.Exception
       while ($webError -and -not ($webError -is [Net.WebException])) { $webError = $webError.InnerException }
-      if (-not $webError -or -not $webError.Response) { Fail "could not reach $(Shown ([Uri]$channelUrl)): $(Redacted $_.Exception.Message)" }
+      if (-not $webError -or -not $webError.Response) { Fail "could not reach ${channelUrl}: $($_.Exception.Message)" }
       $response = $webError.Response
     }
     try {
       $status = [int]$response.StatusCode
       $location = [string]$response.Headers['Location']
     } finally { $response.Close() }
-    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $(Shown ([Uri]$channelUrl)))" }
+    if (-not $location) { Fail "the installation channel did not name an immutable release (HTTP $status from $channelUrl)" }
     $release = New-Object Uri([Uri]$channelUrl, $location)
-    $redirect = "HTTP $status to " + (Shown $release)
+    $redirect = "HTTP $status to " + $release.AbsoluteUri
     if ($release.Scheme -notin @('http', 'https')) { Fail "invalid installation release redirect ($redirect)" }
     # A redirect off the Hands host is a network (often a company web filter)
     # answering for Hands. Say so with the exact redirect: a retry cannot help.
     $handsHost = ([Uri]$channelUrl).Host
-    if ($release.Host -ne $handsHost) { Fail "the network redirected $handsHost to $($release.Host) ($redirect); a company firewall or proxy may be blocking it. Ask your network administrator to allow $handsHost and *.r2.cloudflarestorage.com, then run the same command again" }
+    if ($release.Host -ne $handsHost) { Fail "the network redirected the request for $channelUrl (HTTP $status) to $($release.AbsoluteUri); a company firewall or proxy may be blocking $handsHost. Ask your network administrator to allow $handsHost and *.r2.cloudflarestorage.com, then run the same command again" }
     if ($release.Query -or $release.Fragment -or $release.AbsoluteUri -eq $channelUrl) { Fail "invalid installation release redirect ($redirect)" }
     if ($release.AbsolutePath -notmatch ('/releases/[a-zA-Z0-9_-]+/' + [Regex]::Escape($target) + '$')) { Fail "installation release redirect did not freeze a release ($redirect)" }
     $releaseUrl = $release.AbsoluteUri
@@ -155,7 +131,7 @@ try {
     $code = $LASTEXITCODE
   }
 } catch {
-  [Console]::Error.WriteLine('Could not start the installation: ' + (Redacted $_.Exception.Message -AlreadyShown ([bool]$_.Exception.Data['RaftShown'])))
+  [Console]::Error.WriteLine('Could not start the installation: ' + $_.Exception.Message)
   $code = 1
 } finally {
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
