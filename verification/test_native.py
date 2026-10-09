@@ -1,6 +1,7 @@
 import faulthandler
 import json
 import os
+import sys
 import re
 from pathlib import Path
 import select
@@ -1389,6 +1390,33 @@ class InstallerContract(unittest.TestCase):
         self.assertIn("cannot be combined with --json", result.stderr)
         self.assertFalse(bad.binary.exists())
 
+    @unittest.skipUnless(WINDOWS, "a pasted install updating its own session is the Windows entry script's contract")
+    def test_pasted_windows_install_puts_raft_computer_on_this_session_path(self):
+        # GitHub's Windows job is a disposable account; elsewhere the real
+        # user's registry Path stays untouched.
+        if os.environ.get("GITHUB_ACTIONS") != "true":
+            self.skipTest("Windows user PATH mutation is exercised only in the disposable CI account")
+        machine = self.machine()
+        machine.install_dir = machine.home / ".local/bin"
+        machine.install_dir.mkdir(parents=True)
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        old = subprocess.check_output([powershell, "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"], text=True).strip()
+        try:
+            source = f"(Get-Content -Raw -LiteralPath '{DIST / 'install.ps1'}')"
+            command = ("$env:RAFT_COMPUTER_VERSION = '1.0.0'; "
+                       f"iex {source}; "
+                       "Write-Output ('SESSION-FINDS [' + [bool](Get-Command raft-computer -ErrorAction SilentlyContinue) + '] '"
+                       " + [bool]$env:RAFT_COMPUTER_SESSION_PATH)")
+            extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer", "RAFT_COMPUTER_NO_MODIFY_PATH": "0"}
+            result = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                env=machine.env(extra), text=True, capture_output=True, timeout=180)
+            output = result.stdout + result.stderr
+            self.assertIn("SESSION-FINDS [True] False", result.stdout, output)
+            self.assertIn("ready in this PowerShell", output)
+        finally:
+            subprocess.run([powershell, "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path',$env:RCI_RESTORE_PATH,'User')"],
+                env={**os.environ, "RCI_RESTORE_PATH": old}, check=True)
+
     @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
     def test_bootstrap_setup_rejects_bad_use_before_installing(self):
         extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
@@ -1632,6 +1660,16 @@ class InstallerContract(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('run: source ~/.zshrc', result.stdout + result.stderr)
             self.assertNotIn("Open a new terminal", result.stdout + result.stderr)
+            # bash: macOS terminals start login shells (.bash_profile), Linux
+            # terminals interactive ones (.bashrc).
+            bash = self.machine()
+            bash.install_dir = bash.home / ".local/bin"
+            bash.install_dir.mkdir(parents=True)
+            result = bash.run(["install", "--version", "1.0.0"], extra={"SHELL": "/bin/bash"})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            expected = ".bash_profile" if sys.platform == "darwin" else ".bashrc"
+            self.assertIn(f"run: source ~/{expected}", result.stdout + result.stderr)
+            self.assertIn('export PATH="$HOME/.local/bin:$PATH"', (bash.home / expected).read_text())
 
 
 if __name__ == "__main__":
