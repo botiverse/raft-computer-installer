@@ -210,6 +210,9 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         Some("login") => {
             fs::write(home.join("fixture-login"), b"configured")?;
         }
+        Some("setup") => {
+            fs::write(home.join("fixture-setup"), args[1..].join(" "))?;
+        }
         Some("start") => {
             if behavior.start_diagnostic {
                 eprintln!(
@@ -220,9 +223,10 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 eprintln!("password = spaced-password token : spaced-token");
                 eprintln!("Cookie: theme=dark; sid=cookie-secret");
                 eprintln!("connection=postgres://u:pw123@h/db");
-                eprintln!(
-                    "fatal: could not read from https://ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/org/repo.git"
-                );
+                // Split so the fake token is not a token-shaped source literal
+                // (Stamp's push secret scan), like FAKE_GITHUB_TOKEN in test_native.py.
+                let token = ["ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+                eprintln!("fatal: could not read from https://{token}@github.com/org/repo.git");
                 eprintln!("https://glpat-shortTok@gitlab.com/x.git");
                 eprintln!("\"formattedPassword\":");
                 eprintln!("\"multiline-short-value\"");

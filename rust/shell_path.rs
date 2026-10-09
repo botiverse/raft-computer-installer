@@ -68,7 +68,11 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
                 return Ok(Some(hint));
             }
         }
-        Ok(Some("Open a new terminal to use raft-computer.".into()))
+        // `curl … | sh` runs in a child shell, so it cannot change the user's
+        // current terminal: give the one line that does, ready to paste.
+        Ok(Some(format!(
+            "New terminals will find raft-computer. To use it in this terminal now, run: {line}"
+        )))
     }
     #[cfg(windows)]
     {
@@ -85,7 +89,11 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         )
         .await;
         Ok(Some(if result.is_ok_and(|r| r.success) {
-            "Open a new terminal to use raft-computer.".into()
+            // PowerShell single quotes are literal; a quote in the path doubles.
+            let quoted = directory.to_string_lossy().replace('\'', "''");
+            format!(
+                "New terminals will find raft-computer. To use it in this PowerShell now, run: $env:Path = '{quoted};' + $env:Path"
+            )
         } else {
             hint
         }))
