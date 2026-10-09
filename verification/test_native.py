@@ -1644,6 +1644,22 @@ class InstallerContract(unittest.TestCase):
                 machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_NO_MODIFY_PATH": "0"})
                 new = subprocess.check_output([shell, "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"], text=True).strip()
                 self.assertEqual(new.lower().split(";").count(str(machine.install_dir).lower()), 1)
+                # The default directory (no RAFT_COMPUTER_INSTALL_DIR) is
+                # persisted with Windows separators, and an entry an older
+                # installer wrote as `.local/bin` is recognized, not duplicated.
+                default = {"RAFT_COMPUTER_NO_MODIFY_PATH": "0", "RAFT_COMPUTER_INSTALL_DIR": None}
+                for legacy in (False, True):
+                    fresh = self.machine()
+                    fresh.install_dir = fresh.home / ".local/bin"
+                    seeded = old + ";" + str(fresh.home) + "\\.local/bin" if legacy else old
+                    subprocess.run([shell, "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path',$env:RCI_RESTORE_PATH,'User')"],
+                        env={**os.environ, "RCI_RESTORE_PATH": seeded}, check=True)
+                    fresh.json(["install", "--version", "1.0.0"], extra=default)
+                    new = subprocess.check_output([shell, "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"], text=True).strip()
+                    normalized = [entry.replace("/", "\\").rstrip("\\").lower() for entry in new.split(";")]
+                    self.assertEqual(normalized.count(str(fresh.install_dir).lower()), 1, new)
+                    if not legacy:
+                        self.assertIn(str(fresh.install_dir), new.split(";"))
             finally:
                 subprocess.run([shell, "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path',$env:RCI_RESTORE_PATH,'User')"],
                     env={**os.environ, "RCI_RESTORE_PATH": old}, check=True)
