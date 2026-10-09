@@ -1363,6 +1363,32 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((plain.home / "fixture-setup").exists())
 
+    @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
+    def test_windows_entry_script_setup_by_argument_and_by_env(self):
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        # Run as a file: everything after --setup goes to setup.
+        machine = self.machine()
+        result = machine.run(["--version", "1.0.0", "--setup", "/my-server", "--machine", "m1"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server --machine m1")
+        # Pasted (irm | iex cannot pass arguments): $env:RAFT_COMPUTER_SETUP,
+        # cleared afterwards so a later plain install does not run setup.
+        source = f"(Get-Content -Raw -LiteralPath '{DIST / 'install.ps1'}')"
+        command = ("$env:RAFT_COMPUTER_VERSION = '1.0.0'; $env:RAFT_COMPUTER_SETUP = '/env-server'; "
+                   f"iex {source}; Write-Output ('SETUP-ENV-AFTER [' + $env:RAFT_COMPUTER_SETUP + '] ' + $LASTEXITCODE)")
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        pasted = self.machine()
+        result = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=pasted.env(extra), text=True, capture_output=True, timeout=180)
+        self.assertIn("SETUP-ENV-AFTER [] 0", result.stdout, result.stdout + result.stderr)
+        self.assertEqual((pasted.home / "fixture-setup").read_text(), "/env-server")
+        # Misuse is refused before anything is installed.
+        bad = self.machine()
+        result = bad.run(["--json", "--setup", "/s"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cannot be combined with --json", result.stderr)
+        self.assertFalse(bad.binary.exists())
+
     @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
     def test_bootstrap_setup_rejects_bad_use_before_installing(self):
         extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
@@ -1604,7 +1630,7 @@ class InstallerContract(unittest.TestCase):
             fresh.install_dir.mkdir(parents=True)
             result = fresh.run(["install", "--version", "1.0.0"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('run: export PATH="$HOME/.local/bin:$PATH"', result.stdout + result.stderr)
+            self.assertIn('run: source ~/.zshrc', result.stdout + result.stderr)
             self.assertNotIn("Open a new terminal", result.stdout + result.stderr)
 
 

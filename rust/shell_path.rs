@@ -69,9 +69,10 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
             }
         }
         // `curl … | sh` runs in a child shell, so it cannot change the user's
-        // current terminal: give the one line that does, ready to paste.
+        // current terminal: name the profile it just updated, ready to source.
         Ok(Some(format!(
-            "New terminals will find raft-computer. To use it in this terminal now, run: {line}"
+            "New terminals will find raft-computer. To use it in this terminal now, run: source {}",
+            shell_word(&display_under_home(&profile, &cfg.user_home))
         )))
     }
     #[cfg(windows)]
@@ -97,5 +98,63 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         } else {
             hint
         }))
+    }
+}
+
+/// `~/…` for a path under the user's home, as people type it.
+#[cfg(unix)]
+fn display_under_home(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// A shell word that pastes safely: plain paths stay as they are; anything
+/// else is single-quoted (a leading `~/` stays outside so it still expands).
+#[cfg(unix)]
+fn shell_word(text: &str) -> String {
+    let plain = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+~".contains(c))
+    };
+    if plain(text) {
+        return text.to_owned();
+    }
+    let (prefix, rest) = match text.strip_prefix("~/") {
+        Some(rest) => ("~/", rest),
+        None => ("", text),
+    };
+    format!("{prefix}'{}'", rest.replace('\'', "'\\''"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn profile_is_shown_under_home_and_quoted_only_when_needed() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            shell_word(&display_under_home(Path::new("/home/u/.bashrc"), home)),
+            "~/.bashrc"
+        );
+        assert_eq!(
+            shell_word(&display_under_home(Path::new("/home/u/cfg/.zshrc"), home)),
+            "~/cfg/.zshrc"
+        );
+        assert_eq!(
+            shell_word(&display_under_home(Path::new("/etc/zsh/.zshrc"), home)),
+            "/etc/zsh/.zshrc"
+        );
+        assert_eq!(
+            shell_word(&display_under_home(
+                Path::new("/home/u/my dir/.zshrc"),
+                home
+            )),
+            "~/'my dir/.zshrc'"
+        );
+        assert_eq!(shell_word("/o'b/.zshrc"), "'/o'\\''b/.zshrc'");
     }
 }

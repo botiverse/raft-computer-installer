@@ -55,7 +55,7 @@ Debian 12 and newer are all supported).
 | `--yes`, `-y` | Accept the selected version without an attended confirmation. Unattended runs never ask; invocation is consent. |
 | `--allow-downgrade` | Explicitly allow an older target. Otherwise the request is held. |
 | `--json` | Print a structured result instead of the human result line. |
-| `--setup ARGS…` | Entry scripts only (`install.sh`): after a successful install, run `raft-computer setup ARGS…` with the installed binary. Everything after `--setup` is passed to setup; put install options before it. Not combinable with `--json`. Example: `curl -fsSL …/install.sh \| sh -s -- --setup /my-server`. |
+| `--setup ARGS…` | Entry scripts only (`install.sh`, `install.ps1`; for `irm … \| iex`, which cannot pass arguments, set `$env:RAFT_COMPUTER_SETUP = '/my-server'` first): after a successful install, run `raft-computer setup ARGS…` with the installed binary. Everything after `--setup` is passed to setup; put install options before it. Not combinable with `--json`. Example: `curl -fsSL …/install.sh \| sh -s -- --setup /my-server`. |
 
 `raft-computer-installer --version` alone prints the installer's own version.
 
