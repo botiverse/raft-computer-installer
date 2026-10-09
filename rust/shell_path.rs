@@ -26,7 +26,7 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         return Ok(None);
     }
     let hint = format!("Add {} to PATH.", directory.display());
-    if directory != cfg.user_home.join(".local/bin")
+    if directory != crate::config::default_install_dir(&cfg.user_home)
         || env::var("RAFT_COMPUTER_NO_MODIFY_PATH").as_deref() == Ok("1")
     {
         return Ok(Some(hint));
@@ -84,7 +84,7 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         // data, never interpolated PowerShell source.
         let mut environment = cfg.environment();
         environment.insert("RAFT_INSTALL_BIN".into(), directory.as_os_str().to_owned());
-        let script = "$ErrorActionPreference='Stop'; $p=[Environment]::GetEnvironmentVariable('Path','User'); $d=$env:RAFT_INSTALL_BIN; if (-not (($p -split ';') -contains $d)) { if ($p) { $p=$p+';'+$d } else { $p=$d }; [Environment]::SetEnvironmentVariable('Path',$p,'User') }";
+        let script = "$ErrorActionPreference='Stop'; $p=[Environment]::GetEnvironmentVariable('Path','User'); $d=$env:RAFT_INSTALL_BIN; $n={param($x) $x.Replace('/','\\').TrimEnd('\\')}; if (-not (($p -split ';') | Where-Object { (& $n $_) -ieq (& $n $d) })) { if ($p) { $p=$p+';'+$d } else { $p=$d }; [Environment]::SetEnvironmentVariable('Path',$p,'User') }";
         let result = crate::computer::run(
             std::path::Path::new("powershell.exe"),
             &["-NoProfile", "-NonInteractive", "-Command", script],

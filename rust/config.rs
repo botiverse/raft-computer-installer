@@ -49,6 +49,12 @@ fn absolute(value: &Path, home: &Path) -> Result<PathBuf> {
     })
 }
 
+/// `~/.local/bin`, joined per component so Windows gets `\` separators
+/// in the PATH entry it persists.
+pub fn default_install_dir(home: &Path) -> PathBuf {
+    home.join(".local").join("bin")
+}
+
 fn setting(name: &str, default: &str) -> Result<String> {
     match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
@@ -77,7 +83,7 @@ impl Config {
         let install_dir = absolute(
             &env::var_os("RAFT_COMPUTER_INSTALL_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| user_home.join(".local/bin")),
+                .unwrap_or_else(|| default_install_dir(&user_home)),
             &user_home,
         )?;
         let binary = match env::var_os("RAFT_COMPUTER_BINARY") {

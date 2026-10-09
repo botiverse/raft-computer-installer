@@ -386,7 +386,8 @@ class Machine:
             RAFT_COMPUTER_HANDS_ORIGIN=self.server.base, RAFT_COMPUTER_NON_INTERACTIVE="1", RAFT_COMPUTER_NO_MODIFY_PATH="1" if WINDOWS else "0",
             RAFT_COMPUTER_INSTALLER_DL_BASE=self.server.base + "/dl/raft-computer-installer")
         environment.update(extra or {})
-        return environment
+        # None in `extra` removes a setting, exercising the installer default.
+        return {key: value for key, value in environment.items() if value is not None}
 
     def command(self, args, extra=None, bootstrap=False):
         if bootstrap:
