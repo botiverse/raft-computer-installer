@@ -137,6 +137,30 @@ try {
   # --channel argument always wins over the environment pin.
   if ($env:RAFT_COMPUTER_VERSION -and $command -in @('install', 'upgrade', 'repair') -and -not ($argv | Where-Object { $_ -match '^--(version|channel)(=|$)' })) { $argv += @('--version', $env:RAFT_COMPUTER_VERSION) }
   if ($InstallChannelDefault -and $command -in @('install', 'upgrade', 'repair') -and -not ($argv | Where-Object { $_ -match '^--(version|channel)(=|$)' })) { $argv += @('--channel', $InstallChannelDefault) }
+  # Same resolution as the native config: binary, else install dir, else
+  # ~\.local\bin; a leading ~ or a relative path is under the user's home.
+  $userHome = $env:USERPROFILE
+  function UnderHome($path) {
+    if ($path -eq '~') { return $userHome }
+    if ($path -match '^~[\\/]') { return Join-Path $userHome $path.Substring(2) }
+    if ([IO.Path]::IsPathRooted($path)) { return $path }
+    return Join-Path $userHome $path
+  }
+  $installed = if ($env:RAFT_COMPUTER_BINARY) { UnderHome $env:RAFT_COMPUTER_BINARY } else {
+    $dir = if ($env:RAFT_COMPUTER_INSTALL_DIR) { UnderHome $env:RAFT_COMPUTER_INSTALL_DIR } else { Join-Path $userHome '.local\bin' }
+    Join-Path $dir 'raft-computer.exe'
+  }
+  $installedDir = Split-Path -Parent $installed
+  # Pasted (`irm … | iex`) this script runs in the user's own session, so it
+  # can put the install directory on that session's Path after the native
+  # installer adds it to the user Path (which it does only for the default
+  # directory). Run as a file the session is a throwaway process: skip it.
+  $pastedSession = $true
+  try { if ($PSCommandPath) { $pastedSession = $false } } catch { }
+  $sessionPath = $pastedSession -and $command -in @('install', 'upgrade', 'repair') -and
+    $env:RAFT_COMPUTER_NO_MODIFY_PATH -ne '1' -and
+    $installedDir.TrimEnd('\') -ieq (Join-Path $userHome '.local\bin').TrimEnd('\')
+  if ($sessionPath) { $env:RAFT_COMPUTER_SESSION_PATH = '1' }
   & $cli $command @argv
   $code = $LASTEXITCODE
   # Exit 3 means the operation could not be settled in that process: either it
@@ -148,20 +172,14 @@ try {
     & $cli $command @argv
     $code = $LASTEXITCODE
   }
+  if ($code -eq 0 -and $sessionPath) {
+    # The new user Path reaches new windows only; give this session the same
+    # entry, as the native installer can not (it is a child process).
+    if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $installedDir.TrimEnd('\') })) {
+      $env:Path = if ($env:Path) { "$installedDir;$env:Path" } else { $installedDir }
+    }
+  }
   if ($code -eq 0 -and $null -ne $setupArgs) {
-    # Same resolution as the native config: binary, else install dir, else
-    # ~\.local\bin; a leading ~ or a relative path is under the user's home.
-    $userHome = $env:USERPROFILE
-    function UnderHome($path) {
-      if ($path -eq '~') { return $userHome }
-      if ($path -match '^~[\\/]') { return Join-Path $userHome $path.Substring(2) }
-      if ([IO.Path]::IsPathRooted($path)) { return $path }
-      return Join-Path $userHome $path
-    }
-    $installed = if ($env:RAFT_COMPUTER_BINARY) { UnderHome $env:RAFT_COMPUTER_BINARY } else {
-      $dir = if ($env:RAFT_COMPUTER_INSTALL_DIR) { UnderHome $env:RAFT_COMPUTER_INSTALL_DIR } else { Join-Path $userHome '.local\bin' }
-      Join-Path $dir 'raft-computer.exe'
-    }
     & $installed setup @setupArgs
     $code = $LASTEXITCODE
   }
@@ -170,6 +188,7 @@ try {
   $code = 1
 } finally {
   Remove-Item Env:RAFT_COMPUTER_SETUP -ErrorAction SilentlyContinue
+  Remove-Item Env:RAFT_COMPUTER_SESSION_PATH -ErrorAction SilentlyContinue
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   $ProgressPreference = $savedProgress
   $env:PSModulePath = $savedModulePath

@@ -39,6 +39,9 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| cfg.user_home.clone())
                 .join(".zshrc"),
+            // macOS terminals start login shells, which read .bash_profile
+            // (not .bashrc); Linux terminals start interactive non-login ones.
+            Some("bash") if cfg!(target_os = "macos") => cfg.user_home.join(".bash_profile"),
             Some("bash") => cfg.user_home.join(".bashrc"),
             _ => return Ok(Some(hint)),
         };
@@ -90,6 +93,13 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         )
         .await;
         Ok(Some(if result.is_ok_and(|r| r.success) {
+            // Pasted as `irm … | iex` the entry script runs in the user's own
+            // session and adds the directory to that session's Path itself.
+            if env::var("RAFT_COMPUTER_SESSION_PATH").as_deref() == Ok("1") {
+                return Ok(Some(
+                    "raft-computer is ready in this PowerShell and in new windows.".into(),
+                ));
+            }
             // PowerShell single quotes are literal; a quote in the path doubles.
             let quoted = directory.to_string_lossy().replace('\'', "''");
             format!(
