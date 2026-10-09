@@ -12,6 +12,35 @@ INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_DL_BASE:=https://hands.build/dl/raft-computer-installer}"
 err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
+# `--setup <setup arguments>`: after a successful install, run
+# `raft-computer setup <setup arguments>` with the installed binary, so the
+# web's connect dialog can be one command
+# (`… | sh -s -- --setup /my-server [--machine <id>]`) and the user never
+# depends on the new PATH entry. Everything after --setup belongs to setup;
+# install options go before it. Installation and setup stay separate product
+# actions in the native binary, which never sees this flag.
+setup_requested=
+setup_args=
+arg_count=$#
+arg_index=0
+while [ "$arg_index" -lt "$arg_count" ]; do
+  arg=$1; shift; arg_index=$((arg_index + 1))
+  if [ -n "$setup_requested" ]; then
+    # Keep setup's arguments as a single-quoted list (embedded quotes
+    # escaped), so the later eval rebuilds them verbatim and runs nothing.
+    setup_args="$setup_args $(printf "'%s'" "$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")")"
+    continue
+  fi
+  case "$arg" in
+    --setup) setup_requested=1 ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+if [ -n "$setup_requested" ]; then
+  [ -n "$setup_args" ] || err "--setup needs a server, for example --setup /my-server"
+  case " $* " in *" --json "*) err "--setup cannot be combined with --json" ;; esac
+  case "${1:-install}" in install|upgrade|repair|-*) ;; *) err "--setup works only with install, upgrade or repair" ;; esac
+fi
 # Host of an absolute URL, lowercased, without credentials or port.
 host_of() { printf '%s\n' "$1" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?\#].*$##; s#^.*@##; s#:[0-9]*$##' | tr 'A-Z' 'a-z'; }
 # URLs are printed in full (userinfo, query and fragment included) by product
@@ -155,5 +184,20 @@ code=0
 # is never told to run the installer themselves. A second 3 stays 3.
 if [ "$code" -eq 3 ]; then
   case "$cmd" in status|recover|help) ;; *) code=0; "$tmp/installer" "$cmd" "$@" || code=$? ;; esac
+fi
+if [ "$code" -eq 0 ] && [ -n "$setup_requested" ]; then
+  installed="${RAFT_COMPUTER_BINARY:-${RAFT_COMPUTER_INSTALL_DIR:-$HOME/.local/bin}/raft-computer}"
+  # The installer resolves a relative path against the user's home; match it.
+  case "$installed" in /*) ;; "~") installed=$HOME ;; "~/"*) installed="$HOME/${installed#"~/"}" ;; *) installed="$HOME/$installed" ;; esac
+  # Under `curl … | sh` stdin is this script; setup may need to ask the user.
+  # Probe in a subshell: a failed redirection on a special builtin would
+  # end this non-interactive shell (no controlling terminal, e.g. CI).
+  if (: </dev/tty) 2>/dev/null; then
+    eval "set -- $setup_args"; "$installed" setup "$@" </dev/tty || code=$?
+  else
+    # Not this script's stdin: under `curl | sh` that is the rest of the
+    # script, and setup reading it would swallow the final exit.
+    eval "set -- $setup_args"; "$installed" setup "$@" </dev/null || code=$?
+  fi
 fi
 exit "$code"

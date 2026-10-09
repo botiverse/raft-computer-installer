@@ -1341,6 +1341,67 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(machine.self_version(), "1.0.0")
 
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_setup_runs_installed_setup_after_install(self):
+        # The connect dialog's one command: install, then setup with the
+        # installed binary (no reliance on the new PATH entry).
+        machine = self.machine()
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        result = machine.run(["--version", "1.0.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(machine.self_version(), "1.0.0")
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server")
+        # Everything after --setup is setup's, quoted verbatim; install options
+        # go before it and the flag never reaches the native installer.
+        other = self.machine()
+        result = other.run(["--version", "1.0.0", "--setup", "/other server", "--machine", "it's-$(x)"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((other.home / "fixture-setup").read_text(), "/other server --machine it's-$(x)")
+        # Without the flag nothing runs setup.
+        plain = self.machine()
+        result = plain.run(["--version", "1.0.0"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((plain.home / "fixture-setup").exists())
+
+    @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
+    def test_windows_entry_script_setup_by_argument_and_by_env(self):
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        # Run as a file: everything after --setup goes to setup.
+        machine = self.machine()
+        result = machine.run(["--version", "1.0.0", "--setup", "/my-server", "--machine", "m1"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server --machine m1")
+        # Pasted (irm | iex cannot pass arguments): $env:RAFT_COMPUTER_SETUP,
+        # cleared afterwards so a later plain install does not run setup.
+        source = f"(Get-Content -Raw -LiteralPath '{DIST / 'install.ps1'}')"
+        command = ("$env:RAFT_COMPUTER_VERSION = '1.0.0'; $env:RAFT_COMPUTER_SETUP = '/env-server'; "
+                   f"iex {source}; Write-Output ('SETUP-ENV-AFTER [' + $env:RAFT_COMPUTER_SETUP + '] ' + $LASTEXITCODE)")
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        pasted = self.machine()
+        result = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=pasted.env(extra), text=True, capture_output=True, timeout=180)
+        self.assertIn("SETUP-ENV-AFTER [] 0", result.stdout, result.stdout + result.stderr)
+        self.assertEqual((pasted.home / "fixture-setup").read_text(), "/env-server")
+        # Misuse is refused before anything is installed.
+        bad = self.machine()
+        result = bad.run(["--json", "--setup", "/s"], bootstrap=True, extra=extra)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cannot be combined with --json", result.stderr)
+        self.assertFalse(bad.binary.exists())
+
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_setup_rejects_bad_use_before_installing(self):
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        for args, said in ((["--setup"], "--setup needs a server"),
+                           (["--version", "1.0.0", "--setup"], "--setup needs a server"),
+                           (["--json", "--setup", "/s"], "cannot be combined with --json"),
+                           (["status", "--setup", "/s"], "works only with install")):
+            machine = self.machine()
+            result = machine.run(args, bootstrap=True, extra=extra)
+            self.assertEqual(result.returncode, 1, args)
+            self.assertIn(said, result.stderr, args)
+            self.assertFalse(machine.binary.exists(), args)
+
     def test_bootstrap_explicit_version_beats_pin_env(self):
         machine = self.machine()
         result = machine.run(["--version", "1.1.0"], bootstrap=True,
@@ -1563,6 +1624,14 @@ class InstallerContract(unittest.TestCase):
             machine.json(["upgrade", "--version", "1.1.0"])
             profile = (machine.home / ".zshrc").read_text()
             self.assertEqual(profile.count('export PATH="$HOME/.local/bin:$PATH"'), 1)
+            # The hint gives the line that works in the current terminal.
+            fresh = self.machine()
+            fresh.install_dir = fresh.home / ".local/bin"
+            fresh.install_dir.mkdir(parents=True)
+            result = fresh.run(["install", "--version", "1.0.0"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('run: source ~/.zshrc', result.stdout + result.stderr)
+            self.assertNotIn("Open a new terminal", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

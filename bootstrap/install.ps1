@@ -47,6 +47,25 @@ function Download($url, $out, [bool]$showProgress = $false) {
   }
 }
 try {
+  # --setup <setup arguments> (see install.sh): after a successful install, run
+  # `raft-computer setup ...` with the installed binary. `irm ... | iex` cannot
+  # pass arguments, so $env:RAFT_COMPUTER_SETUP carries them there
+  # (whitespace-separated; it is cleared at the end so a later plain install
+  # does not run setup again). Everything after --setup belongs to setup.
+  $argv = @($args)
+  $setupArgs = $null
+  $setupAt = [Array]::IndexOf([string[]]$argv, '--setup')
+  if ($setupAt -ge 0) {
+    $setupArgs = @($argv | Select-Object -Skip ($setupAt + 1))
+    $argv = @($argv | Select-Object -First $setupAt)
+  } elseif ($env:RAFT_COMPUTER_SETUP) {
+    $setupArgs = @($env:RAFT_COMPUTER_SETUP -split '\s+' | Where-Object { $_ })
+  }
+  if ($null -ne $setupArgs) {
+    if ($setupArgs.Count -eq 0) { Fail '--setup needs a server, for example --setup /my-server' }
+    if ($argv -contains '--json') { Fail '--setup cannot be combined with --json' }
+    if ($argv.Count -gt 0 -and $argv[0] -in @('status', 'recover', 'help')) { Fail '--setup works only with install, upgrade or repair' }
+  }
   # Read the machine architecture from the environment, never from
   # [System.Runtime.InteropServices.RuntimeInformation]: in Windows PowerShell 5.1
   # an interactive console has PSReadLine loaded, which ships a same-named stub
@@ -108,7 +127,6 @@ try {
   $cli = Join-Path $tmp 'installer.exe'
   Download $binaryUrl $cli $true
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash.ToLowerInvariant() -ne $matchesForTarget[0]) { Fail 'installation download does not match its published checksum' }
-  $argv = @($args)
   $command = 'install'
   if ($argv.Count -gt 0 -and $argv[0] -in @('install', 'upgrade', 'repair', 'status', 'recover', 'help')) {
     $command = $argv[0]
@@ -130,10 +148,28 @@ try {
     & $cli $command @argv
     $code = $LASTEXITCODE
   }
+  if ($code -eq 0 -and $null -ne $setupArgs) {
+    # Same resolution as the native config: binary, else install dir, else
+    # ~\.local\bin; a leading ~ or a relative path is under the user's home.
+    $userHome = $env:USERPROFILE
+    function UnderHome($path) {
+      if ($path -eq '~') { return $userHome }
+      if ($path -match '^~[\\/]') { return Join-Path $userHome $path.Substring(2) }
+      if ([IO.Path]::IsPathRooted($path)) { return $path }
+      return Join-Path $userHome $path
+    }
+    $installed = if ($env:RAFT_COMPUTER_BINARY) { UnderHome $env:RAFT_COMPUTER_BINARY } else {
+      $dir = if ($env:RAFT_COMPUTER_INSTALL_DIR) { UnderHome $env:RAFT_COMPUTER_INSTALL_DIR } else { Join-Path $userHome '.local\bin' }
+      Join-Path $dir 'raft-computer.exe'
+    }
+    & $installed setup @setupArgs
+    $code = $LASTEXITCODE
+  }
 } catch {
   [Console]::Error.WriteLine('Could not start the installation: ' + $_.Exception.Message)
   $code = 1
 } finally {
+  Remove-Item Env:RAFT_COMPUTER_SETUP -ErrorAction SilentlyContinue
   if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   $ProgressPreference = $savedProgress
   $env:PSModulePath = $savedModulePath
