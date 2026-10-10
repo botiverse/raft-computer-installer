@@ -189,6 +189,8 @@ if [ "$code" -eq 0 ] && [ -n "$setup_requested" ]; then
   installed="${RAFT_COMPUTER_BINARY:-${RAFT_COMPUTER_INSTALL_DIR:-$HOME/.local/bin}/raft-computer}"
   # The installer resolves a relative path against the user's home; match it.
   case "$installed" in /*) ;; "~") installed=$HOME ;; "~/"*) installed="$HOME/${installed#"~/"}" ;; *) installed="$HOME/$installed" ;; esac
+  # Codex's "==> Launching Codex": say what starts next.
+  printf '==> Setting up Raft Computer\n'
   # Under `curl … | sh` stdin is this script; setup may need to ask the user.
   # Probe in a subshell: a failed redirection on a special builtin would
   # end this non-interactive shell (no controlling terminal, e.g. CI).

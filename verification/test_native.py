@@ -1412,7 +1412,10 @@ class InstallerContract(unittest.TestCase):
                 env=machine.env(extra), text=True, capture_output=True, timeout=180)
             output = result.stdout + result.stderr
             self.assertIn("SESSION-FINDS [True] False", result.stdout, output)
-            self.assertIn("ready in this PowerShell", output)
+            self.assertIn("==> Current PowerShell session: raft-computer", output)
+            self.assertIn("==> Future PowerShell windows: open a new PowerShell window and run: raft-computer", output)
+            self.assertRegex(output, r"==> PATH (updated|is already configured) for future PowerShell sessions\.")
+            self.assertIn("Raft Computer 1.0.0 installed successfully.", output)
         finally:
             subprocess.run([powershell, "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path',$env:RCI_RESTORE_PATH,'User')"],
                 env={**os.environ, "RCI_RESTORE_PATH": old}, check=True)
@@ -1674,8 +1677,27 @@ class InstallerContract(unittest.TestCase):
             fresh.install_dir.mkdir(parents=True)
             result = fresh.run(["install", "--version", "1.0.0"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('run: source ~/.zshrc', result.stdout + result.stderr)
-            self.assertNotIn("Open a new terminal", result.stdout + result.stderr)
+            output = result.stdout + result.stderr
+            # Codex wording and order: current terminal, future terminals,
+            # where PATH went, then the success line.
+            expected_lines = [
+                f'==> Current terminal: export PATH="{fresh.install_dir}:$PATH" && raft-computer',
+                "==> Future terminals: open a new terminal and run: raft-computer",
+                "==> PATH was added to ~/.zshrc",
+                "Raft Computer 1.0.0 installed successfully.",
+            ]
+            positions = [output.find(line) for line in expected_lines]
+            self.assertTrue(all(p >= 0 for p in positions), output)
+            self.assertEqual(positions, sorted(positions), output)
+            # A profile that already carries the line is named, not rewritten.
+            configured = self.machine()
+            configured.install_dir = configured.home / ".local/bin"
+            configured.install_dir.mkdir(parents=True)
+            (configured.home / ".zshrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n')
+            again = configured.run(["install", "--version", "1.0.0"])
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertIn("==> PATH is already configured in ~/.zshrc", again.stdout + again.stderr)
+            self.assertEqual((configured.home / ".zshrc").read_text().count(".local/bin"), 1)
             # bash: macOS terminals start login shells (.bash_profile), Linux
             # terminals interactive ones (.bashrc).
             bash = self.machine()
@@ -1684,7 +1706,7 @@ class InstallerContract(unittest.TestCase):
             result = bash.run(["install", "--version", "1.0.0"], extra={"SHELL": "/bin/bash"})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             expected = ".bash_profile" if sys.platform == "darwin" else ".bashrc"
-            self.assertIn(f"run: source ~/{expected}", result.stdout + result.stderr)
+            self.assertIn(f"==> PATH was added to ~/{expected}", result.stdout + result.stderr)
             self.assertIn('export PATH="$HOME/.local/bin:$PATH"', (bash.home / expected).read_text())
 
 

@@ -284,14 +284,10 @@ fn finish(
     // never carry a product-provided login/setup hint into a current receipt.
     plan.next_step = None;
     let mut line = line.into();
-    if outcome.exit_code() == 0 {
-        if plan.detail.get("readback").map(String::as_str) == Some("service") {
-            line.push_str(" It is running.");
-        }
-        if let Some(hint) = plan.detail.get("pathHint") {
-            line.push(' ');
-            line.push_str(hint);
-        }
+    if outcome.exit_code() == 0
+        && plan.detail.get("readback").map(String::as_str) == Some("service")
+    {
+        line.push_str(" It is running.");
     }
     let mut result = receipt(
         &plan.request,
@@ -758,9 +754,11 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 "published program did not report the selected version".into(),
             ));
         }
-        if let Some(hint) = shell_path::ensure(cfg).await? {
-            plan.detail.insert("pathHint".into(), hint);
-        }
+        // A receipt line is one line; the Codex-style steps printed above it
+        // travel separately (see cli.rs).
+        let steps = shell_path::ensure(cfg).await?;
+        plan.detail
+            .insert("pathSteps".into(), serde_json::to_string(&steps)?);
         // Installation and account/workspace setup are separate product
         // actions. The surface that knows the target server and workspace
         // prints the exact setup command; the installer neither guesses it nor
@@ -799,13 +797,13 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             Outcome::Installed
         };
         let line = format!(
-            "{} {}.",
+            "Raft Computer {} {} successfully.",
+            plan.manifest.version,
             if plan.kind == Kind::Repair {
-                "Reinstalled"
+                "reinstalled"
             } else {
-                "Installed"
-            },
-            plan.manifest.version
+                "installed"
+            }
         );
         return finish(cfg, plan, outcome, None, line);
     }

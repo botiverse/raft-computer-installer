@@ -236,6 +236,19 @@ pub async fn run() -> Result<u8> {
     if args.json {
         println!("{}", serde_json::to_string(&reply)?);
     } else {
+        // Codex order: how to run it (current terminal, future terminals,
+        // PATH) first, the success line last.
+        if reply.exit_code == 0
+            && let Some(steps) = reply
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.detail.get("pathSteps"))
+                .and_then(|steps| serde_json::from_str::<Vec<String>>(steps).ok())
+        {
+            for step in steps {
+                println!("{step}");
+            }
+        }
         println!("{}", reply.line);
     }
     Ok(reply.exit_code)
