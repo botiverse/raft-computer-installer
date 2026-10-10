@@ -6,7 +6,10 @@ use std::{
     io::Write,
 };
 
-pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
+/// The lines printed after a successful install, worded after the Codex CLI
+/// installer: how to run raft-computer in the current terminal, in future
+/// terminals, and where PATH was written.
+pub async fn ensure(cfg: &Config) -> Result<Vec<String>> {
     let directory = cfg.binary.parent().unwrap_or(&cfg.install_dir);
     let on_path = env::var_os("PATH").is_some_and(|path| {
         env::split_paths(&path).any(|entry| {
@@ -22,14 +25,40 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
             }
         })
     });
+    #[cfg(unix)]
+    let current = format!(
+        "Current terminal: export PATH=\"{}:$PATH\" && raft-computer",
+        directory.display()
+    );
+    #[cfg(unix)]
+    let future = "Future terminals: open a new terminal and run: raft-computer";
+    #[cfg(windows)]
+    let current = format!(
+        "Current PowerShell session: $env:Path = '{};' + $env:Path; raft-computer",
+        // PowerShell single quotes are literal; a quote in the path doubles.
+        directory.to_string_lossy().replace('\'', "''")
+    );
+    #[cfg(windows)]
+    let future = "Future PowerShell windows: open a new PowerShell window and run: raft-computer";
     if on_path {
-        return Ok(None);
+        #[cfg(unix)]
+        let current = "Current terminal: raft-computer";
+        #[cfg(windows)]
+        let current = "Current PowerShell session: raft-computer";
+        return Ok(steps(&[
+            &format!("{} is already on PATH", directory.display()),
+            current,
+            future,
+        ]));
     }
-    let hint = format!("Add {} to PATH.", directory.display());
+    let manual = steps(&[
+        &current,
+        &format!("Future terminals: add {} to PATH", directory.display()),
+    ]);
     if directory != crate::config::default_install_dir(&cfg.user_home)
         || env::var("RAFT_COMPUTER_NO_MODIFY_PATH").as_deref() == Ok("1")
     {
-        return Ok(Some(hint));
+        return Ok(manual);
     }
     #[cfg(unix)]
     {
@@ -43,40 +72,47 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
             // (not .bashrc); Linux terminals start interactive non-login ones.
             Some("bash") if cfg!(target_os = "macos") => cfg.user_home.join(".bash_profile"),
             Some("bash") => cfg.user_home.join(".bashrc"),
-            _ => return Ok(Some(hint)),
+            _ => return Ok(manual),
         };
         let line = "export PATH=\"$HOME/.local/bin:$PATH\"";
         let existing = match fs::read_to_string(&profile) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(_) => return Ok(Some(hint)),
+            Err(_) => return Ok(manual),
         };
-        if !existing.lines().any(|existing| existing.trim() == line) {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Append through a user's existing profile symlink; never replace
-            // their dotfile or change its permissions using an atomic rewrite.
-            let updated = (|| -> std::io::Result<()> {
-                if let Some(parent) = profile.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .mode(0o600)
-                    .open(&profile)?;
-                file.write_all(format!("\n# raft-computer\n{line}\n").as_bytes())?;
-                file.sync_all()
-            })();
-            if updated.is_err() {
-                return Ok(Some(hint));
+        let shown = shell_word(&display_under_home(&profile, &cfg.user_home));
+        if existing.lines().any(|existing| existing.trim() == line) {
+            return Ok(steps(&[
+                &current,
+                future,
+                &format!("PATH is already configured in {shown}"),
+            ]));
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        // Append through a user's existing profile symlink; never replace
+        // their dotfile or change its permissions using an atomic rewrite.
+        let updated = (|| -> std::io::Result<()> {
+            if let Some(parent) = profile.parent() {
+                fs::create_dir_all(parent)?;
             }
+            let mut file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .open(&profile)?;
+            file.write_all(format!("\n# raft-computer\n{line}\n").as_bytes())?;
+            file.sync_all()
+        })();
+        if updated.is_err() {
+            return Ok(manual);
         }
         // `curl … | sh` runs in a child shell, so it cannot change the user's
-        // current terminal: name the profile it just updated, ready to source.
-        Ok(Some(format!(
-            "New terminals will find raft-computer. To use it in this terminal now, run: source {}",
-            shell_word(&display_under_home(&profile, &cfg.user_home))
-        )))
+        // current terminal: give the line that works there.
+        Ok(steps(&[
+            &current,
+            future,
+            &format!("PATH was added to {shown}"),
+        ]))
     }
     #[cfg(windows)]
     {
@@ -84,7 +120,7 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
         // data, never interpolated PowerShell source.
         let mut environment = cfg.environment();
         environment.insert("RAFT_INSTALL_BIN".into(), directory.as_os_str().to_owned());
-        let script = "$ErrorActionPreference='Stop'; $p=[Environment]::GetEnvironmentVariable('Path','User'); $d=$env:RAFT_INSTALL_BIN; $n={param($x) $x.Replace('/','\\').TrimEnd('\\')}; if (-not (($p -split ';') | Where-Object { (& $n $_) -ieq (& $n $d) })) { if ($p) { $p=$p+';'+$d } else { $p=$d }; [Environment]::SetEnvironmentVariable('Path',$p,'User') }";
+        let script = "$ErrorActionPreference='Stop'; $p=[Environment]::GetEnvironmentVariable('Path','User'); $d=$env:RAFT_INSTALL_BIN; $n={param($x) $x.Replace('/','\\').TrimEnd('\\')}; if (-not (($p -split ';') | Where-Object { (& $n $_) -ieq (& $n $d) })) { if ($p) { $p=$p+';'+$d } else { $p=$d }; [Environment]::SetEnvironmentVariable('Path',$p,'User'); 'added' } else { 'present' }";
         let result = crate::computer::run(
             std::path::Path::new("powershell.exe"),
             &["-NoProfile", "-NonInteractive", "-Command", script],
@@ -92,23 +128,29 @@ pub async fn ensure(cfg: &Config) -> Result<Option<String>> {
             std::time::Duration::from_secs(30),
         )
         .await;
-        Ok(Some(if result.is_ok_and(|r| r.success) {
-            // Pasted as `irm … | iex` the entry script runs in the user's own
-            // session and adds the directory to that session's Path itself.
-            if env::var("RAFT_COMPUTER_SESSION_PATH").as_deref() == Ok("1") {
-                return Ok(Some(
-                    "raft-computer is ready in this PowerShell and in new windows.".into(),
-                ));
-            }
-            // PowerShell single quotes are literal; a quote in the path doubles.
-            let quoted = directory.to_string_lossy().replace('\'', "''");
-            format!(
-                "New terminals will find raft-computer. To use it in this PowerShell now, run: $env:Path = '{quoted};' + $env:Path"
-            )
+        let result = match result {
+            Ok(result) if result.success => result,
+            _ => return Ok(manual),
+        };
+        let saved = if String::from_utf8_lossy(&result.stdout).trim() == "added" {
+            "PATH updated for future PowerShell sessions."
         } else {
-            hint
-        }))
+            "PATH is already configured for future PowerShell sessions."
+        };
+        // Pasted as `irm … | iex` the entry script runs in the user's own
+        // session and adds the directory to that session's Path itself.
+        let current = if env::var("RAFT_COMPUTER_SESSION_PATH").as_deref() == Ok("1") {
+            "Current PowerShell session: raft-computer".to_owned()
+        } else {
+            current
+        };
+        Ok(steps(&[saved, &current, future]))
     }
+}
+
+/// `==> ` step lines, one per entry.
+fn steps(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|line| format!("==> {line}")).collect()
 }
 
 /// `~/…` for a path under the user's home, as people type it.

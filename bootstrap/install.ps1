@@ -180,6 +180,7 @@ try {
     }
   }
   if ($code -eq 0 -and $null -ne $setupArgs) {
+    Write-Host '==> Setting up Raft Computer'
     & $installed setup @setupArgs
     $code = $LASTEXITCODE
   }
