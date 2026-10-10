@@ -7,6 +7,7 @@ pub mod computer;
 pub mod config;
 mod diagnostic;
 pub mod host;
+pub mod network;
 pub mod operation;
 pub mod presence;
 pub mod process;

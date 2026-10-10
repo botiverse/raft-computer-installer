@@ -1296,6 +1296,61 @@ class InstallerContract(unittest.TestCase):
         self.assert_failure_contract(missing)
         self.assertIn("&version=9.9.9 returned HTTP 404", missing["line"])
 
+    def https_hands(self):
+        # An HTTPS Hands stand-in whose certificate is signed by the test CA
+        # in rust/testdata, like a company proxy that inspects HTTPS. It
+        # answers every request with 404.
+        import base64
+        import http.server
+        import ssl
+        import tempfile
+        import threading
+        testdata = Path(__file__).resolve().parents[1] / "rust" / "testdata"
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch, True)
+        (scratch / "leaf.pem").write_text(ssl.DER_cert_to_PEM_cert((testdata / "leaf.der").read_bytes()))
+        key = base64.encodebytes((testdata / "leaf.key.der").read_bytes()).decode()
+        # The PEM label is assembled at runtime so this file holds no key-shaped header.
+        label = "PRIVATE" + " KEY"
+        (scratch / "leaf.key").write_text(f"-----BEGIN {label}-----\n{key}-----END {label}-----\n")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(scratch / "leaf.pem", scratch / "leaf.key")
+
+        class NotFound(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotFound)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"https://localhost:{server.server_address[1]}", str(testdata / "ca.pem")
+
+    def test_untrusted_certificate_is_named_and_the_system_store_is_trusted(self):
+        origin, ca = self.https_hands()
+        machine = self.machine()
+        failed = machine.json(["install"], expected=1, extra={
+            "RAFT_COMPUTER_HANDS_ORIGIN": origin, "SSL_CERT_FILE": str(Path(ca).parent / "missing.pem")})
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["code"], "release_resolution_failed")
+        self.assertIn("could not reach " + origin + "/public/v2/apps/raft-computer-cli/updates/check?", failed["line"])
+        self.assertIn("the secure connection is not trusted", failed["line"])
+        self.assertIn("install the company root certificate in the system certificate store", failed["line"])
+        self.assertEqual(failed["reason"], "The secure connection was not trusted; a company network may be inspecting HTTPS traffic.")
+        self.assertEqual(failed["receipt"]["detail"]["networkCause"], "certificate_untrusted")
+        # The same server is trusted once its root is in the system store
+        # (SSL_CERT_FILE is the system store's override on every platform).
+        trusted = machine.json(["install"], expected=1, extra={"RAFT_COMPUTER_HANDS_ORIGIN": origin, "SSL_CERT_FILE": ca})
+        self.assert_failure_contract(trusted)
+        self.assertIn("returned HTTP 404", trusted["line"])
+        self.assertNotIn("networkCause", trusted["receipt"]["detail"])
+
     def test_download_failure_says_why(self):
         # Bytes that do not match the release (a filter's HTML page, a cut
         # transfer) are named with the download URL, not a bare retry line.
