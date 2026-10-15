@@ -171,13 +171,15 @@ fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) ->
 
 fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
     let cause = if error.is_timeout() {
-        "the request timed out"
+        "the request timed out".into()
+    } else if let Some(failure) = crate::network::classify(error, url) {
+        failure.sentence()
     } else if error.is_connect() {
-        "the connection failed"
+        "the connection failed".into()
     } else if error.is_redirect() {
-        "it redirected too many times"
+        "it redirected too many times".into()
     } else {
-        "the request failed"
+        "the request failed".into()
     };
     invalid(format!("could not reach {}: {cause}", shown_url(url)))
 }
@@ -199,18 +201,20 @@ impl Source {
             // A redirect off the Hands host is never followed: release
             // selection only comes from Hands, and a network filter that
             // answers for Hands is reported by its exact redirect instead.
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    if attempt.url().host_str() != hands_host.as_deref() {
-                        attempt.stop()
-                    } else if attempt.previous().len() > 5 {
-                        attempt.error("too many redirects")
-                    } else {
-                        attempt.follow()
-                    }
-                }))
-                .build()?,
+            client: crate::network::client(|builder| {
+                let hands_host = hands_host.clone();
+                builder.timeout(Duration::from_secs(30)).redirect(
+                    reqwest::redirect::Policy::custom(move |attempt| {
+                        if attempt.url().host_str() != hands_host.as_deref() {
+                            attempt.stop()
+                        } else if attempt.previous().len() > 5 {
+                            attempt.error("too many redirects")
+                        } else {
+                            attempt.follow()
+                        }
+                    }),
+                )
+            })?,
             hands_origin,
             hands_app: cfg.hands_app.clone(),
         })

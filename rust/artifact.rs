@@ -37,9 +37,12 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     let host = url.host_str().unwrap_or_default().to_owned();
     let cause = match &error {
         crate::Error::Http(error) if error.is_timeout() => "the download timed out".into(),
-        crate::Error::Http(error) if error.is_connect() => "the connection failed".into(),
-        crate::Error::Http(error) if error.is_redirect() => "it redirected too many times".into(),
-        crate::Error::Http(_) => "the download failed".into(),
+        crate::Error::Http(error) => match crate::network::classify(error, &url) {
+            Some(failure) => failure.sentence(),
+            None if error.is_connect() => "the connection failed".into(),
+            None if error.is_redirect() => "it redirected too many times".into(),
+            None => "the download failed".into(),
+        },
         crate::Error::Invalid(message) => {
             if message.starts_with("SHA256_MISMATCH") || message.starts_with("SIZE_MISMATCH") {
                 format!(
@@ -409,7 +412,7 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
                 let bytes = download(
-                    &Downloader::new()?,
+                    &crate::network::downloader()?,
                     release,
                     &dir,
                     "Raft Computer support file",
@@ -440,7 +443,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
     ensure_dir(&scratch)?;
     let sidecar = acquire_sidecar(cfg, manifest).await?;
     let bytes = download(
-        &Downloader::new()?,
+        &crate::network::downloader()?,
         &manifest.release,
         &scratch,
         "Raft Computer",
@@ -477,7 +480,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
 pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
-    let downloader = Downloader::new()?;
+    let downloader = crate::network::downloader()?;
     let bytes = download(
         &downloader,
         &manifest.release,

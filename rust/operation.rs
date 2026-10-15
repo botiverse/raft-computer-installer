@@ -4,7 +4,7 @@
 use crate::{
     Error, Result, artifact, computer,
     config::Config,
-    host,
+    host, network,
     presence::{Interaction, Presence},
     report::{self, FailureCode, Outcome, Receipt},
     request::{Reply, Request},
@@ -837,11 +837,18 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
             plan.detail.insert("diagnostic".into(), error.to_string());
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
             let (line, reason) = if untouched && artifact::is_download_failure(&error) {
+                let cause = network::cause_in(&error.to_string());
+                if let Some(cause) = cause {
+                    plan.detail
+                        .insert("networkCause".into(), cause.code().into());
+                }
                 (
                     bounded_line(format!(
                         "{error}. Nothing was changed. Run the same install command again."
                     )),
-                    "The installation could not finish.".into(),
+                    cause
+                        .map_or("The installation could not finish.", network::Cause::reason)
+                        .into(),
                 )
             } else if untouched {
                 (
@@ -1182,12 +1189,20 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 bounded_line(line),
             );
             result.code = Some(FailureCode::ReleaseResolutionFailed);
+            let cause = network::cause_in(&error.to_string());
             result.reason = Some(if source::is_network_redirect(&error) {
                 "The network redirected the release request to another host.".into()
+            } else if let Some(cause) = cause {
+                cause.reason().into()
             } else {
                 "The requested Raft Computer release could not be resolved.".into()
             });
             result.detail.insert("diagnostic".into(), error.to_string());
+            if let Some(cause) = cause {
+                result
+                    .detail
+                    .insert("networkCause".into(), cause.code().into());
+            }
             result.preserve_unresolved(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));
         }
