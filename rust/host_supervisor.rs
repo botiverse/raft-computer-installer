@@ -177,7 +177,7 @@ pub fn refusal(cfg: &Config, registration: &Registration, target: &str) -> Resul
         Registration::Absent => return Ok(None),
         Registration::Unknown(detail) => {
             return Ok(Some(format!(
-                "Raft Computer is registered with this computer's service manager by Raft Desktop, in a form this installer does not understand ({detail}). Nothing was changed. Update Computer from Raft Desktop, or run the install command from the setup page again to get a newer installer."
+                "Raft Computer is registered with this computer's service manager by Raft Desktop, in a form this version does not understand ({detail}). Nothing was changed. Update Computer from Raft Desktop, or run the install command from the setup page again."
             )));
         }
         Registration::Registered(supervisor) => supervisor,
