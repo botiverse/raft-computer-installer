@@ -141,7 +141,11 @@ and start, never `raft-computer stop`/`start` beside it:
   registered"), names another binary path than this installation's, or the
   target is below its `minComputerVersion`. On Windows the installer first
   leaves the job object the service runs in (`CREATE_BREAKAWAY_FROM_JOB`), or
-  is held.
+  is held. When a stop disables a supervisor that was enabled, the installer
+  records `computer/installer/supervisor-disabled-by-run.json` and re-enables it
+  afterwards (in this run or the next). Its own `raft-computer start`/`stop`
+  carry `RAFT_COMPUTER_INSTALLER_LIFECYCLE=1`, so slock keeps that marker for
+  them; a user's or Raft Desktop's stop or start settles it.
 
 The registration and the supervised exit-code table are contracts owned by
 slock; `contract/` holds byte-identical copies, pinned by digest in
