@@ -478,18 +478,21 @@ async fn start_product_attempt(
     supervisor: Option<&crate::host_supervisor::HostSupervisor>,
 ) -> std::result::Result<Evidence, ProductStartError> {
     if let Some(supervisor) = supervisor {
-        crate::host_supervisor::start(cfg, supervisor)
-            .await
-            .map_err(|error| ProductStartError {
-                failure: computer::LifecycleFailure {
-                    kind: "command-error".into(),
-                    argv: vec!["start".into()],
-                    exit_code: None,
-                    stderr_tail: error.to_string(),
-                    stderr_truncated: false,
-                },
-                error,
-            })?;
+        // Started through the supervisor, which enables it: nothing left to restore.
+        let started = crate::host_supervisor::start(cfg, supervisor).await;
+        if started.is_ok() {
+            crate::host_supervisor::clear_disabled_marker(cfg);
+        }
+        started.map_err(|error| ProductStartError {
+            failure: computer::LifecycleFailure {
+                kind: "command-error".into(),
+                argv: vec!["start".into()],
+                exit_code: None,
+                stderr_tail: error.to_string(),
+                stderr_truncated: false,
+            },
+            error,
+        })?;
         return wait_ready(cfg, vec!["start".into()]).await;
     }
     if let Some(unit) = unit {

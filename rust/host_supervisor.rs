@@ -708,6 +708,40 @@ pub async fn stop_will_disable(supervisor: &HostSupervisor) -> bool {
     supervisor_enabled(supervisor).await == Some(true)
 }
 
+/// "An installer run disabled the supervisor and has not restored it yet",
+/// durable outside any one operation plan: a run that fails after its stop,
+/// or whose restore fails, leaves it for the next run (a new plan) to finish.
+pub fn disabled_marker_path(cfg: &Config) -> PathBuf {
+    cfg.installer_dir.join("supervisor-disabled-by-run.json")
+}
+
+pub fn disabled_by_earlier_run(cfg: &Config) -> bool {
+    fs::metadata(disabled_marker_path(cfg)).is_ok()
+}
+
+pub fn mark_disabled_by_run(cfg: &Config) -> Result<()> {
+    k_carrier::storage::ensure_dir(&cfg.installer_dir)?;
+    k_carrier::storage::write_json(
+        &disabled_marker_path(cfg),
+        &serde_json::json!({ "formatVersion": 1 }),
+    )
+}
+
+pub fn clear_disabled_marker(cfg: &Config) {
+    let _ = fs::remove_file(disabled_marker_path(cfg));
+}
+
+/// Before this run's stop: will it disable an enabled supervisor? A marker
+/// left by an earlier run counts (the supervisor is disabled now only
+/// because of it). Records the durable marker when so.
+pub async fn note_stop(cfg: &Config, supervisor: &HostSupervisor) -> Result<bool> {
+    let disables = disabled_by_earlier_run(cfg) || stop_will_disable(supervisor).await;
+    if disables {
+        mark_disabled_by_run(cfg)?;
+    }
+    Ok(disables)
+}
+
 /// After a run that stopped but did not start the Computer: restore the
 /// supervisor's previous state. Returns a warning when re-enabling failed
 /// (the installed bytes stand either way).
@@ -716,14 +750,19 @@ pub async fn restore_after_stop(
     supervisor: &HostSupervisor,
     disabled_by_run: bool,
 ) -> Option<String> {
-    if !disabled_by_run {
+    if !disabled_by_run && !disabled_by_earlier_run(cfg) {
         return None;
     }
-    enable(cfg, supervisor).await.err().map(|error| {
-        format!(
+    match enable(cfg, supervisor).await {
+        Ok(()) => {
+            clear_disabled_marker(cfg);
+            None
+        }
+        // The marker stays: the next run restores it.
+        Err(error) => Some(format!(
             "The service manager could not re-enable Raft Computer ({error}); run `raft-computer start` to bring it back."
-        )
-    })
+        )),
+    }
 }
 
 pub async fn stop(cfg: &Config, supervisor: &HostSupervisor) -> Result<()> {
