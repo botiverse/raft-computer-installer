@@ -360,6 +360,21 @@ fn command_path(cfg: &Config, id: &str) -> Result<std::path::PathBuf> {
 /// it may invoke Computer, and it survives the calling host controller. That
 /// closes the late-effect window when K kills a timed-out controller while a
 /// product `start` or `stop` is still in flight.
+/// Set on the installer's own `raft-computer start`/`stop` (the product
+/// helper). Shared contract (slock docs/contracts/computer-os-manager-retirement.md):
+/// a stop carrying it is the installer's, so slock keeps the installer's
+/// `supervisor-disabled-by-run.json` marker; only a user's or Raft Desktop's
+/// stop settles it.
+pub const INSTALLER_LIFECYCLE_ENV: &str = "RAFT_COMPUTER_INSTALLER_LIFECYCLE";
+
+fn product_lifecycle_environment(
+    cfg: &Config,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut environment = cfg.environment();
+    environment.insert(INSTALLER_LIFECYCLE_ENV.into(), "1".into());
+    environment
+}
+
 pub async fn lifecycle(cfg: &Config, action: &str) -> Result<LifecycleResult> {
     if !["start", "stop"].contains(&action) {
         return Err(invalid("invalid product lifecycle action"));
@@ -488,7 +503,7 @@ pub async fn serve_lifecycle(cfg: &Config) -> Result<u8> {
     let result = run(
         &cfg.binary,
         &[&request.action],
-        &cfg.environment(),
+        &product_lifecycle_environment(cfg),
         Duration::from_secs(45),
     )
     .await;
@@ -644,4 +659,25 @@ pub async fn preserve_commands_after_stop(
     sync_dir(&cfg.installer_dir)?;
     sync_dir(&parent)?;
     Ok(Some(destination))
+}
+
+#[cfg(test)]
+mod installer_lifecycle_env_tests {
+    use super::*;
+
+    #[test]
+    fn the_product_helper_marks_its_lifecycle_commands_as_the_installers() {
+        let cfg = Config::load().unwrap();
+        let environment = product_lifecycle_environment(&cfg);
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(INSTALLER_LIFECYCLE_ENV)),
+            Some(&std::ffi::OsString::from("1"))
+        );
+        assert!(environment.contains_key(std::ffi::OsStr::new("RAFT_HOME")));
+        assert!(
+            !cfg.environment()
+                .contains_key(std::ffi::OsStr::new(INSTALLER_LIFECYCLE_ENV)),
+            "only the product helper carries it"
+        );
+    }
 }
