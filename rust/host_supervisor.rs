@@ -111,8 +111,13 @@ pub fn parse(bytes: &[u8]) -> Registration {
     let Ok(record) = serde_json::from_slice::<Value>(bytes) else {
         return Registration::Absent;
     };
-    let Some(format) = record.get("formatVersion").and_then(Value::as_u64) else {
+    // A non-numeric version is a corrupt record; a number this installer
+    // does not know (3, 2.5) is a valid record of another version: held.
+    let Some(number) = record.get("formatVersion").filter(|v| v.is_number()) else {
         return Registration::Absent;
+    };
+    let Some(format) = number.as_u64() else {
+        return Registration::Unknown(format!("owner record format {number}"));
     };
     match format {
         1 => return Registration::Absent,
@@ -181,45 +186,203 @@ pub fn normalized_path(path: &std::path::Path) -> String {
 }
 
 /// The registration, with its definition confirmed in the OS manager before
-/// anything is stopped (slock `supervisorDefinitionPresent`): the plist or
-/// unit file exists, or `schtasks /Query` finds the task. A definition that
-/// is gone makes the registration stale: Absent, exactly as slock's
-/// `raft-computer start` treats it (it clears the record and starts
-/// self-managed), so a self-managed Computer is upgraded the self-managed
-/// way. A manager that cannot be asked is Unknown (held).
+/// anything is stopped (slock `supervisorDefinitionPresent`, same rules):
+/// - the plist or unit file exists, or `schtasks /Query` finds the task:
+///   registered;
+/// - nothing at all (no file, no loaded job): a stale registration, Absent,
+///   exactly as slock's `raft-computer start` treats it (it clears the record
+///   and starts self-managed);
+/// - the file is gone but launchd / systemd still has the job loaded: held
+///   (Unknown). It is not self-managed (the manager would relaunch it), and
+///   once stopped it could not be started again without its definition;
+/// - a manager that cannot be asked: held (Unknown).
 pub async fn resolve(cfg: &Config) -> Registration {
     let registration = read(cfg);
     let Registration::Registered(supervisor) = &registration else {
         return registration;
     };
-    match definition_present(supervisor).await {
-        Some(true) => registration,
-        Some(false) => Registration::Absent,
+    match definition_state(supervisor).await {
+        Some(DefinitionState::Present) => registration,
+        Some(DefinitionState::Absent) => Registration::Absent,
+        Some(DefinitionState::LoadedWithoutFile) => Registration::Unknown(
+            "the service manager still runs the registered job, but its definition file is gone"
+                .into(),
+        ),
         None => Registration::Unknown(
             "the service manager could not be asked about the registered definition".into(),
         ),
     }
 }
 
-/// Does the registered definition exist? None when the manager cannot be asked.
-pub async fn definition_present(supervisor: &HostSupervisor) -> Option<bool> {
-    if supervisor.kind == Kind::WindowsTask {
-        let mut command = tokio::process::Command::new("schtasks");
-        command
-            .args(["/Query", "/TN", supervisor.name.as_str()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let status = tokio::time::timeout(Duration::from_secs(30), command.status())
-            .await
-            .ok()?
-            .ok()?;
-        return Some(status.success());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinitionState {
+    Present,
+    /// No file, but the manager has the job loaded (launchd / systemd).
+    LoadedWithoutFile,
+    Absent,
+}
+
+/// Where the registered definition stands; None when the manager cannot be asked.
+pub async fn definition_state(supervisor: &HostSupervisor) -> Option<DefinitionState> {
+    match supervisor.kind {
+        Kind::WindowsTask => {
+            let (found, _) =
+                query("schtasks", &["/Query", "/TN", supervisor.name.as_str()]).await?;
+            Some(if found {
+                DefinitionState::Present
+            } else {
+                DefinitionState::Absent
+            })
+        }
+        Kind::LaunchdAgent | Kind::SystemdUser => {
+            let file = supervisor.definition_path.as_ref()?;
+            if fs::metadata(file).is_ok_and(|meta| meta.is_file()) {
+                return Some(DefinitionState::Present);
+            }
+            let loaded = if supervisor.kind == Kind::LaunchdAgent {
+                query(
+                    "launchctl",
+                    &["print", &launchd_target(supervisor, current_uid())],
+                )
+                .await?
+                .0
+            } else {
+                let (ok, out) = query(
+                    "systemctl",
+                    &[
+                        "--user",
+                        "show",
+                        "-p",
+                        "LoadState",
+                        "--value",
+                        "--",
+                        &supervisor.name,
+                    ],
+                )
+                .await?;
+                ok && out.trim() == "loaded"
+            };
+            Some(if loaded {
+                DefinitionState::LoadedWithoutFile
+            } else {
+                DefinitionState::Absent
+            })
+        }
     }
-    let path = supervisor.definition_path.as_ref()?;
-    Some(fs::metadata(path).is_ok_and(|meta| meta.is_file()))
+}
+
+/// Whether the supervisor is enabled (it will start the service at the next
+/// login). None when not applicable (systemd: the installer only stops a
+/// unit, it never disables it) or when the manager cannot be asked.
+pub async fn supervisor_enabled(supervisor: &HostSupervisor) -> Option<bool> {
+    match supervisor.kind {
+        Kind::SystemdUser => None,
+        Kind::LaunchdAgent => {
+            let (ok, out) = query(
+                "launchctl",
+                &["print-disabled", &format!("gui/{}", current_uid())],
+            )
+            .await?;
+            ok.then(|| !launchd_disabled(&out, &supervisor.name))
+        }
+        Kind::WindowsTask => {
+            let (ok, out) = query(
+                "schtasks",
+                &[
+                    "/Query",
+                    "/TN",
+                    supervisor.name.as_str(),
+                    "/FO",
+                    "CSV",
+                    "/NH",
+                ],
+            )
+            .await?;
+            ok.then(|| !out.contains("\"Disabled\""))
+        }
+    }
+}
+
+/// `launchctl print-disabled` lists `"label" => disabled` (macOS 13+) or
+/// `"label" => true` (older); a label it does not list is enabled.
+pub fn launchd_disabled(output: &str, label: &str) -> bool {
+    let needle = format!("\"{label}\" =>");
+    output.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with(&needle)
+            && matches!(
+                line[needle.len()..].trim().trim_end_matches(','),
+                "disabled" | "true"
+            )
+    })
+}
+
+/// One bounded query of the service manager: Some((succeeded, stdout)), or
+/// None when it could not be run at all.
+pub async fn query(program: &str, args: &[&str]) -> Option<(bool, String)> {
+    #[cfg(test)]
+    if let Some(answer) = test_manager::answer(program, args) {
+        return answer;
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        command.env("XDG_RUNTIME_DIR", format!("/run/user/{}", current_uid()));
+    }
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    Some((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    ))
+}
+
+/// Test seam: answers manager queries and records every supervisor command,
+/// so a test can prove what was (not) stopped. Per thread (tokio tests run on
+/// the current thread).
+#[cfg(test)]
+pub mod test_manager {
+    use std::cell::RefCell;
+    type Answer = Box<dyn Fn(&str, &[&str]) -> Option<(bool, String)>>;
+    thread_local! {
+        static ANSWER: RefCell<Option<Answer>> = const { RefCell::new(None) };
+        static COMMANDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn install(answer: impl Fn(&str, &[&str]) -> Option<(bool, String)> + 'static) {
+        ANSWER.with(|cell| *cell.borrow_mut() = Some(Box::new(answer)));
+        COMMANDS.with(|cell| cell.borrow_mut().clear());
+    }
+    pub fn commands() -> Vec<String> {
+        COMMANDS.with(|cell| cell.borrow().clone())
+    }
+    pub(super) fn answer(program: &str, args: &[&str]) -> Option<Option<(bool, String)>> {
+        ANSWER.with(|cell| cell.borrow().as_ref().map(|answer| answer(program, args)))
+    }
+    thread_local! {
+        static FAIL_COMMANDS: RefCell<bool> = const { RefCell::new(false) };
+    }
+    /// Make every recorded supervisor command fail.
+    pub fn fail_commands(fail: bool) {
+        FAIL_COMMANDS.with(|cell| *cell.borrow_mut() = fail);
+    }
+    /// Some(result) when the seam is installed (the command is recorded, not run).
+    pub(super) fn record(line: String) -> Option<bool> {
+        let installed = ANSWER.with(|cell| cell.borrow().is_some());
+        if !installed {
+            return None;
+        }
+        COMMANDS.with(|cell| cell.borrow_mut().push(line));
+        Some(!FAIL_COMMANDS.with(|cell| *cell.borrow()))
+    }
 }
 
 pub fn read(cfg: &Config) -> Registration {
@@ -447,6 +610,20 @@ pub fn current_uid() -> u32 {
 }
 
 async fn execute(program: &'static str, args: &[OsString]) -> Result<()> {
+    #[cfg(test)]
+    if let Some(ok) = test_manager::record(format!(
+        "{program} {}",
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )) {
+        return if ok {
+            Ok(())
+        } else {
+            Err(invalid(format!("{program} failed")))
+        };
+    }
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -500,8 +677,8 @@ pub async fn apply(cfg: &Config, steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
-/// Leave the supervisor enabled without starting it (a repair of a stopped
-/// registered Computer: its stop disabled it).
+/// Re-enable without starting (a repair whose own stop disabled an enabled
+/// supervisor: the previous state is restored, never more).
 pub fn enable_steps(supervisor: &HostSupervisor, uid: u32) -> Vec<Step> {
     match supervisor.kind {
         Kind::LaunchdAgent => vec![run(
@@ -509,11 +686,9 @@ pub fn enable_steps(supervisor: &HostSupervisor, uid: u32) -> Vec<Step> {
             &["enable", &launchd_target(supervisor, uid)],
             false,
         )],
-        Kind::SystemdUser => vec![run(
-            "systemctl",
-            &["--user", "enable", "--", &supervisor.name],
-            false,
-        )],
+        // The installer only stops a unit (`systemctl --user stop`), it never
+        // disables it: nothing to undo.
+        Kind::SystemdUser => vec![],
         Kind::WindowsTask => vec![run(
             "schtasks",
             &["/Change", "/TN", &supervisor.name, "/ENABLE"],
@@ -524,6 +699,31 @@ pub fn enable_steps(supervisor: &HostSupervisor, uid: u32) -> Vec<Step> {
 
 pub async fn enable(cfg: &Config, supervisor: &HostSupervisor) -> Result<()> {
     apply(cfg, &enable_steps(supervisor, current_uid())).await
+}
+
+/// Before a stop that disables (launchd, the task): was the supervisor
+/// enabled? Only then does `restore_after_stop` re-enable it. Unknown counts
+/// as not enabled: a supervisor the user stopped is never turned back on.
+pub async fn stop_will_disable(supervisor: &HostSupervisor) -> bool {
+    supervisor_enabled(supervisor).await == Some(true)
+}
+
+/// After a run that stopped but did not start the Computer: restore the
+/// supervisor's previous state. Returns a warning when re-enabling failed
+/// (the installed bytes stand either way).
+pub async fn restore_after_stop(
+    cfg: &Config,
+    supervisor: &HostSupervisor,
+    disabled_by_run: bool,
+) -> Option<String> {
+    if !disabled_by_run {
+        return None;
+    }
+    enable(cfg, supervisor).await.err().map(|error| {
+        format!(
+            "The service manager could not re-enable Raft Computer ({error}); run `raft-computer start` to bring it back."
+        )
+    })
 }
 
 pub async fn stop(cfg: &Config, supervisor: &HostSupervisor) -> Result<()> {
@@ -861,6 +1061,7 @@ mod tests {
 
     #[test]
     fn enabling_a_stopped_registration_never_starts_it() {
+        // (Only re-enables; systemd units are never disabled by the installer.)
         let s = supervisor(Kind::LaunchdAgent, "build.raft.desktop.computer");
         assert_eq!(
             commands(&enable_steps(&s, 501)),
@@ -871,6 +1072,202 @@ mod tests {
             commands(&enable_steps(&t, 0)),
             [r"schtasks /Change /TN \Raft\Raft Computer /ENABLE"]
         );
+    }
+
+    #[test]
+    fn every_shared_parsing_case_is_classified_as_slock_classifies_it() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../contract/host-lifecycle-registration.cases.json"
+        ))
+        .unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let raw = case["raw"].as_str().unwrap();
+            let state = match parse(raw.as_bytes()) {
+                Registration::Absent => "absent",
+                Registration::Registered(_) => "registered",
+                Registration::Unknown(_) => "unknown",
+            };
+            assert_eq!(state, case["state"].as_str().unwrap(), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn launchctl_print_disabled_is_read_for_the_label_only() {
+        let out = "disabled services = {\n\t\"com.other\" => disabled\n\t\"build.raft.desktop.computer\" => disabled\n}\n";
+        assert!(launchd_disabled(out, "build.raft.desktop.computer"));
+        assert!(!launchd_disabled(
+            "\t\"build.raft.desktop.computer\" => enabled\n",
+            "build.raft.desktop.computer"
+        ));
+        assert!(
+            launchd_disabled(
+                "\t\"build.raft.desktop.computer\" => true\n",
+                "build.raft.desktop.computer"
+            ),
+            "older macOS"
+        );
+        assert!(!launchd_disabled(
+            "\t\"build.raft.desktop.computer.x\" => disabled\n",
+            "build.raft.desktop.computer"
+        ));
+        assert!(
+            !launchd_disabled("", "build.raft.desktop.computer"),
+            "not listed: enabled"
+        );
+    }
+
+    /// archer #60 re-review, follow-ups 1 and 2: the registration is present
+    /// and the plist was deleted while the Computer runs.
+    /// - launchd still has the job loaded: held, so nothing is stopped (once
+    ///   booted out it could not be started again without its definition);
+    /// - nothing is loaded: the Computer is self-managed; the supervisor is
+    ///   never touched.
+    /// upgrade, install and repair all pass this one gate before any stop
+    /// (`the_supervisor_gate_comes_before_every_stop`).
+    #[tokio::test]
+    async fn a_deleted_plist_with_the_job_still_loaded_is_held_and_nothing_is_stopped() {
+        let (dir, cfg) = temp_cfg();
+        let plist = dir.path().join("build.raft.desktop.computer.plist");
+        write_registration(&cfg, &plist);
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print")) => {
+                Some((true, "\tstate = running\n\tpid = 4242\n".into()))
+            }
+            _ => Some((false, String::new())),
+        });
+        let registration = resolve(&cfg).await;
+        assert!(
+            matches!(&registration, Registration::Unknown(detail) if detail.contains("definition file is gone")),
+            "{registration:?}"
+        );
+        for target in ["1.0.58", "1.0.60"] {
+            let (code, _) = refusal_with_code(&cfg, &registration, target)
+                .unwrap()
+                .expect("held before anything stops");
+            assert_eq!(code, crate::report::FailureCode::InstallationHeld);
+        }
+        assert_eq!(
+            test_manager::commands(),
+            Vec::<String>::new(),
+            "nothing disabled, booted out or stopped"
+        );
+
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print")) => Some((false, String::new())),
+            _ => Some((false, String::new())),
+        });
+        assert_eq!(
+            resolve(&cfg).await,
+            Registration::Absent,
+            "nothing loaded: self-managed"
+        );
+        assert_eq!(
+            refusal(&cfg, &Registration::Absent, "1.0.60").unwrap(),
+            None
+        );
+        assert_eq!(
+            test_manager::commands(),
+            Vec::<String>::new(),
+            "the supervisor is never touched"
+        );
+
+        test_manager::install(|_, _| None);
+        assert!(
+            matches!(resolve(&cfg).await, Registration::Unknown(_)),
+            "a manager that cannot be asked holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_systemd_unit_whose_file_is_gone_but_still_loaded_is_held() {
+        let (dir, cfg) = temp_cfg();
+        let unit = dir.path().join("raft-desktop-computer.service");
+        let record = serde_json::json!({ "formatVersion": 2, "supervisor": {
+            "kind": "systemd-user", "name": "raft-desktop-computer.service", "definitionPath": unit,
+            "binaryPath": cfg.binary, "launcherPath": null, "registeredBy": "desktop", "registeredAt": "t", "minComputerVersion": "1.0.58" } });
+        fs::create_dir_all(registration_path(&cfg).parent().unwrap()).unwrap();
+        fs::write(registration_path(&cfg), record.to_string()).unwrap();
+        test_manager::install(|program, args| match program {
+            "systemctl" if args.contains(&"LoadState") => Some((true, "loaded\n".into())),
+            _ => Some((false, String::new())),
+        });
+        assert!(matches!(resolve(&cfg).await, Registration::Unknown(_)));
+        test_manager::install(|program, args| match program {
+            "systemctl" if args.contains(&"LoadState") => Some((true, "not-found\n".into())),
+            _ => Some((false, String::new())),
+        });
+        assert_eq!(resolve(&cfg).await, Registration::Absent);
+    }
+
+    /// archer #60 re-review blocker: restore the previous state, never more.
+    #[tokio::test]
+    async fn a_run_re_enables_only_what_its_own_stop_disabled() {
+        let (_dir, cfg) = temp_cfg();
+        let s = supervisor(Kind::LaunchdAgent, "build.raft.desktop.computer");
+        // (a) The user ran `raft-computer stop` (the label is disabled): the
+        // install or repair leaves it disabled.
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print-disabled")) => Some((
+                true,
+                "\t\"build.raft.desktop.computer\" => disabled\n".into(),
+            )),
+            _ => Some((true, String::new())),
+        });
+        let disabled_by_run = stop_will_disable(&s).await;
+        assert!(!disabled_by_run);
+        assert_eq!(restore_after_stop(&cfg, &s, disabled_by_run).await, None);
+        assert_eq!(
+            test_manager::commands(),
+            Vec::<String>::new(),
+            "never re-enabled"
+        );
+        // (b) It was enabled and this run's stop disabled it: re-enabled.
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print-disabled")) => {
+                Some((true, "\t\"com.other\" => disabled\n".into()))
+            }
+            _ => Some((true, String::new())),
+        });
+        let disabled_by_run = stop_will_disable(&s).await;
+        assert!(disabled_by_run);
+        assert_eq!(restore_after_stop(&cfg, &s, disabled_by_run).await, None);
+        assert_eq!(
+            test_manager::commands(),
+            ["launchctl enable gui/".to_string()
+                + &current_uid().to_string()
+                + "/build.raft.desktop.computer"]
+        );
+        // A failed re-enable is a warning, never a failed install.
+        test_manager::fail_commands(true);
+        let warning = restore_after_stop(&cfg, &s, true).await;
+        test_manager::fail_commands(false);
+        assert!(warning.is_some_and(|w| w.contains("raft-computer start")));
+        // Unknown state (the manager did not answer) never re-enables.
+        test_manager::install(|_, _| None);
+        assert!(!stop_will_disable(&s).await);
+        // systemd: the installer never disables a unit, so nothing to undo.
+        let unit = supervisor(Kind::SystemdUser, "raft-desktop-computer.service");
+        assert!(!stop_will_disable(&unit).await);
+        assert!(enable_steps(&unit, 0).is_empty());
+    }
+
+    #[test]
+    fn the_supervisor_gate_comes_before_every_stop() {
+        let source = include_str!("operation.rs");
+        for function in ["async fn upgrade(", "async fn install("] {
+            let body = &source[source.find(function).unwrap()..];
+            let body = &body[..body[1..]
+                .find("\nasync fn ")
+                .map_or(body.len(), |end| end + 1)];
+            let gate = body
+                .find("supervisor_refusal(cfg, plan).await?")
+                .unwrap_or_else(|| panic!("{function} has the gate"));
+            for stop in ["stop_product(", "Phase::Stopping", "Phase::Upgrading"] {
+                if let Some(at) = body.find(stop) {
+                    assert!(gate < at, "{function}: the supervisor gate precedes {stop}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -895,6 +1292,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 2);
+        assert_eq!(checked, 3);
     }
 }

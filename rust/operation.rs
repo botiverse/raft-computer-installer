@@ -780,6 +780,18 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 crate::process::terminate(&crate::host::installed_product_processes(cfg)?).await?,
             );
         }
+        // Record what this run's stop is about to undo: a launchd agent or a
+        // logon task is disabled by it. Only an enabled one is re-enabled at
+        // the end (restore the previous state); a supervisor the user
+        // stopped (`raft-computer stop` disables it) stays disabled.
+        if let Some(supervisor) = host_supervisor(plan)
+            && !plan.detail.contains_key("supervisorDisabledByRun")
+        {
+            let disables = crate::host_supervisor::stop_will_disable(&supervisor).await;
+            plan.detail
+                .insert("supervisorDisabledByRun".into(), disables.to_string());
+            save(cfg, plan)?;
+        }
         forced.extend(
             host::stop_product(
                 cfg,
@@ -897,11 +909,24 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 ));
             }
             plan.detail.insert("readback".into(), "candidate".into());
-            // A repair stops through the supervisor, which disables it; a
-            // registered Computer that was not running is left enabled (not
-            // started), so its next login or `raft-computer start` brings it up.
+            // A repair's stop disables a launchd agent or a logon task (a
+            // systemd unit is only stopped, never disabled). The Computer was
+            // not running and is not started: restore only what this run
+            // changed, so an enabled supervisor is enabled again and one the
+            // user stopped stays stopped. A failure here never fails the
+            // installed bytes: it is a warning in the outcome.
             if let Some(supervisor) = host_supervisor(plan) {
-                crate::host_supervisor::enable(cfg, &supervisor).await?;
+                let disabled_by_run = plan
+                    .detail
+                    .get("supervisorDisabledByRun")
+                    .map(String::as_str)
+                    == Some("true");
+                if let Some(warning) =
+                    crate::host_supervisor::restore_after_stop(cfg, &supervisor, disabled_by_run)
+                        .await
+                {
+                    plan.detail.insert("warning".into(), warning);
+                }
             }
         }
         let outcome = if plan.kind == Kind::Repair {
