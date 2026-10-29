@@ -18,7 +18,7 @@ from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
     "caller_not_computer", "candidate_start_failed", "downgrade_not_allowed",
-    "install_failed", "installation_declined", "installation_held",
+    "install_failed", "installation_declined", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
     "request_conflict", "result_unreadable",

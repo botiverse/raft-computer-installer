@@ -34,6 +34,11 @@ pub struct ProductState {
     /// product is then stopped and started through `systemctl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_unit: Option<crate::systemd::ServiceUnit>,
+    /// The supervisor Raft Desktop registered for this home when the
+    /// operation began (host_supervisor.rs); it then stops and starts the
+    /// product, ahead of any systemd unit found at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_supervisor: Option<crate::host_supervisor::HostSupervisor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -253,6 +258,7 @@ pub async fn prepare(
     artifact::saved_sidecar(cfg, &operation.from_version)?;
     let answer = answer(cfg).await?;
     let service_unit = crate::systemd::product_unit(cfg).await?;
+    let host_supervisor = registered_supervisor(cfg).await?;
     save(
         cfg,
         &ProductState {
@@ -268,8 +274,24 @@ pub async fn prepare(
             last_start: None,
             waiting_caller: cfg.waiting_caller.clone(),
             service_unit,
+            host_supervisor,
         },
     )
+}
+
+/// The registered supervisor, or None. A registration that is not understood
+/// never reads as "none" (operation.rs holds it before K starts; finding one
+/// here means it changed mid-operation).
+pub async fn registered_supervisor(
+    cfg: &Config,
+) -> Result<Option<crate::host_supervisor::HostSupervisor>> {
+    match crate::host_supervisor::resolve(cfg).await {
+        crate::host_supervisor::Registration::Absent => Ok(None),
+        crate::host_supervisor::Registration::Registered(supervisor) => Ok(Some(supervisor)),
+        crate::host_supervisor::Registration::Unknown(detail) => Err(Error::Uncertain(format!(
+            "the service registration is not understood: {detail}"
+        ))),
+    }
 }
 
 pub fn read(cfg: &Config) -> Result<ProductState> {
@@ -309,13 +331,16 @@ pub async fn live_evidence(cfg: &Config) -> Result<Evidence> {
 pub async fn stop_product(
     cfg: &Config,
     unit: Option<&crate::systemd::ServiceUnit>,
+    supervisor: Option<&crate::host_supervisor::HostSupervisor>,
 ) -> Result<Vec<u32>> {
     // The product gets the first opportunity to unregister or stop its service;
-    // a systemd unit is stopped by its manager, which then does not restart it.
+    // a supervisor (Raft Desktop's registration, or a systemd unit) is stopped
+    // through its manager, disabled first so it does not restart it.
     // The bounded fallback acts only on OS-identified instances of this binary.
-    match unit {
-        Some(unit) => crate::systemd::systemctl(unit, "stop").await?,
-        None => {
+    match (supervisor, unit) {
+        (Some(supervisor), _) => crate::host_supervisor::stop(cfg, supervisor).await?,
+        (None, Some(unit)) => crate::systemd::systemctl(unit, "stop").await?,
+        (None, None) => {
             let _ = computer::lifecycle(cfg, "stop").await?;
         }
     }
@@ -408,13 +433,68 @@ pub fn publish(cfg: &Config, slot: Slot) -> Result<String> {
         },
     }
     write_durable(&cfg.binary, &binary, true)?;
+    publish_launcher(cfg);
     Ok(version)
+}
+
+pub const LAUNCHER_NAME: &str = "raft-computer-launch.exe";
+
+/// Keep `raft-computer-launch.exe` next to the published binary at this
+/// installer's version. Best effort: the product is stopped (so the launcher
+/// has exited), and a launcher that could not be replaced is an older
+/// working one, never a reason to fail or roll back the Computer.
+#[cfg(not(windows))]
+fn publish_launcher(_: &Config) {}
+
+#[cfg(windows)]
+#[allow(clippy::const_is_empty)] // empty in builds that embedded no launcher
+fn publish_launcher(cfg: &Config) {
+    // Embedded at build time (build.rs).
+    const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raft-computer-launch.bin"));
+    if LAUNCHER.is_empty() {
+        return;
+    }
+    // Only a machine Raft Desktop registered with a logon task runs the launcher.
+    if !matches!(
+        crate::host_supervisor::read(cfg),
+        crate::host_supervisor::Registration::Registered(ref supervisor)
+            if supervisor.kind == crate::host_supervisor::Kind::WindowsTask
+    ) {
+        return;
+    }
+    let Some(directory) = cfg.binary.parent() else {
+        return;
+    };
+    let destination = directory.join(LAUNCHER_NAME);
+    if fs::read(&destination).is_ok_and(|existing| existing == LAUNCHER) {
+        return;
+    }
+    let _ = write_durable(&destination, LAUNCHER, true);
 }
 
 async fn start_product_attempt(
     cfg: &Config,
     unit: Option<&crate::systemd::ServiceUnit>,
+    supervisor: Option<&crate::host_supervisor::HostSupervisor>,
 ) -> std::result::Result<Evidence, ProductStartError> {
+    if let Some(supervisor) = supervisor {
+        // Started through the supervisor, which enables it: nothing left to restore.
+        let started = crate::host_supervisor::start(cfg, supervisor).await;
+        if started.is_ok() {
+            crate::host_supervisor::clear_disabled_marker(cfg);
+        }
+        started.map_err(|error| ProductStartError {
+            failure: computer::LifecycleFailure {
+                kind: "command-error".into(),
+                argv: vec!["start".into()],
+                exit_code: None,
+                stderr_tail: error.to_string(),
+                stderr_truncated: false,
+            },
+            error,
+        })?;
+        return wait_ready(cfg, vec!["start".into()]).await;
+    }
     if let Some(unit) = unit {
         crate::systemd::systemctl(unit, "start")
             .await
@@ -498,8 +578,9 @@ async fn wait_ready(
 pub async fn start_product(
     cfg: &Config,
     unit: Option<&crate::systemd::ServiceUnit>,
+    supervisor: Option<&crate::host_supervisor::HostSupervisor>,
 ) -> Result<Evidence> {
-    start_product_attempt(cfg, unit)
+    start_product_attempt(cfg, unit, supervisor)
         .await
         .map_err(|failure| failure.error)
 }
@@ -636,7 +717,13 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
         }
         publish(cfg, slot)?;
         let evidence = if record.running {
-            match start_product_attempt(cfg, record.service_unit.as_ref()).await {
+            match start_product_attempt(
+                cfg,
+                record.service_unit.as_ref(),
+                record.host_supervisor.as_ref(),
+            )
+            .await
+            {
                 Ok(evidence) => evidence,
                 Err(failure) => {
                     if let Ok(reference) =
@@ -742,9 +829,14 @@ async fn dispatch(cfg: &Config, request: Request) -> Result<Value> {
         "stop" => {
             let mut record = read(cfg)?;
             if record.running {
-                record
-                    .forced_stops
-                    .extend(stop_product(cfg, record.service_unit.as_ref()).await?);
+                record.forced_stops.extend(
+                    stop_product(
+                        cfg,
+                        record.service_unit.as_ref(),
+                        record.host_supervisor.as_ref(),
+                    )
+                    .await?,
+                );
                 save(cfg, &record)?;
             } else if !installed_product_processes(cfg)?.is_empty() {
                 return Err(Error::Uncertain(

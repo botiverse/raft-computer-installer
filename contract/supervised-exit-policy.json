@@ -1,0 +1,24 @@
+{
+  "formatVersion": 1,
+  "description": "Exit-code contract between Raft Computer and the OS supervisor Raft Desktop registers. Source: slock docs/contracts/fixtures/supervised-exit-policy.json; the installer repo carries a byte-identical copy (contract/CONTRACT_FIXTURES).",
+  "classes": ["relaunch", "crash", "stay-down", "stay-down:unlinked", "stay-down:config"],
+  "exitCodeFor": {
+    "launchd-agent": { "relaunch": 75, "crash": 1, "stay-down": 0, "stay-down:unlinked": 0, "stay-down:config": 0 },
+    "systemd-user": { "relaunch": 75, "crash": 1, "stay-down": 0, "stay-down:unlinked": 77, "stay-down:config": 78 },
+    "windows-task": { "relaunch": 75, "crash": 1, "stay-down": 0, "stay-down:unlinked": 77, "stay-down:config": 78 }
+  },
+  "supervisorReads": {
+    "launchd-agent": { "relaunch": "nonzero", "stayDown": [0] },
+    "systemd-user": { "relaunch": "nonzero", "stayDown": [0, 77, 78] },
+    "windows-task": { "relaunch": "nonzero", "stayDown": [0, 77, 78] }
+  },
+  "launcher": {
+    "relaunchAtOnce": [75],
+    "stayDown": [0, 77, 78],
+    "otherwise": "crash",
+    "backoffMs": [2000, 4000, 8000, 16000, 32000, 60000],
+    "readyFile": "computer/run/launcher-ready",
+    "breakerReceipt": "computer/run/supervisor-breaker.json"
+  },
+  "breaker": { "consecutiveFailedStarts": 5 }
+}

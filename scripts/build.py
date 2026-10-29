@@ -105,13 +105,22 @@ def build(output, fixtures=False):
     target = target_key()
     triple = rust_triple(target)
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
+    environment = {**os.environ, "CARGO_TARGET_DIR": str(target_dir)}
+    built = target_dir / triple / "release" if triple else target_dir / "release"
+    if target.startswith("win32-"):
+        # The Windows installer embeds the launcher Raft Desktop's logon task
+        # runs (build.rs) and publishes it next to raft-computer.exe.
+        subprocess.run(["cargo", "build", "--locked", "--release", "--bin", "raft-computer-launch"], cwd=ROOT, check=True, env=environment)
+        launcher = built / "raft-computer-launch.exe"
+        if not launcher.is_file() or launcher.stat().st_size == 0:
+            raise ValueError("the Windows launcher was not built")
+        environment["RAFT_COMPUTER_LAUNCHER_EXE"] = str(launcher)
     command = ["cargo", "build", "--locked", "--release", "--bin", "raft-computer-installer"]
     if triple:
         command += ["--target", triple]
     if fixtures:
         command += ["--features", "verification-fixture", "--bin", "raft-computer-fixture"]
-    subprocess.run(command, cwd=ROOT, check=True, env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
-    built = target_dir / triple / "release" if triple else target_dir / "release"
+    subprocess.run(command, cwd=ROOT, check=True, env=environment)
     name = "raft-computer-installer" + (".exe" if os.name == "nt" else "")
     binary = output / "native" / target / name
     binary.parent.mkdir(parents=True, exist_ok=True)

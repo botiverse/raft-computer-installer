@@ -431,6 +431,73 @@ async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
         .map(|unit| crate::systemd::confinement_reason(&unit)))
 }
 
+/// The supervisor Raft Desktop registered when a repair began (see
+/// `hostSupervisor`), used for its stop and start.
+fn host_supervisor(plan: &Plan) -> Option<crate::host_supervisor::HostSupervisor> {
+    plan.detail
+        .get("hostSupervisor")
+        .and_then(|supervisor| serde_json::from_str(supervisor).ok())
+}
+
+/// Refuse before stopping anything when Raft Desktop's service registration
+/// forbids this operation: not understood, another binary path, a target
+/// below its floor, or (Windows) this installer could not leave the job the
+/// service runs in.
+async fn supervisor_refusal(cfg: &Config, plan: &Plan) -> Result<Option<(FailureCode, String)>> {
+    // The registration with its definition confirmed in the OS manager, before
+    // anything is stopped (a missing definition is a stale registration).
+    let registration = crate::host_supervisor::resolve(cfg).await;
+    if let Some(refusal) =
+        crate::host_supervisor::refusal_with_code(cfg, &registration, &plan.manifest.version)?
+    {
+        return Ok(Some(refusal));
+    }
+    Ok(crate::host_supervisor::confinement(&registration)
+        .map(|reason| (FailureCode::InstallationHeld, reason)))
+}
+
+fn refuse_supervised(
+    cfg: &Config,
+    plan: &mut Plan,
+    (code, reason): (FailureCode, String),
+) -> Result<Reply> {
+    finish(
+        cfg,
+        plan,
+        Outcome::Held,
+        Some((code, reason.clone())),
+        &reason,
+    )
+}
+
+/// After a failed operation: re-enable a supervisor this or an earlier run
+/// disabled, best effort, when no product process runs. The durable marker
+/// stays when this fails, so a later run still restores it.
+async fn restore_after_failure(cfg: &Config, plan: &Plan) -> Option<String> {
+    let running = !crate::host::installed_product_processes(cfg)
+        .ok()?
+        .is_empty();
+    restore_after_failure_with(cfg, host_supervisor(plan), running).await
+}
+
+async fn restore_after_failure_with(
+    cfg: &Config,
+    supervisor: Option<crate::host_supervisor::HostSupervisor>,
+    running: bool,
+) -> Option<String> {
+    if running || !crate::host_supervisor::disabled_by_earlier_run(cfg) {
+        return None;
+    }
+    crate::host_supervisor::restore_after_stop(cfg, &supervisor?, true).await
+}
+
+/// A new plan inherits an earlier run's "disabled by a run" marker.
+fn carry_over_disabled_marker(cfg: &Config, detail: &mut BTreeMap<String, String>) {
+    if crate::host_supervisor::disabled_by_earlier_run(cfg) {
+        detail.insert("supervisorDisabledByRun".into(), "true".into());
+    }
+}
+
 fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
     finish(
         cfg,
@@ -461,6 +528,9 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     if plan.phase == Phase::Ready {
         if let Some(reason) = systemd_confinement(cfg).await? {
             return refuse_confined(cfg, plan, reason);
+        }
+        if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
+            return refuse_supervised(cfg, plan, refusal);
         }
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
         let from = plan
@@ -698,6 +768,13 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
+        if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
+            return refuse_supervised(cfg, plan, refusal);
+        }
+        if let Some(supervisor) = host::registered_supervisor(cfg).await? {
+            plan.detail
+                .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
+        }
         if plan.kind == Kind::Repair {
             if let Some(reason) = systemd_confinement(cfg).await? {
                 return refuse_confined(cfg, plan, reason);
@@ -731,7 +808,26 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 crate::process::terminate(&crate::host::installed_product_processes(cfg)?).await?,
             );
         }
-        forced.extend(host::stop_product(cfg, service_unit(plan).as_ref()).await?);
+        // Record what this run's stop is about to undo: a launchd agent or a
+        // logon task is disabled by it. Only an enabled one is re-enabled at
+        // the end (restore the previous state); a supervisor the user
+        // stopped (`raft-computer stop` disables it) stays disabled.
+        if let Some(supervisor) = host_supervisor(plan)
+            && !plan.detail.contains_key("supervisorDisabledByRun")
+        {
+            let disables = crate::host_supervisor::note_stop(cfg, &supervisor).await?;
+            plan.detail
+                .insert("supervisorDisabledByRun".into(), disables.to_string());
+            save(cfg, plan)?;
+        }
+        forced.extend(
+            host::stop_product(
+                cfg,
+                service_unit(plan).as_ref(),
+                host_supervisor(plan).as_ref(),
+            )
+            .await?,
+        );
         if let Some(path) = computer::preserve_commands_after_stop(cfg, &plan.request.id).await? {
             plan.detail.insert(
                 "commandQuarantine".into(),
@@ -819,7 +915,14 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if plan.running == Some(true) || plan.setup_succeeded {
             let evidence = match host::live_evidence(cfg).await {
                 Ok(evidence) => evidence,
-                Err(_) => host::start_product(cfg, service_unit(plan).as_ref()).await?,
+                Err(_) => {
+                    host::start_product(
+                        cfg,
+                        service_unit(plan).as_ref(),
+                        host_supervisor(plan).as_ref(),
+                    )
+                    .await?
+                }
             };
             if evidence.version != plan.manifest.version {
                 return Err(Error::Uncertain(
@@ -834,6 +937,25 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 ));
             }
             plan.detail.insert("readback".into(), "candidate".into());
+            // A repair's stop disables a launchd agent or a logon task (a
+            // systemd unit is only stopped, never disabled). The Computer was
+            // not running and is not started: restore only what this run
+            // changed, so an enabled supervisor is enabled again and one the
+            // user stopped stays stopped. A failure here never fails the
+            // installed bytes: it is a warning in the outcome.
+            if let Some(supervisor) = host_supervisor(plan) {
+                let disabled_by_run = plan
+                    .detail
+                    .get("supervisorDisabledByRun")
+                    .map(String::as_str)
+                    == Some("true");
+                if let Some(warning) =
+                    crate::host_supervisor::restore_after_stop(cfg, &supervisor, disabled_by_run)
+                        .await
+                {
+                    plan.detail.insert("warning".into(), warning);
+                }
+            }
         }
         let outcome = if plan.kind == Kind::Repair {
             Outcome::Repaired
@@ -879,6 +1001,12 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
         Ok(reply) => Ok(reply),
         Err(error) => {
             plan.detail.insert("diagnostic".into(), error.to_string());
+            // A run that disabled the supervisor and failed before restoring
+            // it: restore now, best effort (only when nothing runs; a running
+            // service was started through the supervisor, which enabled it).
+            if let Some(warning) = restore_after_failure(cfg, plan).await {
+                plan.detail.insert("warning".into(), warning);
+            }
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
             let (line, reason) = if untouched && artifact::is_download_failure(&error) {
                 (
@@ -1311,6 +1439,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     if let Some(fallback) = source.roots_fallback() {
         plan.detail.insert("tlsRoots".into(), fallback.to_owned());
     }
+    carry_over_disabled_marker(cfg, &mut plan.detail);
     if plan.kind == Kind::Repair && exists(&active_path(cfg))? {
         mark_damage(cfg)?;
     }
@@ -1411,5 +1540,120 @@ mod rollback_copy_tests {
             reason,
             "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed and not running."
         );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_marker_tests {
+    use super::*;
+    use crate::host_supervisor::{self, HostSupervisor, Kind, test_manager};
+
+    fn cfg() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::load().unwrap();
+        cfg.state_home = dir.path().to_path_buf();
+        cfg.installer_dir = dir.path().join("computer").join("installer");
+        (dir, cfg)
+    }
+
+    fn agent() -> HostSupervisor {
+        HostSupervisor {
+            kind: Kind::LaunchdAgent,
+            name: "build.raft.desktop.computer".into(),
+            definition_path: Some(PathBuf::from("/x.plist")),
+            binary_path: PathBuf::from("/x/raft-computer"),
+            launcher_path: None,
+            min_computer_version: "1.0.58".into(),
+        }
+    }
+
+    /// archer #60 gap (a): a repair that stopped (disabling an enabled agent)
+    /// and then failed restores right away, best effort.
+    #[tokio::test]
+    async fn a_failed_run_restores_what_it_disabled_right_away() {
+        let (_dir, cfg) = cfg();
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print-disabled")) => Some((true, String::new())),
+            _ => Some((true, String::new())),
+        });
+        assert!(
+            host_supervisor::note_stop(&cfg, &agent()).await.unwrap(),
+            "it was enabled: this stop disables it"
+        );
+        assert!(
+            host_supervisor::disabled_by_earlier_run(&cfg),
+            "the durable marker"
+        );
+        // The service is running (started through the supervisor): nothing to do.
+        assert_eq!(
+            restore_after_failure_with(&cfg, Some(agent()), true).await,
+            None
+        );
+        assert!(test_manager::commands().is_empty());
+        // Not running after the failure: re-enabled now, marker cleared.
+        assert_eq!(
+            restore_after_failure_with(&cfg, Some(agent()), false).await,
+            None
+        );
+        assert!(
+            test_manager::commands()
+                .iter()
+                .any(|c| c.starts_with("launchctl enable"))
+        );
+        assert!(!host_supervisor::disabled_by_earlier_run(&cfg));
+    }
+
+    /// archer #60 gap (b): when the restore fails too, the marker survives
+    /// into the next run's new plan, which restores it.
+    #[tokio::test]
+    async fn the_marker_survives_a_failed_restore_into_the_next_plan() {
+        let (_dir, cfg) = cfg();
+        test_manager::install(|_, _| Some((true, String::new())));
+        assert!(host_supervisor::note_stop(&cfg, &agent()).await.unwrap());
+        test_manager::fail_commands(true);
+        assert!(
+            restore_after_failure_with(&cfg, Some(agent()), false)
+                .await
+                .is_some(),
+            "a warning"
+        );
+        test_manager::fail_commands(false);
+        assert!(
+            host_supervisor::disabled_by_earlier_run(&cfg),
+            "kept for the next run"
+        );
+        // The next run builds a fresh plan: it inherits the marker.
+        let mut detail = BTreeMap::new();
+        carry_over_disabled_marker(&cfg, &mut detail);
+        assert_eq!(
+            detail.get("supervisorDisabledByRun").map(String::as_str),
+            Some("true")
+        );
+        // Its own stop sees the agent disabled (by the earlier run) and still owns the restore.
+        test_manager::install(|program, args| match (program, args.first().copied()) {
+            ("launchctl", Some("print-disabled")) => Some((
+                true,
+                "\t\"build.raft.desktop.computer\" => disabled\n".into(),
+            )),
+            _ => Some((true, String::new())),
+        });
+        assert!(
+            host_supervisor::note_stop(&cfg, &agent()).await.unwrap(),
+            "an earlier run's marker counts"
+        );
+        assert_eq!(
+            host_supervisor::restore_after_stop(&cfg, &agent(), false).await,
+            None
+        );
+        assert!(
+            test_manager::commands()
+                .iter()
+                .any(|c| c.starts_with("launchctl enable"))
+        );
+        assert!(!host_supervisor::disabled_by_earlier_run(&cfg));
+        // Without any marker, a user's stop is never undone.
+        let mut fresh = BTreeMap::new();
+        carry_over_disabled_marker(&cfg, &mut fresh);
+        assert!(fresh.is_empty());
     }
 }

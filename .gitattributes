@@ -1,0 +1,3 @@
+# Byte-identical copies of slock's contract fixtures, pinned by sha256
+# (contract/CONTRACT_FIXTURES): never convert line endings on checkout.
+contract/** -text

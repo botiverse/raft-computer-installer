@@ -7,6 +7,8 @@ pub mod computer;
 pub mod config;
 mod diagnostic;
 pub mod host;
+pub mod host_supervisor;
+pub mod launch_policy;
 pub mod operation;
 pub mod presence;
 pub mod process;

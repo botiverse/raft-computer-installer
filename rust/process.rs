@@ -1316,14 +1316,34 @@ mod environment_tests {
         }
     }
 
+    /// Not a test: the child the next test reads. Sleeps only when asked.
+    #[test]
+    #[ignore]
+    fn environment_fixture_child() {
+        if std::env::var_os("RAFT_ENVIRONMENT_FIXTURE_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
     // A Computer's state home is read from its environment, including on
     // macOS (KERN_PROCARGS2), where argv precedes the environment.
+    //
+    // The child is this test binary, never an Apple platform binary such as
+    // /bin/sleep: macOS 26 (with SIP) hides a platform binary's environment
+    // from KERN_PROCARGS2, while a third-party one's (raft-computer's) stays
+    // readable, so /bin/sleep made this test depend on the macOS version.
     #[test]
     fn reads_a_child_environment_after_its_arguments() {
         let child = OwnedChild(
-            Command::new("/bin/sleep")
-                .arg("30")
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::environment_tests::environment_fixture_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
                 .env_clear()
+                .env("RAFT_ENVIRONMENT_FIXTURE_CHILD", "1")
                 .env("RAFT_HOME", "/fixture/home with space")
                 .env("HOME", "/fixture/user")
                 .spawn()
@@ -1349,7 +1369,9 @@ mod environment_tests {
         assert!(environment.contains(&("RAFT_HOME".into(), "/fixture/home with space".into())));
         assert!(environment.contains(&("HOME".into(), "/fixture/user".into())));
         assert!(
-            !environment.iter().any(|(k, _)| k == "30"),
+            !environment
+                .iter()
+                .any(|(k, _)| k == "--exact" || k == "--ignored"),
             "argv is not environment"
         );
     }

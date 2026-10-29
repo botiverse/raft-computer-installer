@@ -1,0 +1,66 @@
+{
+  "formatVersion": 1,
+  "description": "How every reader classifies host-lifecycle-owner.json (slock hostSupervisor.ts parseHostSupervisorRegistration, installer rust/host_supervisor.rs parse). absent: unregistered (corrupt counts as unregistered, as before the contract). unknown: a valid record this reader does not understand; held / refused, never unregistered. registered: a Desktop registration (its definition is then confirmed in the OS manager).",
+  "cases": [
+    {
+      "name": "not JSON",
+      "raw": "not json",
+      "state": "absent"
+    },
+    {
+      "name": "not an object",
+      "raw": "[]",
+      "state": "absent"
+    },
+    {
+      "name": "no format version",
+      "raw": "{\"owner\": \"app\"}",
+      "state": "absent"
+    },
+    {
+      "name": "a string format version",
+      "raw": "{\"formatVersion\": \"2\"}",
+      "state": "absent"
+    },
+    {
+      "name": "format 1",
+      "raw": "{\"formatVersion\": 1, \"owner\": \"cli\", \"enabled\": true}",
+      "state": "absent"
+    },
+    {
+      "name": "format 2 without a supervisor",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": null}",
+      "state": "absent"
+    },
+    {
+      "name": "a fractional format version",
+      "raw": "{\"formatVersion\": 2.5}",
+      "state": "unknown"
+    },
+    {
+      "name": "a future format version",
+      "raw": "{\"formatVersion\": 3, \"supervisor\": null}",
+      "state": "unknown"
+    },
+    {
+      "name": "a supervisor that is not an object",
+      "raw": "{\"formatVersion\": 2, \"supervisor\": \"launchd\"}",
+      "state": "unknown"
+    },
+    {
+      "name": "an unknown supervisor kind",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"upstart\", \"name\": \"build.raft.desktop.computer\", \"definitionPath\": \"/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "unknown"
+    },
+    {
+      "name": "registered by someone else",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"launchd-agent\", \"name\": \"build.raft.desktop.computer\", \"definitionPath\": \"/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"cli\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "unknown"
+    },
+    {
+      "name": "a Desktop launchd registration",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"launchd-agent\", \"name\": \"build.raft.desktop.computer\", \"definitionPath\": \"/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "registered"
+    }
+  ]
+}
