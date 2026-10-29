@@ -6,8 +6,10 @@
 //! against, so the two sides cannot drift.
 //!
 //! A start counts as failed, mechanically, when the service exits (or cannot
-//! be spawned) without having written the readiness file for its pid.
-//! Duration plays no part. Reaching readiness resets the count.
+//! be spawned) without having written the readiness file for its pid, with
+//! any code except a stay-down one; that includes 75, since a deliberate
+//! relaunch can only be asked of a ready service. Duration plays no part.
+//! Reaching readiness resets the count.
 use serde::Deserialize;
 
 pub const POLICY_JSON: &str = include_str!("../contract/supervised-exit-policy.json");
@@ -79,11 +81,12 @@ impl State {
             self.failed_starts = 0;
         }
         if let Some(code) = code {
-            if policy.launcher.relaunch_at_once.contains(&code) {
-                return Decision::Relaunch { delay_ms: 0 };
-            }
             if policy.launcher.stay_down.contains(&code) {
                 return Decision::StayDown;
+            }
+            // A deliberate relaunch of a ready service: at once, never counted.
+            if reached_ready && policy.launcher.relaunch_at_once.contains(&code) {
+                return Decision::Relaunch { delay_ms: 0 };
             }
         }
         if !reached_ready {
@@ -115,7 +118,11 @@ mod tests {
             let code = map[class].as_i64().unwrap() as i32;
             let decision = State::default().on_exit(&policy, Some(code), false);
             match class {
-                "relaunch" => assert_eq!(decision, Decision::Relaunch { delay_ms: 0 }, "{class}"),
+                "relaunch" => assert_eq!(
+                    State::default().on_exit(&policy, Some(code), true),
+                    Decision::Relaunch { delay_ms: 0 },
+                    "{class}"
+                ),
                 "crash" => assert!(
                     matches!(decision, Decision::Relaunch { delay_ms } if delay_ms > 0),
                     "{class}"
@@ -162,14 +169,21 @@ mod tests {
             Decision::Relaunch { delay_ms: 2000 }
         );
         assert_eq!(state.failed_starts, 0);
-        // A deliberate relaunch never counts, ready or not.
+        // A deliberate relaunch of a ready service never counts.
         for _ in 0..10 {
             assert_eq!(
-                state.on_exit(&policy, Some(75), false),
+                state.on_exit(&policy, Some(75), true),
                 Decision::Relaunch { delay_ms: 0 }
             );
         }
         assert_eq!(state.failed_starts, 0);
+        // 75 before readiness is not deliberate: it backs off and counts.
+        let mut early = State::default();
+        let decisions: Vec<Decision> = (0..5)
+            .map(|_| early.on_exit(&policy, Some(75), false))
+            .collect();
+        assert_eq!(decisions[0], Decision::Relaunch { delay_ms: 2000 });
+        assert_eq!(decisions[4], Decision::Trip);
     }
 
     #[test]

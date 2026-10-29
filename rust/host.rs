@@ -258,7 +258,7 @@ pub async fn prepare(
     artifact::saved_sidecar(cfg, &operation.from_version)?;
     let answer = answer(cfg).await?;
     let service_unit = crate::systemd::product_unit(cfg).await?;
-    let host_supervisor = registered_supervisor(cfg)?;
+    let host_supervisor = registered_supervisor(cfg).await?;
     save(
         cfg,
         &ProductState {
@@ -282,10 +282,10 @@ pub async fn prepare(
 /// The registered supervisor, or None. A registration that is not understood
 /// never reads as "none" (operation.rs holds it before K starts; finding one
 /// here means it changed mid-operation).
-pub fn registered_supervisor(
+pub async fn registered_supervisor(
     cfg: &Config,
 ) -> Result<Option<crate::host_supervisor::HostSupervisor>> {
-    match crate::host_supervisor::read(cfg) {
+    match crate::host_supervisor::resolve(cfg).await {
         crate::host_supervisor::Registration::Absent => Ok(None),
         crate::host_supervisor::Registration::Registered(supervisor) => Ok(Some(supervisor)),
         crate::host_supervisor::Registration::Unknown(detail) => Err(Error::Uncertain(format!(
@@ -452,6 +452,14 @@ fn publish_launcher(cfg: &Config) {
     // Embedded at build time (build.rs).
     const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raft-computer-launch.bin"));
     if LAUNCHER.is_empty() {
+        return;
+    }
+    // Only a machine Raft Desktop registered with a logon task runs the launcher.
+    if !matches!(
+        crate::host_supervisor::read(cfg),
+        crate::host_supervisor::Registration::Registered(ref supervisor)
+            if supervisor.kind == crate::host_supervisor::Kind::WindowsTask
+    ) {
         return;
     }
     let Some(directory) = cfg.binary.parent() else {

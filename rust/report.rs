@@ -30,6 +30,7 @@ pub enum FailureCode {
     InstallFailed,
     InstallationDeclined,
     InstallationHeld,
+    InstallationPathMismatch,
     InterruptedBeforeStart,
     LegacyFailure,
     OperationBusy,
@@ -41,13 +42,14 @@ pub enum FailureCode {
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CallerNotComputer,
         Self::CandidateStartFailed,
         Self::DowngradeNotAllowed,
         Self::InstallFailed,
         Self::InstallationDeclined,
         Self::InstallationHeld,
+        Self::InstallationPathMismatch,
         Self::InterruptedBeforeStart,
         Self::LegacyFailure,
         Self::OperationBusy,
@@ -66,6 +68,7 @@ impl FailureCode {
             Self::InstallFailed => "install_failed",
             Self::InstallationDeclined => "installation_declined",
             Self::InstallationHeld => "installation_held",
+            Self::InstallationPathMismatch => "installation_path_mismatch",
             Self::InterruptedBeforeStart => "interrupted_before_start",
             Self::LegacyFailure => "legacy_failure",
             Self::OperationBusy => "operation_busy",
@@ -213,9 +216,9 @@ mod failure_code_tests {
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 14);
+        assert_eq!(values.len(), 15);
         assert_eq!(values[0], "\"caller_not_computer\"");
-        assert_eq!(values[13], "\"result_unreadable\"");
+        assert_eq!(values[14], "\"result_unreadable\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),

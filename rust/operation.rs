@@ -443,14 +443,31 @@ fn host_supervisor(plan: &Plan) -> Option<crate::host_supervisor::HostSupervisor
 /// forbids this operation: not understood, another binary path, a target
 /// below its floor, or (Windows) this installer could not leave the job the
 /// service runs in.
-fn supervisor_refusal(cfg: &Config, plan: &Plan) -> Result<Option<String>> {
-    let registration = crate::host_supervisor::read(cfg);
-    if let Some(reason) =
-        crate::host_supervisor::refusal(cfg, &registration, &plan.manifest.version)?
+async fn supervisor_refusal(cfg: &Config, plan: &Plan) -> Result<Option<(FailureCode, String)>> {
+    // The registration with its definition confirmed in the OS manager, before
+    // anything is stopped (a missing definition is a stale registration).
+    let registration = crate::host_supervisor::resolve(cfg).await;
+    if let Some(refusal) =
+        crate::host_supervisor::refusal_with_code(cfg, &registration, &plan.manifest.version)?
     {
-        return Ok(Some(reason));
+        return Ok(Some(refusal));
     }
-    Ok(crate::host_supervisor::confinement(&registration))
+    Ok(crate::host_supervisor::confinement(&registration)
+        .map(|reason| (FailureCode::InstallationHeld, reason)))
+}
+
+fn refuse_supervised(
+    cfg: &Config,
+    plan: &mut Plan,
+    (code, reason): (FailureCode, String),
+) -> Result<Reply> {
+    finish(
+        cfg,
+        plan,
+        Outcome::Held,
+        Some((code, reason.clone())),
+        &reason,
+    )
 }
 
 fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
@@ -484,8 +501,8 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if let Some(reason) = systemd_confinement(cfg).await? {
             return refuse_confined(cfg, plan, reason);
         }
-        if let Some(reason) = supervisor_refusal(cfg, plan)? {
-            return refuse_confined(cfg, plan, reason);
+        if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
+            return refuse_supervised(cfg, plan, refusal);
         }
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
         let from = plan
@@ -723,10 +740,10 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
-        if let Some(reason) = supervisor_refusal(cfg, plan)? {
-            return refuse_confined(cfg, plan, reason);
+        if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
+            return refuse_supervised(cfg, plan, refusal);
         }
-        if let Some(supervisor) = host::registered_supervisor(cfg)? {
+        if let Some(supervisor) = host::registered_supervisor(cfg).await? {
             plan.detail
                 .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
         }
@@ -880,6 +897,12 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 ));
             }
             plan.detail.insert("readback".into(), "candidate".into());
+            // A repair stops through the supervisor, which disables it; a
+            // registered Computer that was not running is left enabled (not
+            // started), so its next login or `raft-computer start` brings it up.
+            if let Some(supervisor) = host_supervisor(plan) {
+                crate::host_supervisor::enable(cfg, &supervisor).await?;
+            }
         }
         let outcome = if plan.kind == Kind::Repair {
             Outcome::Repaired

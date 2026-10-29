@@ -296,9 +296,10 @@ pub async fn run() -> Result<u8> {
     // copy that could not break away is refused in operation.rs before
     // anything is stopped.
     #[cfg(windows)]
-    if ["upgrade", "repair"].contains(&args.request.command.as_str())
+    if ["install", "upgrade", "repair"].contains(&args.request.command.as_str())
         && env::var_os(crate::host_supervisor::BROKE_AWAY_ENV).is_none()
-        && crate::host_supervisor::confinement(&crate::host_supervisor::read(&cfg)).is_some()
+        && crate::host_supervisor::confinement(&crate::host_supervisor::resolve(&cfg).await)
+            .is_some()
     {
         match crate::host_supervisor::break_away(&raw_args).await {
             crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0)) => {
