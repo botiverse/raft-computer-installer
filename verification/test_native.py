@@ -339,6 +339,36 @@ class InstallerContract(unittest.TestCase):
             with self.subTest(iteration=iteration):
                 self.assert_remote_service_parent_is_still_stopped_and_replaced()
 
+    def test_upgrade_started_inside_the_computer_is_refused_before_stopping(self):
+        machine = self.server.machine()
+        try:
+            machine.json(["install", "--version", "1.0.0"])
+            machine.product(["login"])
+            start = subprocess.run([str(machine.binary), "start"],
+                env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+                text=True, capture_output=True, timeout=20)
+            self.assertEqual(start.returncode, 0, start.stderr)
+            before = machine.live()
+            self.assertIsNotNone(before)
+            self.server.requests.clear()
+            exchange(machine.home, "agent-upgrade")
+            exit_path = machine.home / "fixture-agent-upgrade.exit"
+            wait_for(lambda: exit_path.exists(), timeout=60)
+            self.assertEqual(exit_path.read_text(), "2")
+            reply = json.loads((machine.home / "fixture-agent-upgrade.out").read_text())
+            self.assertEqual(reply["code"], "installation_held", reply)
+            self.assertIn("started from inside Raft Computer", reply["line"])
+            self.assertEqual(runtime_offenders(reply["line"]), [])
+            # Nothing was touched: same service instance, same version, no
+            # operation started and nothing downloaded.
+            self.assertEqual(machine.live(), before)
+            self.assertEqual(machine.self_version(), "1.0.0")
+            self.assertFalse((machine.state / "active.json").exists())
+            self.assertEqual(self.server.requests, [])
+        finally:
+            machine.close()
+            self.server.machines.remove(machine)
+
     def test_old_noninteractive_cli_is_rejected_without_stopping_it(self):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])

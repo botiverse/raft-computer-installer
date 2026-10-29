@@ -144,6 +144,28 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
                 .ok_or("remote installer identity unavailable")?;
             write_json(&home.join("fixture-remote-installer.json"), &identity)?;
         }
+        // An agent of this Computer running `raft-computer upgrade` itself:
+        // the waiting CLI and its installer are descendants of the service.
+        if request["action"] == "agent-upgrade" {
+            let output = fs::File::create(home.join("fixture-agent-upgrade.out"))?;
+            let mut child = Command::new(env::current_exe()?)
+                .args(["upgrade", "--version", "1.1.0", "--json"])
+                .env("RAFT_COMPUTER_INSTALLER_CALLER", "waiting-cli-v1")
+                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                .stdin(Stdio::null())
+                .stdout(output)
+                .stderr(Stdio::null())
+                .spawn()?;
+            let exit = home.join("fixture-agent-upgrade.exit");
+            std::thread::spawn(move || {
+                let code = child
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let _ = fs::write(exit, code.to_string());
+            });
+        }
         if request["action"] == "stop" {
             break;
         }
