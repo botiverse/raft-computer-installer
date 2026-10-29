@@ -836,6 +836,9 @@ mod tests {
             normalized_path(std::path::Path::new("C:/Users/u/x.exe")),
             normalized_path(std::path::Path::new(r"C:\Users\u\x.exe"))
         );
+        // On a POSIX host a POSIX path keeps its case (Windows compares
+        // every path case-insensitively, as its file system does).
+        #[cfg(not(windows))]
         assert_ne!(
             normalized_path(std::path::Path::new("/Users/u/.local/bin/raft-computer")),
             normalized_path(std::path::Path::new("/Users/U/.local/bin/raft-computer")),
