@@ -152,6 +152,43 @@ pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity
     Ok(processes)
 }
 
+/// How far up the process tree to look for this installation's Computer.
+const ANCESTOR_LIMIT: usize = 64;
+
+/// This installation's running Computer, when it is an ancestor of `caller`
+/// (the waiting CLI). That is a local command started from inside the
+/// Computer, for example by one of its agents: stopping the service stops
+/// everything the Computer started, this installer included, so the upgrade
+/// would die halfway and leave the service down.
+pub fn product_ancestor(
+    cfg: &Config,
+    caller: &process::Identity,
+) -> Result<Option<process::Identity>> {
+    let products = installed_product_processes(cfg)?;
+    if products.is_empty() {
+        return Ok(None);
+    }
+    let mut pid = caller.pid;
+    let mut seen = vec![pid];
+    for _ in 0..ANCESTOR_LIMIT {
+        let Some(parent) = process::parent_of(pid)? else {
+            return Ok(None);
+        };
+        if seen.contains(&parent) {
+            return Ok(None);
+        }
+        seen.push(parent);
+        if let Some(product) = products.iter().find(|product| product.pid == parent)
+            && process::observe(parent)?
+                .is_some_and(|identity| process::same_instance(&identity, product))
+        {
+            return Ok(Some(product.clone()));
+        }
+        pid = parent;
+    }
+    Ok(None)
+}
+
 /// Attest a status-reported product pid against any executable a product
 /// process may run from, preferring the installed binary's diagnostic.
 fn attest_product(cfg: &Config, pid: u32) -> Result<process::Identity> {

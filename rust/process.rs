@@ -79,6 +79,15 @@ pub fn observe(pid: u32) -> Result<Option<Identity>> {
     native::observe(pid)
 }
 
+/// The parent pid of a same-user process; `None` once it has exited, belongs
+/// to another user, or is the top of the tree.
+pub fn parent_of(pid: u32) -> Result<Option<u32>> {
+    if pid <= 1 {
+        return Ok(None);
+    }
+    Ok(native::parent_of(pid)?.filter(|parent| *parent > 0))
+}
+
 /// The environment of a same-user process, used to tell apart Computer
 /// instances that run one shared installed binary with different state homes
 /// (`RAFT_HOME`). `None` when the OS does not expose it (Windows, access
@@ -565,6 +574,22 @@ mod native {
         Ok(unsafe { libc::getppid() } as u32)
     }
 
+    pub fn parent_of(pid: u32) -> Result<Option<u32>> {
+        let root = PathBuf::from(format!("/proc/{pid}"));
+        match fs::metadata(&root) {
+            Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => return Ok(None),
+            Ok(_) => {}
+            Err(e) if exited(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let text = match fs::read_to_string(root.join("stat")) {
+            Ok(text) => text,
+            Err(e) if exited(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(crate::systemd::parent_from_stat(&text))
+    }
+
     pub fn definitely_exited(pid: u32) -> Result<bool> {
         Ok(read_stat(pid)?.is_none())
     }
@@ -707,6 +732,13 @@ mod native {
 
     pub fn parent() -> Result<u32> {
         Ok(unsafe { libc::getppid() } as u32)
+    }
+
+    pub fn parent_of(pid: u32) -> Result<Option<u32>> {
+        if pid > i32::MAX as u32 {
+            return Ok(None);
+        }
+        Ok(info(pid)?.map(|info| info.pbi_ppid))
     }
 
     pub fn definitely_exited(pid: u32) -> Result<bool> {
@@ -961,6 +993,11 @@ mod native {
     }
 
     pub fn parent() -> Result<u32> {
+        parent_of(std::process::id())?
+            .ok_or_else(|| Error::Uncertain("parent process unavailable".into()))
+    }
+
+    pub fn parent_of(pid: u32) -> Result<Option<u32>> {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error().into());
@@ -970,12 +1007,12 @@ mod native {
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         let mut found = unsafe { Process32FirstW(snapshot.0, &mut entry) };
         while found != 0 {
-            if entry.th32ProcessID == std::process::id() {
-                return Ok(entry.th32ParentProcessID);
+            if entry.th32ProcessID == pid {
+                return Ok(Some(entry.th32ParentProcessID));
             }
             found = unsafe { Process32NextW(snapshot.0, &mut entry) };
         }
-        Err(Error::Uncertain("parent process unavailable".into()))
+        Ok(None)
     }
 
     pub fn pids() -> Result<Vec<u32>> {

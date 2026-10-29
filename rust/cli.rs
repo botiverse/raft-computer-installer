@@ -172,6 +172,10 @@ async fn worker(cfg: &Config) -> Result<u8> {
     Ok(reply.exit_code)
 }
 
+/// The answer to a local install, upgrade or repair started from inside the
+/// running Computer (see host::product_ancestor).
+pub const INSIDE_COMPUTER_LINE: &str = "This upgrade was started from inside Raft Computer (for example by an agent on this computer). Stopping the service would stop the upgrade too, so nothing was changed. Ask the computer's owner to upgrade it from the Computer page on the web, or run the command in your own terminal.";
+
 pub async fn run() -> Result<u8> {
     // Isolate the launcher too: otherwise its capture pipes can pass through
     // the worker as extra inherited handles into a resident Windows service.
@@ -212,6 +216,25 @@ pub async fn run() -> Result<u8> {
         if let Some(parent) = parent {
             let remote = args.request.approved_by.starts_with("remote:");
             if !remote && marker.is_some() {
+                // A local command run from inside the Computer (an agent on
+                // this computer): stopping the service would kill this
+                // installer with it. Refuse before anything is touched.
+                if let Some(product) = host::product_ancestor(&cfg, &parent)? {
+                    let reply = Reply::failure(
+                        &args.request.id,
+                        2,
+                        INSIDE_COMPUTER_LINE,
+                        FailureCode::InstallationHeld,
+                        "The upgrade was started from inside Raft Computer.",
+                    )
+                    .with_diagnostic(format!("computer process {} is an ancestor", product.pid));
+                    if args.json {
+                        println!("{}", serde_json::to_string(&reply)?);
+                    } else {
+                        eprintln!("{}", reply.line);
+                    }
+                    return Ok(reply.exit_code);
+                }
                 // The supported CLI declares its role. Terminal presence and a
                 // separate status snapshot cannot establish who is waiting.
                 // OS parent identity limits the exemption to this invocation.
