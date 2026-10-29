@@ -1,0 +1,20 @@
+{
+  "formatVersion": 2,
+  "owner": "app",
+  "enabled": true,
+  "dispatcherPath": null,
+  "label": null,
+  "definitionPath": null,
+  "supervisor": {
+    "kind": "launchd-agent",
+    "name": "build.raft.desktop.computer",
+    "definitionPath": "/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist",
+    "binaryPath": "/Users/u/.local/bin/raft-computer",
+    "launcherPath": null,
+    "registeredBy": "desktop",
+    "registeredAt": "2026-10-29T00:00:00.000Z",
+    "minComputerVersion": "1.0.58"
+  },
+  "app": { "path": "/Applications/Raft Desktop.app", "id": "build.raft.desktop", "checkinAt": "2026-10-29T00:00:00.000Z", "missingSince": null },
+  "autoUpgrade": { "paused": false }
+}

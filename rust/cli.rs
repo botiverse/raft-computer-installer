@@ -292,6 +292,38 @@ pub async fn run() -> Result<u8> {
         }
         // Could not leave the unit: the operation refuses before stopping.
     }
+    // Windows: the same for the job object of Raft Desktop's logon task. A
+    // copy that could not break away is refused in operation.rs before
+    // anything is stopped.
+    #[cfg(windows)]
+    if ["upgrade", "repair"].contains(&args.request.command.as_str())
+        && env::var_os(crate::host_supervisor::BROKE_AWAY_ENV).is_none()
+        && crate::host_supervisor::confinement(&crate::host_supervisor::read(&cfg)).is_some()
+    {
+        match crate::host_supervisor::break_away(&raw_args).await {
+            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0)) => {
+                if !args.json {
+                    println!(
+                        "Continuing the {} outside the Computer service's job.",
+                        args.request.command
+                    );
+                }
+                return Ok(0);
+            }
+            crate::systemd::Escape::Exited(_) => {
+                if let Some(receipt) = crate::report::read(&cfg, &args.request.id)? {
+                    let reply = Reply::receipt(receipt);
+                    if args.json {
+                        println!("{}", serde_json::to_string(&reply)?);
+                    } else {
+                        println!("{}", reply.line);
+                    }
+                    return Ok(reply.exit_code);
+                }
+            }
+            crate::systemd::Escape::Failed => {}
+        }
+    }
     let reply = supervisor::run(&cfg, &args.request).await?;
     if args.json {
         println!("{}", serde_json::to_string(&reply)?);

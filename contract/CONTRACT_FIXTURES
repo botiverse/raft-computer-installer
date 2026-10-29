@@ -1,0 +1,5 @@
+# Byte-identical copies of fixtures owned by slock (botiverse/slock,
+# docs/contracts/fixtures/). Change them there first, copy them here, and
+# update both digests: contract::tests fails when a copy no longer matches.
+f778a53a9530d04e29237566a106d03923f16024ec6db739c8e4291e8feb5480  supervised-exit-policy.json
+8ba7322f045c842a349321c813df3e88e2d3c60dcba9918ecc15e63537237b07  host-lifecycle-registration.v2.json

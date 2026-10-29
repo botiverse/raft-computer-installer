@@ -123,6 +123,35 @@ cross-release URLs, or hash/size mismatches stop installation before service cha
 and published beside its matching binary, including during rollback. Product
 bytes run from the installation directory, outside K's slots.
 
+### Service managers
+
+A service the product runs under a service manager is that manager's to stop
+and start, never `raft-computer stop`/`start` beside it:
+
+- **A systemd unit** found at runtime (a user's own unit): the installer leaves
+  the unit's control group first (`systemd-run --scope`) and uses `systemctl`.
+- **Raft Desktop's registration** (`rust/host_supervisor.rs`): format 2 of
+  `<RAFT_HOME>/computer/host-lifecycle-owner.json` names a launchd agent, a
+  systemd `--user` unit or a Windows logon task. Stop disables it first, so
+  nothing relaunches the old version during the swap (`launchctl disable` +
+  `bootout`; `schtasks /Change /DISABLE`, a graceful stop, `/End`); start and
+  rollback enable it and start it again (`enable` + `bootstrap` + `kickstart`;
+  `/ENABLE` + `/Run`). The operation is held before anything is touched when
+  the registration is not understood (an unknown format is never read as "not
+  registered"), names another binary path than this installation's, or the
+  target is below its `minComputerVersion`. On Windows the installer first
+  leaves the job object the service runs in (`CREATE_BREAKAWAY_FROM_JOB`), or
+  is held.
+
+The registration and the supervised exit-code table are contracts owned by
+slock; `contract/` holds byte-identical copies, pinned by digest in
+`contract/CONTRACT_FIXTURES`. Windows builds also produce
+`raft-computer-launch.exe` (GUI subsystem), which the installer publishes next
+to `raft-computer.exe`: the program the logon task runs. It applies that exit
+table (75 relaunches, 0/77/78 stay down, anything else relaunches with backoff)
+and stops after five consecutive starts that never reached readiness: it writes
+`computer/run/supervisor-breaker.json`, deletes the task, and exits 0.
+
 K owns `<RAFT_HOME>/computer/k`. The installer keeps its operation records,
 receipts, cached sidecars and recovery files under `<RAFT_HOME>/computer/installer`.
 Repair temporarily retains recovery inputs under `quarantine/` while the result

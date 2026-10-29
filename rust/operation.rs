@@ -431,6 +431,28 @@ async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
         .map(|unit| crate::systemd::confinement_reason(&unit)))
 }
 
+/// The supervisor Raft Desktop registered when a repair began (see
+/// `hostSupervisor`), used for its stop and start.
+fn host_supervisor(plan: &Plan) -> Option<crate::host_supervisor::HostSupervisor> {
+    plan.detail
+        .get("hostSupervisor")
+        .and_then(|supervisor| serde_json::from_str(supervisor).ok())
+}
+
+/// Refuse before stopping anything when Raft Desktop's service registration
+/// forbids this operation: not understood, another binary path, a target
+/// below its floor, or (Windows) this installer could not leave the job the
+/// service runs in.
+fn supervisor_refusal(cfg: &Config, plan: &Plan) -> Result<Option<String>> {
+    let registration = crate::host_supervisor::read(cfg);
+    if let Some(reason) =
+        crate::host_supervisor::refusal(cfg, &registration, &plan.manifest.version)?
+    {
+        return Ok(Some(reason));
+    }
+    Ok(crate::host_supervisor::confinement(&registration))
+}
+
 fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
     finish(
         cfg,
@@ -460,6 +482,9 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     }
     if plan.phase == Phase::Ready {
         if let Some(reason) = systemd_confinement(cfg).await? {
+            return refuse_confined(cfg, plan, reason);
+        }
+        if let Some(reason) = supervisor_refusal(cfg, plan)? {
             return refuse_confined(cfg, plan, reason);
         }
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
@@ -698,6 +723,13 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
+        if let Some(reason) = supervisor_refusal(cfg, plan)? {
+            return refuse_confined(cfg, plan, reason);
+        }
+        if let Some(supervisor) = host::registered_supervisor(cfg)? {
+            plan.detail
+                .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
+        }
         if plan.kind == Kind::Repair {
             if let Some(reason) = systemd_confinement(cfg).await? {
                 return refuse_confined(cfg, plan, reason);
@@ -731,7 +763,14 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 crate::process::terminate(&crate::host::installed_product_processes(cfg)?).await?,
             );
         }
-        forced.extend(host::stop_product(cfg, service_unit(plan).as_ref()).await?);
+        forced.extend(
+            host::stop_product(
+                cfg,
+                service_unit(plan).as_ref(),
+                host_supervisor(plan).as_ref(),
+            )
+            .await?,
+        );
         if let Some(path) = computer::preserve_commands_after_stop(cfg, &plan.request.id).await? {
             plan.detail.insert(
                 "commandQuarantine".into(),
@@ -819,7 +858,14 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if plan.running == Some(true) || plan.setup_succeeded {
             let evidence = match host::live_evidence(cfg).await {
                 Ok(evidence) => evidence,
-                Err(_) => host::start_product(cfg, service_unit(plan).as_ref()).await?,
+                Err(_) => {
+                    host::start_product(
+                        cfg,
+                        service_unit(plan).as_ref(),
+                        host_supervisor(plan).as_ref(),
+                    )
+                    .await?
+                }
             };
             if evidence.version != plan.manifest.version {
                 return Err(Error::Uncertain(
