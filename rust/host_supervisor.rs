@@ -1007,6 +1007,8 @@ mod tests {
         let (dir, cfg) = temp_cfg();
         let plist = dir.path().join("build.raft.desktop.computer.plist");
         write_registration(&cfg, &plist);
+        // Never the host's real launchctl: the job is not loaded.
+        test_manager::install(|_, _| Some((false, String::new())));
         assert!(
             matches!(read(&cfg), Registration::Registered(_)),
             "the file alone says registered"
