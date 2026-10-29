@@ -83,10 +83,18 @@ fn plain(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
 
+/// Absolute in either path syntax, whatever this host is: the record names
+/// paths of the platform that wrote it, and must parse the same everywhere.
 fn absolute(value: Option<String>) -> Option<PathBuf> {
     let value = value.filter(|v| plain(v))?;
-    let path = PathBuf::from(value);
-    path.is_absolute().then_some(path)
+    let bytes = value.as_bytes();
+    let posix = bytes.first() == Some(&b'/');
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let unc = value.starts_with("\\\\");
+    (posix || drive || unc).then(|| PathBuf::from(value))
 }
 
 /// Parse the owner record. Unknown top-level and supervisor fields are
@@ -505,6 +513,16 @@ mod tests {
             parse(bad_floor.as_bytes()),
             Registration::Unknown(_)
         ));
+        let windows = String::from_utf8(registered("windows-task", ""))
+            .unwrap()
+            .replace(
+                "/h/.local/bin/raft-computer-launch.exe",
+                r"C:\\Users\\u\\.local\\bin\\raft-computer-launch.exe",
+            );
+        assert!(
+            matches!(parse(windows.as_bytes()), Registration::Registered(_)),
+            "Windows paths parse on every host"
+        );
         // Later additive fields are tolerated.
         assert!(matches!(
             parse(&registered("launchd-agent", r#","futureField":1"#)),
