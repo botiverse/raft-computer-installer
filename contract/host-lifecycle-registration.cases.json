@@ -61,6 +61,26 @@
       "name": "a Desktop launchd registration",
       "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"launchd-agent\", \"name\": \"build.raft.desktop.computer\", \"definitionPath\": \"/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
       "state": "registered"
+    },
+    {
+      "name": "a Desktop registration naming another job",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"launchd-agent\", \"name\": \"com.apple.Finder\", \"definitionPath\": \"/Users/u/Library/LaunchAgents/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "unknown"
+    },
+    {
+      "name": "a Desktop registration naming another definition file",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"launchd-agent\", \"name\": \"build.raft.desktop.computer\", \"definitionPath\": \"/tmp/evil/build.raft.desktop.computer.plist\", \"binaryPath\": \"/Users/u/.local/bin/raft-computer\", \"launcherPath\": null, \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "unknown"
+    },
+    {
+      "name": "a Desktop scheduled task",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"windows-task\", \"name\": \"\\\\Raft\\\\Raft Computer\", \"definitionPath\": null, \"binaryPath\": \"C:\\\\Users\\\\u\\\\.local\\\\bin\\\\raft-computer.exe\", \"launcherPath\": \"C:\\\\Users\\\\u\\\\.local\\\\bin\\\\raft-computer-launch.exe\", \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "registered"
+    },
+    {
+      "name": "a scheduled task with another launcher",
+      "raw": "{\"formatVersion\": 2, \"owner\": \"app\", \"supervisor\": {\"kind\": \"windows-task\", \"name\": \"\\\\Raft\\\\Raft Computer\", \"definitionPath\": null, \"binaryPath\": \"C:\\\\Users\\\\u\\\\.local\\\\bin\\\\raft-computer.exe\", \"launcherPath\": \"C:\\\\Users\\\\u\\\\evil.exe\", \"registeredBy\": \"desktop\", \"registeredAt\": \"t\", \"minComputerVersion\": \"1.0.58\"}}",
+      "state": "unknown"
     }
   ]
 }

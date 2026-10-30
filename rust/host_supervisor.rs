@@ -39,6 +39,17 @@ impl Kind {
         }
     }
 
+    /// The fixed label, unit or task Raft Desktop registers for this kind
+    /// (slock `DESKTOP_LAUNCHD_LABEL` / `DESKTOP_SYSTEMD_UNIT` /
+    /// `DESKTOP_WINDOWS_TASK`).
+    fn desktop_name(self) -> &'static str {
+        match self {
+            Self::LaunchdAgent => DESKTOP_LAUNCHD_LABEL,
+            Self::SystemdUser => DESKTOP_SYSTEMD_UNIT,
+            Self::WindowsTask => DESKTOP_WINDOWS_TASK,
+        }
+    }
+
     /// The only kind each platform registers.
     fn native() -> Option<Self> {
         if cfg!(target_os = "macos") {
@@ -78,6 +89,32 @@ pub enum Registration {
     /// service manager that could not be asked about the definition. Treated
     /// as registered: the operation is held.
     Unknown(String),
+}
+
+pub const DESKTOP_LAUNCHD_LABEL: &str = "build.raft.desktop.computer";
+pub const DESKTOP_SYSTEMD_UNIT: &str = "raft-desktop-computer.service";
+pub const DESKTOP_WINDOWS_TASK: &str = "\\Raft\\Raft Computer";
+pub const WINDOWS_LAUNCHER_NAME: &str = "raft-computer-launch.exe";
+
+/// The definition file Raft Desktop writes, whatever the home or
+/// XDG_CONFIG_HOME: `<home>/Library/LaunchAgents/<label>.plist` or
+/// `<config>/systemd/user/<unit>`, with no `.` or `..` segment. A scheduled
+/// task has no file.
+fn is_desktop_definition_path(kind: Kind, path: &str) -> bool {
+    if path
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return false;
+    }
+    match kind {
+        Kind::LaunchdAgent => path.ends_with(&format!(
+            "/Library/LaunchAgents/{DESKTOP_LAUNCHD_LABEL}.plist"
+        )),
+        Kind::SystemdUser => path.ends_with(&format!("/systemd/user/{DESKTOP_SYSTEMD_UNIT}")),
+        Kind::WindowsTask => false,
+    }
 }
 
 fn text(value: &Value, key: &str) -> Option<String> {
@@ -138,16 +175,36 @@ pub fn parse(bytes: &[u8]) -> Registration {
     let Some(name) = text(supervisor, "name").filter(|v| plain(v)) else {
         return Registration::Unknown("the supervisor has no name".into());
     };
+    // The name and definition reach launchctl/systemctl/schtasks. Raft
+    // Desktop only ever registers its own fixed entry, so anything else is
+    // not ours to act on (slock `parseHostSupervisorRegistration`).
+    if name != kind.desktop_name() {
+        return Registration::Unknown("the supervisor is not Raft Desktop's own entry".into());
+    }
     let Some(binary_path) = absolute(text(supervisor, "binaryPath")) else {
         return Registration::Unknown("the supervisor has no absolute binary path".into());
     };
-    let definition_path = absolute(text(supervisor, "definitionPath"));
+    let definition_text = text(supervisor, "definitionPath");
+    let definition_path = absolute(definition_text.clone());
     if kind != Kind::WindowsTask && definition_path.is_none() {
         return Registration::Unknown("the supervisor has no definition path".into());
     }
-    let launcher_path = absolute(text(supervisor, "launcherPath"));
+    if let Some(definition) = definition_text.filter(|_| definition_path.is_some())
+        && !is_desktop_definition_path(kind, &definition)
+    {
+        return Registration::Unknown(
+            "the supervisor definition is not Raft Desktop's own file".into(),
+        );
+    }
+    let launcher_text = text(supervisor, "launcherPath");
+    let launcher_path = absolute(launcher_text.clone());
     if kind == Kind::WindowsTask && launcher_path.is_none() {
         return Registration::Unknown("the scheduled task has no launcher path".into());
+    }
+    if let Some(launcher) = launcher_text.filter(|_| launcher_path.is_some())
+        && launcher.rsplit(['\\', '/']).next() != Some(WINDOWS_LAUNCHER_NAME)
+    {
+        return Registration::Unknown("the scheduled task launcher is not Raft Desktop's".into());
     }
     let Some(min_computer_version) =
         text(supervisor, "minComputerVersion").filter(|v| version::exact(v).is_ok())
@@ -226,18 +283,26 @@ pub enum DefinitionState {
 pub async fn definition_state(supervisor: &HostSupervisor) -> Option<DefinitionState> {
     match supervisor.kind {
         Kind::WindowsTask => {
-            let (found, _) =
-                query("schtasks", &["/Query", "/TN", supervisor.name.as_str()]).await?;
-            Some(if found {
-                DefinitionState::Present
-            } else {
-                DefinitionState::Absent
-            })
+            let code = query_code(
+                "schtasks",
+                &["/Query", "/TN", supervisor.name.as_str(), "/HRESULT"],
+            )
+            .await?;
+            schtasks_definition_state(code)
         }
         Kind::LaunchdAgent | Kind::SystemdUser => {
             let file = supervisor.definition_path.as_ref()?;
-            if fs::metadata(file).is_ok_and(|meta| meta.is_file()) {
-                return Some(DefinitionState::Present);
+            match fs::metadata(file) {
+                Ok(meta) if meta.is_file() => return Some(DefinitionState::Present),
+                Ok(_) => {}
+                // Only a missing file is "no file"; anything else (permission
+                // denied) is a definition that could not be checked.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(_) => return None,
             }
             let loaded = if supervisor.kind == Kind::LaunchdAgent {
                 query(
@@ -319,6 +384,50 @@ pub fn launchd_disabled(output: &str, label: &str) -> bool {
 
 /// One bounded query of the service manager: Some((succeeded, stdout)), or
 /// None when it could not be run at all.
+/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: what `schtasks /Query ... /HRESULT`
+/// exits with when the task does not exist (slock `isWindowsTaskMissingCode`).
+const WINDOWS_TASK_MISSING_HRESULT: u32 = 0x8007_0002;
+
+/// Only schtasks' own "no such task" means gone. Any other failure (access
+/// denied, a busy Task Scheduler) is a manager that could not be asked:
+/// treating it as gone would act beside a live task.
+fn schtasks_definition_state(code: Option<i32>) -> Option<DefinitionState> {
+    match code? {
+        0 => Some(DefinitionState::Present),
+        code if code as u32 == WINDOWS_TASK_MISSING_HRESULT => Some(DefinitionState::Absent),
+        _ => None,
+    }
+}
+
+/// A query's exit code (None: the process ended without one). The outer None:
+/// the manager could not be asked (did not start, timed out).
+async fn query_code(program: &str, args: &[&str]) -> Option<Option<i32>> {
+    #[cfg(test)]
+    if let Some(answer) = test_manager::answer(program, args) {
+        // The seam answers found / not found.
+        return answer.map(|(found, _)| {
+            Some(if found {
+                0
+            } else {
+                WINDOWS_TASK_MISSING_HRESULT as i32
+            })
+        });
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let status = tokio::time::timeout(Duration::from_secs(30), command.status())
+        .await
+        .ok()?
+        .ok()?;
+    Some(status.code())
+}
+
 pub async fn query(program: &str, args: &[&str]) -> Option<(bool, String)> {
     #[cfg(test)]
     if let Some(answer) = test_manager::answer(program, args) {
@@ -779,11 +888,94 @@ mod tests {
 
     const FIXTURE: &[u8] = include_bytes!("../contract/host-lifecycle-registration.v2.json");
 
+    /// Raft Desktop's own entry for `kind` (the only one the parser accepts).
     fn registered(kind: &str, extra: &str) -> Vec<u8> {
+        let (name, definition) = match kind {
+            "systemd-user" => (
+                "raft-desktop-computer.service",
+                r#""/h/.config/systemd/user/raft-desktop-computer.service""#,
+            ),
+            "windows-task" => (r"\\Raft\\Raft Computer", "null"),
+            _ => (
+                "build.raft.desktop.computer",
+                r#""/h/Library/LaunchAgents/build.raft.desktop.computer.plist""#,
+            ),
+        };
         format!(
-            r#"{{"formatVersion":2,"owner":"app","supervisor":{{"kind":"{kind}","name":"n","definitionPath":"/d/n.plist","binaryPath":"/h/.local/bin/raft-computer","launcherPath":"/h/.local/bin/raft-computer-launch.exe","registeredBy":"desktop","minComputerVersion":"1.0.58"{extra}}}}}"#
+            r#"{{"formatVersion":2,"owner":"app","supervisor":{{"kind":"{kind}","name":"{name}","definitionPath":{definition},"binaryPath":"/h/.local/bin/raft-computer","launcherPath":"/h/.local/bin/raft-computer-launch.exe","registeredBy":"desktop","minComputerVersion":"1.0.58"{extra}}}}}"#
         )
         .into_bytes()
+    }
+
+    /// #11982 review (slock #proj-raft-computer:#33): the name and definition
+    /// reach the service manager, so only Raft Desktop's own entry is acted on.
+    #[test]
+    fn a_registration_naming_another_job_definition_or_launcher_is_unknown() {
+        for kind in ["launchd-agent", "systemd-user", "windows-task"] {
+            let good = String::from_utf8(registered(kind, "")).unwrap();
+            assert!(
+                matches!(parse(good.as_bytes()), Registration::Registered(_)),
+                "{kind}"
+            );
+            let mut forged = vec![
+                good.replace(
+                    r#""name":"build.raft.desktop.computer""#,
+                    r#""name":"com.apple.Finder""#,
+                )
+                .replace(
+                    r#""name":"raft-desktop-computer.service""#,
+                    r#""name":"--global""#,
+                )
+                .replace(
+                    r#""name":"\\Raft\\Raft Computer""#,
+                    r#""name":"\\Raft\\x’;Remove-Item C:\\""#,
+                ),
+                good.replace(
+                    r#""/h/.local/bin/raft-computer-launch.exe""#,
+                    r#""C:\\Users\\u\\evil.exe""#,
+                ),
+            ];
+            if kind == "windows-task" {
+                forged.push(good.replace(
+                    r#""definitionPath":null"#,
+                    r#""definitionPath":"C:\\x.xml""#,
+                ));
+            } else {
+                forged.push(
+                    good.replace("/h/Library/LaunchAgents/", "/tmp/evil/")
+                        .replace("/h/.config/systemd/user/", "/tmp/evil/"),
+                );
+                forged.push(
+                    good.replace("/h/Library/LaunchAgents/", "/h/x/../Library/LaunchAgents/")
+                        .replace("/h/.config/systemd/user/", "/h/x/../systemd/user/"),
+                );
+            }
+            for raw in forged {
+                if raw == good {
+                    continue; // the replacement did not apply to this kind
+                }
+                assert!(
+                    matches!(parse(raw.as_bytes()), Registration::Unknown(_)),
+                    "{kind}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_schtasks_no_such_task_means_the_scheduled_task_is_gone() {
+        assert_eq!(
+            schtasks_definition_state(Some(0)),
+            Some(DefinitionState::Present)
+        );
+        assert_eq!(
+            schtasks_definition_state(Some(0x8007_0002_u32 as i32)),
+            Some(DefinitionState::Absent)
+        );
+        for code in [0x8007_0005_u32 as i32, 1, -1] {
+            assert_eq!(schtasks_definition_state(Some(code)), None, "{code}");
+        }
+        assert_eq!(schtasks_definition_state(None), None);
     }
 
     #[test]
@@ -1044,7 +1236,9 @@ mod tests {
     #[tokio::test]
     async fn a_registration_whose_definition_is_gone_is_stale_before_anything_stops() {
         let (dir, cfg) = temp_cfg();
-        let plist = dir.path().join("build.raft.desktop.computer.plist");
+        let plist = dir
+            .path()
+            .join("Library/LaunchAgents/build.raft.desktop.computer.plist");
         write_registration(&cfg, &plist);
         // Never the host's real launchctl: the job is not loaded.
         test_manager::install(|_, _| Some((false, String::new())));
@@ -1058,6 +1252,7 @@ mod tests {
             "no definition: stale, not supervised"
         );
         assert_eq!(refusal(&cfg, &resolve(&cfg).await, "1.0.58").unwrap(), None);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
         fs::write(&plist, "<plist/>").unwrap();
         assert!(matches!(resolve(&cfg).await, Registration::Registered(_)));
     }
@@ -1168,7 +1363,9 @@ mod tests {
     #[tokio::test]
     async fn a_deleted_plist_with_the_job_still_loaded_is_held_and_nothing_is_stopped() {
         let (dir, cfg) = temp_cfg();
-        let plist = dir.path().join("build.raft.desktop.computer.plist");
+        let plist = dir
+            .path()
+            .join("Library/LaunchAgents/build.raft.desktop.computer.plist");
         write_registration(&cfg, &plist);
         test_manager::install(|program, args| match (program, args.first().copied()) {
             ("launchctl", Some("print")) => {
@@ -1222,7 +1419,9 @@ mod tests {
     #[tokio::test]
     async fn a_systemd_unit_whose_file_is_gone_but_still_loaded_is_held() {
         let (dir, cfg) = temp_cfg();
-        let unit = dir.path().join("raft-desktop-computer.service");
+        let unit = dir
+            .path()
+            .join("systemd/user/raft-desktop-computer.service");
         let record = serde_json::json!({ "formatVersion": 2, "supervisor": {
             "kind": "systemd-user", "name": "raft-desktop-computer.service", "definitionPath": unit,
             "binaryPath": cfg.binary, "launcherPath": null, "registeredBy": "desktop", "registeredAt": "t", "minComputerVersion": "1.0.58" } });
