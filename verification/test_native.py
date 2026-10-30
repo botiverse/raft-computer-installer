@@ -649,6 +649,7 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(len(self.server.requests), downloads)
         conflict = machine.json(["upgrade", "--version", "1.0.0"], expected=2, extra={"RAFT_COMPUTER_OPERATION_ID": "warm"})
         self.assertIsNone(conflict["receipt"])
+        self.assertIn("env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY", conflict["line"])
         self.assertEqual(machine.live(), live)
         for candidate in ("1.2.0", "1.5.0"):
             with self.subTest(candidate=candidate):
