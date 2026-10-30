@@ -3,4 +3,4 @@
 # update both digests: contract::tests fails when a copy no longer matches.
 f778a53a9530d04e29237566a106d03923f16024ec6db739c8e4291e8feb5480  supervised-exit-policy.json
 8ba7322f045c842a349321c813df3e88e2d3c60dcba9918ecc15e63537237b07  host-lifecycle-registration.v2.json
-ad3e4a834c9b5e06417b315a932081542a4c646c8c91b2fec2ea9e774cdbf273  host-lifecycle-registration.cases.json
+02dcc0671d0c840509a37f95fbaf87cc5bee1c73d881f842527e26b9dabf8426  host-lifecycle-registration.cases.json
