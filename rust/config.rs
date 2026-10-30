@@ -164,6 +164,19 @@ impl Config {
         })
     }
 
+    /// Variables that describe one installer run: which operation it is, who
+    /// asked for it, whether it may prompt, and which caller waits. A Computer
+    /// the installer starts must not inherit them, or every runner and agent
+    /// would carry this run's id and `remote:` label into later upgrades
+    /// (#proj-raft-computer:#32). Configuration such as
+    /// RAFT_COMPUTER_INSTALLER_CHANNEL is not listed: it is meant to persist.
+    pub const OPERATION_ENV: [&'static str; 4] = [
+        "RAFT_COMPUTER_OPERATION_ID",
+        "RAFT_COMPUTER_APPROVED_BY",
+        "RAFT_COMPUTER_NON_INTERACTIVE",
+        "RAFT_COMPUTER_INSTALLER_CALLER",
+    ];
+
     pub fn environment(&self) -> BTreeMap<OsString, OsString> {
         BTreeMap::from([
             ("RAFT_HOME".into(), self.state_home.as_os_str().to_owned()),

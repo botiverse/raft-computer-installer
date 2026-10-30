@@ -168,6 +168,9 @@ pub async fn run(
     budget: Duration,
 ) -> Result<CommandResult> {
     let mut command = Command::new(binary);
+    for name in Config::OPERATION_ENV {
+        command.env_remove(name);
+    }
     command
         .args(args)
         .envs(environment)
@@ -385,7 +388,11 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<LifecycleResult> {
         path.parent()
             .ok_or_else(|| invalid("command directory missing"))?,
     )?;
-    let mut child = Command::new(std::env::current_exe()?)
+    let mut helper_command = Command::new(std::env::current_exe()?);
+    for name in Config::OPERATION_ENV {
+        helper_command.env_remove(name);
+    }
+    let mut child = helper_command
         .arg("--product-command")
         .envs(cfg.environment())
         .stdin(Stdio::piped())
