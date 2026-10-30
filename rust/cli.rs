@@ -174,7 +174,7 @@ async fn worker(cfg: &Config) -> Result<u8> {
 
 /// The answer to a local install, upgrade or repair started from inside the
 /// running Computer (see host::product_ancestor).
-pub const LEAKED_REMOTE_LINE: &str = "This shell still carries a finished web upgrade's approval, so nothing was changed. Run the command again without it: env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY -u RAFT_COMPUTER_NON_INTERACTIVE -u RAFT_COMPUTER_INSTALLER_CALLER raft-computer upgrade";
+pub const LEAKED_REMOTE_LINE: &str = "This shell still carries a finished web upgrade's approval, so nothing was changed. Run the command again without it: env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY -u RAFT_COMPUTER_NON_INTERACTIVE raft-computer upgrade";
 pub const INSIDE_COMPUTER_LINE: &str = "This upgrade was started from inside Raft Computer (for example by an agent on this computer). Stopping the service would stop the upgrade too, so nothing was changed. Ask the computer's owner to upgrade it from the Computer page on the web, or run the command in your own terminal.";
 
 pub async fn run() -> Result<u8> {
