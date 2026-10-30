@@ -101,6 +101,10 @@ pub const WINDOWS_LAUNCHER_NAME: &str = "raft-computer-launch.exe";
 /// `<config>/systemd/user/<unit>`, with no `.` or `..` segment. A scheduled
 /// task has no file.
 fn is_desktop_definition_path(kind: Kind, path: &str) -> bool {
+    // Either separator: the file name and its directories are what matter
+    // (a test or a Windows host joins with `\\`).
+    let path = path.replace('\\', "/");
+    let path = path.as_str();
     if path
         .split('/')
         .skip(1)
