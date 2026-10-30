@@ -31,6 +31,12 @@ use std::{
     sync::Arc,
 };
 
+/// A request id from a finished operation is refused. The usual cause is a
+/// shell that still carries a finished web upgrade's variables (an old
+/// installer passed them to the service and every agent): say how to drop
+/// them (#proj-raft-computer:#32).
+pub const REQUEST_CONFLICT_LINE: &str = "This request ID already belongs to a different operation. If this shell still carries a finished upgrade's variables, run the command again without them: env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY -u RAFT_COMPUTER_NON_INTERACTIVE raft-computer upgrade";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum Kind {
@@ -403,10 +409,16 @@ fn rollback_copy(
             ),
         );
     }
+    // Read once, when the rollback finished: a service manager (launchd
+    // KeepAlive, systemd Restart=) or a slow start can still bring the old
+    // version back afterwards, so say when, not that it stays down.
     let reason = format!(
-        "Raft Computer {target} didn't start correctly, so {from_version} is still installed but not running."
+        "Raft Computer {target} didn't start correctly, so {from_version} is still installed. It was not running when the upgrade finished."
     );
-    (format!("{reason} Run `raft-computer start`."), reason)
+    (
+        format!("{reason} If it is not back within a few minutes, run `raft-computer start`."),
+        reason,
+    )
 }
 
 /// Refuse before stopping anything when the systemd unit that runs the
@@ -986,7 +998,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::failure(
                 &request.id,
                 2,
-                "This request ID already belongs to a different operation.",
+                REQUEST_CONFLICT_LINE,
                 FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
@@ -1023,7 +1035,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::failure(
                 &request.id,
                 2,
-                "This request ID already belongs to a different operation.",
+                REQUEST_CONFLICT_LINE,
                 FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
@@ -1386,11 +1398,11 @@ mod rollback_copy_tests {
         let (line, reason) = rollback_copy("1.0.32", "1.0.31", Some(true), false);
         assert_eq!(
             line,
-            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed but not running. Run `raft-computer start`.",
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed. It was not running when the upgrade finished. If it is not back within a few minutes, run `raft-computer start`.",
         );
         assert_eq!(
             reason,
-            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed but not running."
+            "Raft Computer 1.0.32 didn't start correctly, so 1.0.31 is still installed. It was not running when the upgrade finished."
         );
     }
 

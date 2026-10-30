@@ -339,6 +339,88 @@ class InstallerContract(unittest.TestCase):
             with self.subTest(iteration=iteration):
                 self.assert_remote_service_parent_is_still_stopped_and_replaced()
 
+    def test_upgrade_started_inside_the_computer_is_refused_before_stopping(self):
+        self._assert_upgrade_inside_the_computer_is_refused("agent-upgrade")
+
+    def test_leaked_remote_label_does_not_skip_the_inside_computer_refusal(self):
+        # A web upgrade's id and `remote:` label used to leak into the service
+        # and every agent (#proj-raft-computer:#32); the refusal is decided
+        # from the process tree, so the label must not exempt the agent.
+        self._assert_upgrade_inside_the_computer_is_refused("agent-upgrade-leaked")
+
+    def test_the_started_computer_inherits_no_installer_run_variables(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        # A `remote:` label is honored only from the service itself (refused
+        # from this test's shell), so a caller-supplied approver stands in.
+        leaked = {"RAFT_COMPUTER_OPERATION_ID": "web-upgrade", "RAFT_COMPUTER_APPROVED_BY": "a script",
+            "RAFT_COMPUTER_NON_INTERACTIVE": "1"}
+        upgraded = machine.json(["upgrade", "--version", "1.1.0"], extra=leaked)
+        self.assertIn("It is running.", upgraded["line"])
+        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assertEqual(json.loads((machine.home / "fixture-service-env.json").read_text()), [])
+
+    def test_an_agent_calling_the_installer_directly_is_refused_before_stopping(self):
+        # Not through the CLI: the installer's parent is the agent's shell, so
+        # the refusal has to look further up the tree (#proj-raft-computer:#32).
+        if WINDOWS:
+            self.skipTest("the fixture agent shell is POSIX sh")
+        self._assert_upgrade_inside_the_computer_is_refused("agent-installer-direct")
+
+    def test_an_agent_calling_the_installer_directly_with_a_leaked_remote_label_is_refused(self):
+        if WINDOWS:
+            self.skipTest("the fixture agent shell is POSIX sh")
+        self._assert_upgrade_inside_the_computer_is_refused("agent-installer-direct-leaked")
+
+    def test_a_leaked_remote_label_outside_the_computer_is_refused_with_the_variables_to_drop(self):
+        # A user's own shell that picked up a finished web upgrade's variables
+        # (Carl on xxwork): not a web upgrade, so refused, and told what to unset.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        self.server.requests.clear()
+        held = machine.json(["upgrade", "--version", "1.1.0"], expected=2, extra={
+            "RAFT_COMPUTER_OPERATION_ID": "finished-web-upgrade",
+            "RAFT_COMPUTER_APPROVED_BY": "remote:finished-web-upgrade"})
+        self.assertEqual(held["code"], "installation_held", held)
+        self.assertIn("env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY", held["line"])
+        self.assertEqual(machine.self_version(), "1.0.0")
+        self.assertEqual(self.server.requests, [])
+        # Without them the same command upgrades; an operation id alone is
+        # only an id (replay), not an approval.
+        upgraded = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "my-own-id"})
+        self.assertEqual(upgraded["receipt"]["outcome"], "promoted", upgraded)
+
+    def _assert_upgrade_inside_the_computer_is_refused(self, action):
+        machine = self.server.machine()
+        try:
+            machine.json(["install", "--version", "1.0.0"])
+            machine.product(["login"])
+            start = subprocess.run([str(machine.binary), "start"],
+                env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+                text=True, capture_output=True, timeout=20)
+            self.assertEqual(start.returncode, 0, start.stderr)
+            before = machine.live()
+            self.assertIsNotNone(before)
+            self.server.requests.clear()
+            exchange(machine.home, action)
+            exit_path = machine.home / "fixture-agent-upgrade.exit"
+            wait_for(lambda: exit_path.exists(), timeout=60)
+            self.assertEqual(exit_path.read_text(), "2")
+            reply = json.loads((machine.home / "fixture-agent-upgrade.out").read_text())
+            self.assertEqual(reply["code"], "installation_held", reply)
+            self.assertIn("started from inside Raft Computer", reply["line"])
+            self.assertEqual(runtime_offenders(reply["line"]), [])
+            # Nothing was touched: same service instance, same version, no
+            # operation started and nothing downloaded.
+            self.assertEqual(machine.live(), before)
+            self.assertEqual(machine.self_version(), "1.0.0")
+            self.assertFalse((machine.state / "active.json").exists())
+            self.assertEqual(self.server.requests, [])
+        finally:
+            machine.close()
+            self.server.machines.remove(machine)
+
     def test_old_noninteractive_cli_is_rejected_without_stopping_it(self):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])
@@ -567,6 +649,7 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(len(self.server.requests), downloads)
         conflict = machine.json(["upgrade", "--version", "1.0.0"], expected=2, extra={"RAFT_COMPUTER_OPERATION_ID": "warm"})
         self.assertIsNone(conflict["receipt"])
+        self.assertIn("env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY", conflict["line"])
         self.assertEqual(machine.live(), live)
         for candidate in ("1.2.0", "1.5.0"):
             with self.subTest(candidate=candidate):

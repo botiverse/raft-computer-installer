@@ -172,6 +172,11 @@ async fn worker(cfg: &Config) -> Result<u8> {
     Ok(reply.exit_code)
 }
 
+/// The answer to a local install, upgrade or repair started from inside the
+/// running Computer (see host::product_ancestor).
+pub const LEAKED_REMOTE_LINE: &str = "This shell still carries a finished web upgrade's approval, so nothing was changed. Run the command again without it: env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY -u RAFT_COMPUTER_NON_INTERACTIVE raft-computer upgrade";
+pub const INSIDE_COMPUTER_LINE: &str = "This upgrade was started from inside Raft Computer (for example by an agent on this computer). Stopping the service would stop the upgrade too, so nothing was changed. Ask the computer's owner to upgrade it from the Computer page on the web, or run the command in your own terminal.";
+
 pub async fn run() -> Result<u8> {
     // Isolate the launcher too: otherwise its capture pipes can pass through
     // the worker as extra inherited handles into a resident Windows service.
@@ -209,14 +214,67 @@ pub async fn run() -> Result<u8> {
                 "waiting caller is not the installed immediate parent",
             ));
         }
+        // A command run from inside the Computer (an agent on this computer,
+        // through the CLI or by calling this installer directly): stopping the
+        // service would kill this installer with it. Refuse before anything is
+        // touched. Decided from the process tree, never from the environment.
+        // Prevents accidents only: the same OS user can always arrange its own
+        // process tree (setsid, a double fork) or download an installer, so
+        // this is not an approval check (#proj-raft-computer:#32).
+        let inside = match &parent {
+            // Through a Computer process (the waiting CLI, or the service for a
+            // web upgrade): a Computer above that process.
+            Some(parent) => host::product_ancestor(&cfg, parent)?,
+            // Called directly: a Computer anywhere above this installer.
+            None => match crate::process::observe(std::process::id())? {
+                Some(own) => host::product_ancestor(&cfg, &own)?,
+                None => None,
+            },
+        };
+        if let Some(product) = inside {
+            let reply = Reply::failure(
+                &args.request.id,
+                2,
+                INSIDE_COMPUTER_LINE,
+                FailureCode::InstallationHeld,
+                "The upgrade was started from inside Raft Computer.",
+            )
+            .with_diagnostic(format!("computer process {} is an ancestor", product.pid));
+            if args.json {
+                println!("{}", serde_json::to_string(&reply)?);
+            } else {
+                eprintln!("{}", reply.line);
+            }
+            return Ok(reply.exit_code);
+        }
+        // A web upgrade's installer is a direct child of the running service,
+        // with no Computer above it and no CLI declaring itself. A `remote:`
+        // label anywhere else is a leaked one (an old installer passed it to
+        // the service and every agent): refuse, and say how to drop it, rather
+        // than treat it as an ordinary local upgrade.
+        let from_service = parent.is_some() && marker.is_none();
+        if args.request.approved_by.starts_with("remote:") && !from_service {
+            let reply = Reply::failure(
+                &args.request.id,
+                2,
+                LEAKED_REMOTE_LINE,
+                FailureCode::InstallationHeld,
+                "A web upgrade's approval was found outside that upgrade.",
+            );
+            if args.json {
+                println!("{}", serde_json::to_string(&reply)?);
+            } else {
+                eprintln!("{}", reply.line);
+            }
+            return Ok(reply.exit_code);
+        }
         if let Some(parent) = parent {
-            let remote = args.request.approved_by.starts_with("remote:");
-            if !remote && marker.is_some() {
+            if marker.is_some() {
                 // The supported CLI declares its role. Terminal presence and a
-                // separate status snapshot cannot establish who is waiting.
-                // OS parent identity limits the exemption to this invocation.
+                // separate status snapshot cannot establish who is waiting. OS
+                // parent identity limits the exemption to this invocation.
                 args.request.waiting_caller = Some(parent);
-            } else if !remote {
+            } else if !args.request.approved_by.starts_with("remote:") {
                 let reply = Reply::failure(
                     &args.request.id,
                     1,

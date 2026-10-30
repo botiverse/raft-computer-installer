@@ -101,6 +101,18 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
         pid: std::process::id(),
         generation: uuid::Uuid::new_v4().to_string(),
     };
+    // Which per-run installer variables this service inherited
+    // (#proj-raft-computer:#32): a service must carry none of them.
+    let inherited: Vec<&str> = [
+        "RAFT_COMPUTER_OPERATION_ID",
+        "RAFT_COMPUTER_APPROVED_BY",
+        "RAFT_COMPUTER_NON_INTERACTIVE",
+        "RAFT_COMPUTER_INSTALLER_CALLER",
+    ]
+    .into_iter()
+    .filter(|name| env::var_os(name).is_some())
+    .collect();
+    write_json(&home.join("fixture-service-env.json"), &inherited)?;
     write_json(&home.join("fixture-service.json"), &state)?;
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -143,6 +155,68 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
             let identity = raft_computer_installer::process::observe(child.id())?
                 .ok_or("remote installer identity unavailable")?;
             write_json(&home.join("fixture-remote-installer.json"), &identity)?;
+        }
+        // An agent of this Computer calling the installer directly, from its
+        // own shell (not through the CLI, so the installer's immediate parent
+        // is not a Computer process). `-leaked`: with a finished web
+        // upgrade's id and `remote:` label in its environment.
+        #[cfg(unix)]
+        if request["action"] == "agent-installer-direct"
+            || request["action"] == "agent-installer-direct-leaked"
+        {
+            let installer = env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?;
+            let output = fs::File::create(home.join("fixture-agent-upgrade.out"))?;
+            let exit = home.join("fixture-agent-upgrade.exit");
+            let mut command = Command::new("/bin/sh");
+            if request["action"] == "agent-installer-direct-leaked" {
+                command
+                    .env("RAFT_COMPUTER_OPERATION_ID", "finished-web-upgrade")
+                    .env("RAFT_COMPUTER_APPROVED_BY", "remote:finished-web-upgrade");
+            }
+            // Not `exec`: the shell must stay the installer's parent.
+            command
+                .args([
+                    "-c",
+                    "\"$0\" upgrade --version 1.1.0 --json; printf %s $? > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+                ])
+                .arg(&installer)
+                .arg(&exit)
+                .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
+                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                .stdin(Stdio::null())
+                .stdout(output)
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
+        // An agent of this Computer running `raft-computer upgrade` itself:
+        // the waiting CLI and its installer are descendants of the service.
+        // `agent-upgrade-leaked`: the same agent, whose environment still
+        // carries a finished web upgrade's id and `remote:` label.
+        if request["action"] == "agent-upgrade" || request["action"] == "agent-upgrade-leaked" {
+            let output = fs::File::create(home.join("fixture-agent-upgrade.out"))?;
+            let mut command = Command::new(env::current_exe()?);
+            if request["action"] == "agent-upgrade-leaked" {
+                command
+                    .env("RAFT_COMPUTER_OPERATION_ID", "finished-web-upgrade")
+                    .env("RAFT_COMPUTER_APPROVED_BY", "remote:finished-web-upgrade");
+            }
+            let mut child = command
+                .args(["upgrade", "--version", "1.1.0", "--json"])
+                .env("RAFT_COMPUTER_INSTALLER_CALLER", "waiting-cli-v1")
+                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                .stdin(Stdio::null())
+                .stdout(output)
+                .stderr(Stdio::null())
+                .spawn()?;
+            let exit = home.join("fixture-agent-upgrade.exit");
+            std::thread::spawn(move || {
+                let code = child
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let _ = fs::write(exit, code.to_string());
+            });
         }
         if request["action"] == "stop" {
             break;
