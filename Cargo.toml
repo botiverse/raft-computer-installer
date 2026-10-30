@@ -1,6 +1,6 @@
 [package]
 name = "raft-computer-installer"
-version = "0.3.24-rc.1"
+version = "0.3.24-rc.2"
 edition = "2024"
 rust-version = "1.89"
 publish = false
