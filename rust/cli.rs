@@ -214,30 +214,39 @@ pub async fn run() -> Result<u8> {
             ));
         }
         if let Some(parent) = parent {
-            let remote = args.request.approved_by.starts_with("remote:");
-            if !remote && marker.is_some() {
-                // A local command run from inside the Computer (an agent on
-                // this computer): stopping the service would kill this
-                // installer with it. Refuse before anything is touched.
-                if let Some(product) = host::product_ancestor(&cfg, &parent)? {
-                    let reply = Reply::failure(
-                        &args.request.id,
-                        2,
-                        INSIDE_COMPUTER_LINE,
-                        FailureCode::InstallationHeld,
-                        "The upgrade was started from inside Raft Computer.",
-                    )
-                    .with_diagnostic(format!("computer process {} is an ancestor", product.pid));
-                    if args.json {
-                        println!("{}", serde_json::to_string(&reply)?);
-                    } else {
-                        eprintln!("{}", reply.line);
-                    }
-                    return Ok(reply.exit_code);
+            // A command run from inside the Computer (an agent on this
+            // computer): stopping the service would kill this installer with
+            // it. Refuse before anything is touched. This is decided from the
+            // process tree, never from RAFT_COMPUTER_APPROVED_BY: a web
+            // upgrade's `remote:` label used to leak into the service and every
+            // agent, and skipped this check (#proj-raft-computer:#32). A web
+            // upgrade's installer is a direct child of the service, which has
+            // no Computer ancestor, so it is never refused here. This prevents
+            // accidents; it is not an approval check, since the same OS user
+            // can always arrange its own process tree.
+            if let Some(product) = host::product_ancestor(&cfg, &parent)? {
+                let reply = Reply::failure(
+                    &args.request.id,
+                    2,
+                    INSIDE_COMPUTER_LINE,
+                    FailureCode::InstallationHeld,
+                    "The upgrade was started from inside Raft Computer.",
+                )
+                .with_diagnostic(format!("computer process {} is an ancestor", product.pid));
+                if args.json {
+                    println!("{}", serde_json::to_string(&reply)?);
+                } else {
+                    eprintln!("{}", reply.line);
                 }
-                // The supported CLI declares its role. Terminal presence and a
-                // separate status snapshot cannot establish who is waiting.
-                // OS parent identity limits the exemption to this invocation.
+                return Ok(reply.exit_code);
+            }
+            // The supported CLI declares its role; its declaration wins over
+            // any `remote:` label it inherited.
+            let remote = marker.is_none() && args.request.approved_by.starts_with("remote:");
+            if marker.is_some() {
+                // Terminal presence and a separate status snapshot cannot
+                // establish who is waiting. OS parent identity limits the
+                // exemption to this invocation.
                 args.request.waiting_caller = Some(parent);
             } else if !remote {
                 let reply = Reply::failure(

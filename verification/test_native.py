@@ -340,6 +340,26 @@ class InstallerContract(unittest.TestCase):
                 self.assert_remote_service_parent_is_still_stopped_and_replaced()
 
     def test_upgrade_started_inside_the_computer_is_refused_before_stopping(self):
+        self._assert_upgrade_inside_the_computer_is_refused("agent-upgrade")
+
+    def test_leaked_remote_label_does_not_skip_the_inside_computer_refusal(self):
+        # A web upgrade's id and `remote:` label used to leak into the service
+        # and every agent (#proj-raft-computer:#32); the refusal is decided
+        # from the process tree, so the label must not exempt the agent.
+        self._assert_upgrade_inside_the_computer_is_refused("agent-upgrade-leaked")
+
+    def test_the_started_computer_inherits_no_installer_run_variables(self):
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        leaked = {"RAFT_COMPUTER_OPERATION_ID": "web-upgrade", "RAFT_COMPUTER_APPROVED_BY": "remote:web-upgrade",
+            "RAFT_COMPUTER_NON_INTERACTIVE": "1"}
+        upgraded = machine.json(["upgrade", "--version", "1.1.0"], extra=leaked)
+        self.assertIn("It is running.", upgraded["line"])
+        self.assertEqual(machine.live()["version"], "1.1.0")
+        self.assertEqual(json.loads((machine.home / "fixture-service-env.json").read_text()), [])
+
+    def _assert_upgrade_inside_the_computer_is_refused(self, action):
         machine = self.server.machine()
         try:
             machine.json(["install", "--version", "1.0.0"])
@@ -351,7 +371,7 @@ class InstallerContract(unittest.TestCase):
             before = machine.live()
             self.assertIsNotNone(before)
             self.server.requests.clear()
-            exchange(machine.home, "agent-upgrade")
+            exchange(machine.home, action)
             exit_path = machine.home / "fixture-agent-upgrade.exit"
             wait_for(lambda: exit_path.exists(), timeout=60)
             self.assertEqual(exit_path.read_text(), "2")
