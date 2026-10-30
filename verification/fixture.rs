@@ -156,6 +156,38 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
                 .ok_or("remote installer identity unavailable")?;
             write_json(&home.join("fixture-remote-installer.json"), &identity)?;
         }
+        // An agent of this Computer calling the installer directly, from its
+        // own shell (not through the CLI, so the installer's immediate parent
+        // is not a Computer process). `-leaked`: with a finished web
+        // upgrade's id and `remote:` label in its environment.
+        #[cfg(unix)]
+        if request["action"] == "agent-installer-direct"
+            || request["action"] == "agent-installer-direct-leaked"
+        {
+            let installer = env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?;
+            let output = fs::File::create(home.join("fixture-agent-upgrade.out"))?;
+            let exit = home.join("fixture-agent-upgrade.exit");
+            let mut command = Command::new("/bin/sh");
+            if request["action"] == "agent-installer-direct-leaked" {
+                command
+                    .env("RAFT_COMPUTER_OPERATION_ID", "finished-web-upgrade")
+                    .env("RAFT_COMPUTER_APPROVED_BY", "remote:finished-web-upgrade");
+            }
+            // Not `exec`: the shell must stay the installer's parent.
+            command
+                .args([
+                    "-c",
+                    "\"$0\" upgrade --version 1.1.0 --json; printf %s $? > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+                ])
+                .arg(&installer)
+                .arg(&exit)
+                .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
+                .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+                .stdin(Stdio::null())
+                .stdout(output)
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
         // An agent of this Computer running `raft-computer upgrade` itself:
         // the waiting CLI and its installer are descendants of the service.
         // `agent-upgrade-leaked`: the same agent, whose environment still

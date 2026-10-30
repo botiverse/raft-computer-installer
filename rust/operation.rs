@@ -31,6 +31,12 @@ use std::{
     sync::Arc,
 };
 
+/// A request id from a finished operation is refused. The usual cause is a
+/// shell that still carries a finished web upgrade's variables (an old
+/// installer passed them to the service and every agent): say how to drop
+/// them (#proj-raft-computer:#32).
+pub const REQUEST_CONFLICT_LINE: &str = "This request ID already belongs to a different operation. If this shell still carries a finished upgrade's variables, run the command again without them: env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY -u RAFT_COMPUTER_NON_INTERACTIVE raft-computer upgrade";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum Kind {
@@ -1120,7 +1126,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::failure(
                 &request.id,
                 2,
-                "This request ID already belongs to a different operation.",
+                REQUEST_CONFLICT_LINE,
                 FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
@@ -1157,7 +1163,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             return Ok(Reply::failure(
                 &request.id,
                 2,
-                "This request ID already belongs to a different operation.",
+                REQUEST_CONFLICT_LINE,
                 FailureCode::RequestConflict,
                 "This request ID already belongs to a different operation.",
             ));
