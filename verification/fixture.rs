@@ -101,6 +101,18 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
         pid: std::process::id(),
         generation: uuid::Uuid::new_v4().to_string(),
     };
+    // Which per-run installer variables this service inherited
+    // (#proj-raft-computer:#32): a service must carry none of them.
+    let inherited: Vec<&str> = [
+        "RAFT_COMPUTER_OPERATION_ID",
+        "RAFT_COMPUTER_APPROVED_BY",
+        "RAFT_COMPUTER_NON_INTERACTIVE",
+        "RAFT_COMPUTER_INSTALLER_CALLER",
+    ]
+    .into_iter()
+    .filter(|name| env::var_os(name).is_some())
+    .collect();
+    write_json(&home.join("fixture-service-env.json"), &inherited)?;
     write_json(&home.join("fixture-service.json"), &state)?;
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -146,9 +158,17 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
         }
         // An agent of this Computer running `raft-computer upgrade` itself:
         // the waiting CLI and its installer are descendants of the service.
-        if request["action"] == "agent-upgrade" {
+        // `agent-upgrade-leaked`: the same agent, whose environment still
+        // carries a finished web upgrade's id and `remote:` label.
+        if request["action"] == "agent-upgrade" || request["action"] == "agent-upgrade-leaked" {
             let output = fs::File::create(home.join("fixture-agent-upgrade.out"))?;
-            let mut child = Command::new(env::current_exe()?)
+            let mut command = Command::new(env::current_exe()?);
+            if request["action"] == "agent-upgrade-leaked" {
+                command
+                    .env("RAFT_COMPUTER_OPERATION_ID", "finished-web-upgrade")
+                    .env("RAFT_COMPUTER_APPROVED_BY", "remote:finished-web-upgrade");
+            }
+            let mut child = command
                 .args(["upgrade", "--version", "1.1.0", "--json"])
                 .env("RAFT_COMPUTER_INSTALLER_CALLER", "waiting-cli-v1")
                 .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
