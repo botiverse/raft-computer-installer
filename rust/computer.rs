@@ -168,9 +168,6 @@ pub async fn run(
     budget: Duration,
 ) -> Result<CommandResult> {
     let mut command = Command::new(binary);
-    for name in Config::OPERATION_ENV {
-        command.env_remove(name);
-    }
     command
         .args(args)
         .envs(environment)
@@ -178,6 +175,10 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // After `environment`, so nothing passed in can add one back.
+    for name in Config::OPERATION_ENV {
+        command.env_remove(name);
+    }
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW; setup uses the retained console instead.
     let mut child = command
@@ -389,12 +390,12 @@ pub async fn lifecycle(cfg: &Config, action: &str) -> Result<LifecycleResult> {
             .ok_or_else(|| invalid("command directory missing"))?,
     )?;
     let mut helper_command = Command::new(std::env::current_exe()?);
+    helper_command.envs(cfg.environment());
     for name in Config::OPERATION_ENV {
         helper_command.env_remove(name);
     }
     let mut child = helper_command
         .arg("--product-command")
-        .envs(cfg.environment())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
