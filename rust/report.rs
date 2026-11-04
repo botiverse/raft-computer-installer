@@ -29,6 +29,7 @@ pub enum FailureCode {
     DowngradeNotAllowed,
     InstallFailed,
     InstallationDeclined,
+    InstallationDirNotWritable,
     InstallationHeld,
     InstallationPathMismatch,
     InterruptedBeforeStart,
@@ -39,15 +40,18 @@ pub enum FailureCode {
     RepairNotNeeded,
     RequestConflict,
     ResultUnreadable,
+    RunningAsRoot,
+    UnexpectedError,
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 18] = [
         Self::CallerNotComputer,
         Self::CandidateStartFailed,
         Self::DowngradeNotAllowed,
         Self::InstallFailed,
         Self::InstallationDeclined,
+        Self::InstallationDirNotWritable,
         Self::InstallationHeld,
         Self::InstallationPathMismatch,
         Self::InterruptedBeforeStart,
@@ -58,6 +62,8 @@ impl FailureCode {
         Self::RepairNotNeeded,
         Self::RequestConflict,
         Self::ResultUnreadable,
+        Self::RunningAsRoot,
+        Self::UnexpectedError,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -67,6 +73,7 @@ impl FailureCode {
             Self::DowngradeNotAllowed => "downgrade_not_allowed",
             Self::InstallFailed => "install_failed",
             Self::InstallationDeclined => "installation_declined",
+            Self::InstallationDirNotWritable => "installation_dir_not_writable",
             Self::InstallationHeld => "installation_held",
             Self::InstallationPathMismatch => "installation_path_mismatch",
             Self::InterruptedBeforeStart => "interrupted_before_start",
@@ -77,6 +84,8 @@ impl FailureCode {
             Self::RepairNotNeeded => "repair_not_needed",
             Self::RequestConflict => "request_conflict",
             Self::ResultUnreadable => "result_unreadable",
+            Self::RunningAsRoot => "running_as_root",
+            Self::UnexpectedError => "unexpected_error",
         }
     }
 }
@@ -216,9 +225,11 @@ mod failure_code_tests {
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 15);
+        assert_eq!(values.len(), 18);
         assert_eq!(values[0], "\"caller_not_computer\"");
-        assert_eq!(values[14], "\"result_unreadable\"");
+        assert_eq!(values[15], "\"result_unreadable\"");
+        assert_eq!(values[16], "\"running_as_root\"");
+        assert_eq!(values[17], "\"unexpected_error\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),

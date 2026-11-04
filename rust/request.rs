@@ -77,6 +77,10 @@ pub struct Reply {
     pub code: Option<FailureCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// The one runnable next step, when the reply has one apart from `line`
+    /// (a failure reported before any operation started).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
     pub receipt: Option<Receipt>,
     pub world: Option<World>,
 }
@@ -92,6 +96,7 @@ impl Reply {
             reason: None,
             code: None,
             diagnostic: None,
+            next_step: None,
             receipt: None,
             world: None,
         }
@@ -112,6 +117,7 @@ impl Reply {
             reason: Some(reason.into()),
             code: Some(code),
             diagnostic: None,
+            next_step: None,
             receipt: None,
             world: None,
         }
@@ -135,9 +141,14 @@ impl Reply {
             reason,
             code,
             diagnostic: None,
+            next_step: None,
             receipt: Some(receipt),
             world: None,
         }
+    }
+    pub fn with_next_step(mut self, next_step: impl Into<String>) -> Self {
+        self.next_step = Some(next_step.into());
+        self
     }
     pub fn with_diagnostic(mut self, diagnostic: impl Into<String>) -> Self {
         self.diagnostic = Some(diagnostic.into());
@@ -194,6 +205,9 @@ impl Reply {
                 (Some(_), None) | (None, Some(_))
             )
             || (self.exit_code == 0 && (self.reason.is_some() || self.code.is_some()))
+            || self.next_step.as_ref().is_some_and(|step| {
+                step.trim().is_empty() || step.len() > 512 || step.chars().any(char::is_control)
+            })
             || (self.exit_code == 0 && self.diagnostic.is_some())
             || (self.exit_code != 0 && (self.reason.is_none() || self.code.is_none()))
         {

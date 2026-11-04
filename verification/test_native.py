@@ -18,10 +18,10 @@ from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
     "caller_not_computer", "candidate_start_failed", "downgrade_not_allowed",
-    "install_failed", "installation_declined", "installation_held", "installation_path_mismatch",
+    "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
-    "request_conflict", "result_unreadable",
+    "request_conflict", "result_unreadable", "running_as_root", "unexpected_error",
 }
 
 
@@ -1049,6 +1049,59 @@ class InstallerContract(unittest.TestCase):
         self.assertNotIn("user home must be absolute", out)
         self.assertNotIn("installer", out.lower(), out)
         self.assertEqual(runtime_offenders(out), [])
+
+    @unittest.skipIf(WINDOWS or os.geteuid() == 0, "Unix permissions; root bypasses them")
+    def test_unwritable_state_home_names_the_folder_and_the_fix_before_downloading(self):
+        # #proj-raft-computer:#44: a state home this user cannot write used to
+        # print only "could not finish ... run it again", which fails the same
+        # way every time, and --json printed nothing on stdout.
+        machine = self.machine()
+        blocked = machine.home / "computer"
+        blocked.mkdir()
+        blocked.chmod(0o555)
+        self.addCleanup(blocked.chmod, 0o755)
+        self.server.requests.clear()
+        for args in (["status", "--json"], ["install", "--version", "1.0.0", "--json"]):
+            with self.subTest(args=args):
+                result = machine.run(args)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                reply = json.loads(result.stdout)
+                self.assert_failure_contract(reply)
+                self.assertEqual(reply["code"], "installation_dir_not_writable")
+                self.assertIn("can't write to ~/computer: permission denied", reply["line"])
+                self.assertEqual(reply["nextStep"],
+                    "Make it writable, then run the same install command again: chmod u+w ~/computer")
+                self.assertNotIn("Run the same install command again", reply["line"])
+                self.assertIn(reply["line"], result.stderr)
+                self.assertEqual(runtime_offenders(result.stderr), [])
+        self.assertEqual(sorted(p.name for p in blocked.iterdir()), [])
+        self.assertEqual(self.server.requests, [])
+
+    @unittest.skipIf(WINDOWS or os.geteuid() == 0, "Unix permissions; root bypasses them")
+    def test_unwritable_lock_folder_is_found_up_front(self):
+        # A lock folder a sudo run left behind: only the up-front check names
+        # it (installation_dir_not_writable) without starting an operation;
+        # past it, the operation fails on the lock instead.
+        machine = self.machine()
+        machine.json(["status"])
+        claims = machine.state / "gate" / "upgrade.lock.claims"
+        supervisors = machine.state / "scratch" / "supervisors"
+        self.assertTrue(claims.is_dir())
+        before = sorted(p.name for p in supervisors.iterdir())
+        claims.chmod(0o555)
+        self.addCleanup(claims.chmod, 0o755)
+        for args in (["status", "--json"], ["install", "--version", "1.0.0", "--json"]):
+            with self.subTest(args=args):
+                result = machine.run(args)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                reply = json.loads(result.stdout)
+                self.assert_failure_contract(reply)
+                self.assertEqual(reply["code"], "installation_dir_not_writable")
+                self.assertIn("can't write to ~/computer: permission denied (a folder inside it", reply["line"])
+                self.assertEqual(reply["nextStep"],
+                    "Make it writable, then run the same install command again: chmod -R u+w ~/computer")
+                self.assertEqual(runtime_offenders(result.stderr), [])
+        self.assertEqual(sorted(p.name for p in supervisors.iterdir()), before)
 
     def test_top_level_failure_preserves_a_private_bounded_diagnostic(self):
         machine = self.machine()
