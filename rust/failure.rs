@@ -72,28 +72,62 @@ pub struct Blocked {
     pub read_only: bool,
 }
 
-/// The directories an operation writes to first. Checking them only reads
-/// metadata: nothing is created, so `status` stays read-only here.
-fn targets(cfg: &Config, installs: bool) -> Vec<PathBuf> {
-    let mut targets = vec![
+/// The directories `command` writes to first, and the lock files it must
+/// read. Checking them only reads metadata: nothing is created, so `status`
+/// stays read-only here. `status` checks only what it always touches (the
+/// supervisor's scratch and the operation gate).
+fn targets(cfg: &Config, command: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let gate = cfg.installer_dir.join("gate");
+    let mut dirs = vec![
         cfg.scratch().join("supervisors"),
-        cfg.installer_dir.join("receipts"),
-        cfg.installer_dir.join("diagnostics"),
-        cfg.installer_dir.join("bin"),
-        cfg.k_state.clone(),
+        gate.join("upgrade.lock.claims"),
     ];
-    if installs {
-        targets.push(cfg.install_dir.clone());
+    let mut files = vec![gate.join("upgrade.lock")];
+    if command != "status" {
+        dirs.push(cfg.installer_dir.join("receipts"));
+        dirs.push(cfg.k_state.join("upgrade.lock.claims"));
+        files.push(cfg.k_state.join("upgrade.lock"));
     }
-    targets
+    if ["install", "upgrade", "repair"].contains(&command) {
+        dirs.push(cfg.installer_dir.join("bin"));
+        dirs.push(cfg.install_dir.clone());
+    }
+    (dirs, files)
 }
 
-/// The first state directory (or its nearest existing ancestor) this user
-/// cannot write, if any.
-pub fn blocked(cfg: &Config, installs: bool) -> Option<Blocked> {
-    targets(cfg, installs)
-        .iter()
+/// The first state directory (or its nearest existing ancestor), or existing
+/// lock file, that `command` needs and this user cannot write or read.
+pub fn blocked(cfg: &Config, command: &str) -> Option<Blocked> {
+    let (dirs, files) = targets(cfg, command);
+    dirs.iter()
         .find_map(|target| blocked_on_the_way(target))
+        .or_else(|| files.iter().find_map(|file| unreadable(file)))
+}
+
+#[cfg(unix)]
+fn access(path: &Path, mode: libc::c_int) -> Option<Option<i32>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is a valid NUL-terminated string for the call's duration.
+    if unsafe { libc::access(path.as_ptr(), mode) } == 0 {
+        return Some(None);
+    }
+    Some(io::Error::last_os_error().raw_os_error())
+}
+
+#[cfg(unix)]
+fn denied(path: &Path, errno: Option<i32>) -> Option<Blocked> {
+    match errno {
+        Some(libc::EACCES | libc::EPERM) => Some(Blocked {
+            path: path.to_path_buf(),
+            read_only: false,
+        }),
+        Some(libc::EROFS) => Some(Blocked {
+            path: path.to_path_buf(),
+            read_only: true,
+        }),
+        _ => None,
+    }
 }
 
 /// The nearest existing ancestor of `target` (inclusive) decides whether it
@@ -101,7 +135,6 @@ pub fn blocked(cfg: &Config, installs: bool) -> Option<Blocked> {
 /// ancestor's own missing search permission.
 #[cfg(unix)]
 pub fn blocked_on_the_way(target: &Path) -> Option<Blocked> {
-    use std::os::unix::ffi::OsStrExt;
     let mut existing = target;
     let metadata = loop {
         match std::fs::metadata(existing) {
@@ -120,22 +153,16 @@ pub fn blocked_on_the_way(target: &Path) -> Option<Blocked> {
     if !metadata.is_dir() {
         return None;
     }
-    let path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `path` is a valid NUL-terminated string for the call's duration.
-    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+    denied(existing, access(existing, libc::W_OK | libc::X_OK)?)
+}
+
+/// An existing file this user cannot read (a lock left by another account).
+#[cfg(unix)]
+fn unreadable(file: &Path) -> Option<Blocked> {
+    if !std::fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    match io::Error::last_os_error().raw_os_error() {
-        Some(libc::EACCES | libc::EPERM) => Some(Blocked {
-            path: existing.to_path_buf(),
-            read_only: false,
-        }),
-        Some(libc::EROFS) => Some(Blocked {
-            path: existing.to_path_buf(),
-            read_only: true,
-        }),
-        _ => None,
-    }
+    denied(file, access(file, libc::R_OK)?)
 }
 
 #[cfg(not(unix))]
@@ -143,16 +170,59 @@ pub fn blocked_on_the_way(_target: &Path) -> Option<Blocked> {
     None
 }
 
-/// The directory to give back to the user: the topmost one between the home
-/// (exclusive) and `blocked` (inclusive) that the user does not own. Never the
-/// home itself or anything outside it; `None` when every one is owned.
-pub fn chown_target(blocked: &Path, home: &Path, owned: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+#[cfg(not(unix))]
+fn unreadable(_file: &Path) -> Option<Blocked> {
+    None
+}
+
+/// What to give back to the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChownTarget {
+    pub path: PathBuf,
+    /// The link under home that leads to `path`, when one does: `chown -R`
+    /// on a link changes the link, not the folder it points to.
+    pub link: Option<PathBuf>,
+}
+
+/// The topmost directory between the home (exclusive) and `blocked`
+/// (inclusive) that the user does not own. Never the home itself or anything
+/// outside it; `None` when every one is owned. A link on the way is followed,
+/// and the folder it leads to is checked instead.
+pub fn chown_target(
+    blocked: &Path,
+    home: &Path,
+    owned: impl Fn(&Path) -> bool,
+) -> Option<ChownTarget> {
     let relative = blocked.strip_prefix(home).ok()?;
     let mut current = home.to_path_buf();
-    for component in relative.components() {
+    let mut components = relative.components();
+    while let Some(component) = components.next() {
         current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+            let link = current.clone();
+            let mut resolved = std::fs::canonicalize(&link).ok()?;
+            if !owned(&resolved) {
+                return Some(ChownTarget {
+                    path: resolved,
+                    link: Some(link),
+                });
+            }
+            for component in components {
+                resolved.push(component);
+                if !owned(&resolved) {
+                    return Some(ChownTarget {
+                        path: resolved,
+                        link: Some(link),
+                    });
+                }
+            }
+            return None;
+        }
         if !owned(&current) {
-            return Some(current);
+            return Some(ChownTarget {
+                path: current,
+                link: None,
+            });
         }
     }
     None
@@ -236,10 +306,24 @@ impl Answer {
 
 /// Paths are shown the way people type them (`~/…`). A directory inside the
 /// private installation state is shown, and fixed, as the state home: those
-/// internal folders are not something the user needs to know about.
+/// internal folders are not something the user needs to know about. When the
+/// state home is the home itself (or above it), the folder directly under
+/// home on the way is shown instead: home is never the thing to fix.
 fn shown(path: &Path, cfg: Option<&Config>) -> PathBuf {
     match cfg {
-        Some(cfg) if path.starts_with(&cfg.installer_dir) => cfg.state_home.clone(),
+        Some(cfg) if path.starts_with(&cfg.installer_dir) => {
+            if !cfg.user_home.starts_with(&cfg.state_home) {
+                return cfg.state_home.clone();
+            }
+            match path
+                .strip_prefix(&cfg.user_home)
+                .ok()
+                .and_then(|rest| rest.components().next())
+            {
+                Some(first) => cfg.user_home.join(first),
+                None => path.to_path_buf(),
+            }
+        }
         _ => path.to_path_buf(),
     }
 }
@@ -256,75 +340,134 @@ fn word(path: &Path, cfg: Option<&Config>) -> String {
     crate::shell_path::shell_word(&display(path, cfg))
 }
 
+/// What the permission answer needs to know about this machine, so tests can
+/// supply owners and names.
+#[cfg(unix)]
+pub struct Accounts<'a> {
+    pub uid: u32,
+    pub user: String,
+    pub owner: &'a dyn Fn(&Path) -> Option<u32>,
+    pub name: &'a dyn Fn(u32) -> String,
+}
+
+#[cfg(unix)]
+impl Accounts<'static> {
+    fn system() -> Self {
+        Accounts {
+            uid: current_uid(),
+            user: current_user(),
+            owner: &owner_of,
+            name: &account,
+        }
+    }
+}
+
 /// The answer for a directory this user cannot write.
 pub fn not_writable(blocked: &Blocked, cfg: Option<&Config>) -> Answer {
-    let path = shown(&blocked.path, cfg);
-    let user = current_user();
-    if blocked.read_only {
-        return Answer {
-            message: format!(
-                "Raft Computer can't write to {}: the file system is read-only.",
-                display(&path, cfg)
-            ),
-            next_step: "Make it writable, or set RAFT_HOME to a writable folder, then run the same install command again.".into(),
-            code: FailureCode::InstallationDirNotWritable,
-            retry_helps: false,
-        };
-    }
     #[cfg(unix)]
     {
-        let uid = current_uid();
-        let why = match owner_of(&blocked.path) {
-            Some(owner) if owner != uid => format!("it belongs to {}", account(owner)),
-            _ => format!("it is not writable by {user}"),
-        };
-        let message = format!(
-            "Raft Computer can't write to {}: permission denied ({why}).",
-            display(&path, cfg)
-        );
-        if let Some(cfg) = cfg
-            && path.starts_with(&cfg.user_home)
-            && path != cfg.user_home
-        {
-            let owned = |p: &Path| owner_of(p) == Some(uid);
-            let next_step = match chown_target(&blocked.path, &cfg.user_home, owned) {
-                Some(target) => format!(
-                    "Fix the owner, then run the same install command again: sudo chown -R {} {}",
-                    crate::shell_path::shell_word(&user),
-                    word(&shown(&target, Some(cfg)), Some(cfg))
-                ),
-                None if path == blocked.path => format!(
-                    "Make it writable, then run the same install command again: chmod u+w {}",
-                    word(&path, Some(cfg))
-                ),
-                None => format!(
-                    "Make it writable, then run the same install command again: chmod -R u+w {}",
-                    word(&path, Some(cfg))
-                ),
-            };
-            return Answer {
-                message,
-                next_step,
-                code: FailureCode::InstallationDirNotWritable,
-                retry_helps: false,
-            };
+        not_writable_for(blocked, cfg, &Accounts::system())
+    }
+    #[cfg(not(unix))]
+    {
+        let path = shown(&blocked.path, cfg);
+        if blocked.read_only {
+            return read_only(&path, cfg);
         }
         Answer {
-            message,
-            next_step: format!(
-                "Make {} writable by {user}, then run the same install command again.",
+            message: format!(
+                "Raft Computer can't write to {}: permission denied.",
                 display(&path, cfg)
+            ),
+            next_step: format!(
+                "Make {} writable by {}, then run the same install command again.",
+                display(&path, cfg),
+                current_user()
             ),
             code: FailureCode::InstallationDirNotWritable,
             retry_helps: false,
         }
     }
-    #[cfg(not(unix))]
+}
+
+fn read_only(path: &Path, cfg: Option<&Config>) -> Answer {
     Answer {
         message: format!(
-            "Raft Computer can't write to {}: permission denied.",
-            display(&path, cfg)
+            "Raft Computer can't write to {}: the file system is read-only.",
+            display(path, cfg)
         ),
+        next_step: "Make it writable, or set RAFT_HOME to a writable folder, then run the same install command again.".into(),
+        code: FailureCode::InstallationDirNotWritable,
+        retry_helps: false,
+    }
+}
+
+#[cfg(unix)]
+pub fn not_writable_for(blocked: &Blocked, cfg: Option<&Config>, accounts: &Accounts) -> Answer {
+    let path = shown(&blocked.path, cfg);
+    if blocked.read_only {
+        return read_only(&path, cfg);
+    }
+    let user = &accounts.user;
+    // The reason names the folder that actually blocks; when a parent is
+    // shown in its place, it says the blocking folder is inside it.
+    let subject = if path == blocked.path {
+        "it"
+    } else {
+        "a folder inside it"
+    };
+    let why = match (accounts.owner)(&blocked.path) {
+        Some(owner) if owner != accounts.uid => {
+            format!("{subject} belongs to {}", (accounts.name)(owner))
+        }
+        _ => format!("{subject} is not writable by {user}"),
+    };
+    let message = format!(
+        "Raft Computer can't write to {}: permission denied ({why}).",
+        display(&path, cfg)
+    );
+    if let Some(cfg) = cfg
+        && path.starts_with(&cfg.user_home)
+        && path != cfg.user_home
+    {
+        let owned = |p: &Path| (accounts.owner)(p) == Some(accounts.uid);
+        let next_step = match chown_target(&blocked.path, &cfg.user_home, owned) {
+            Some(ChownTarget { path: target, link }) => {
+                let target = shown(&target, Some(cfg));
+                let command = format!(
+                    "sudo chown -R {} {}",
+                    crate::shell_path::shell_word(user),
+                    word(&target, Some(cfg))
+                );
+                match link {
+                    Some(link) => format!(
+                        "{} is a link to {}. Fix the owner of that folder, then run the same install command again: {command}",
+                        display(&link, Some(cfg)),
+                        display(&target, Some(cfg))
+                    ),
+                    None => {
+                        format!("Fix the owner, then run the same install command again: {command}")
+                    }
+                }
+            }
+            None if path == blocked.path => format!(
+                "Make it writable, then run the same install command again: chmod u+w {}",
+                word(&path, Some(cfg))
+            ),
+            None => format!(
+                "Make it writable, then run the same install command again: chmod -R u+w {}",
+                word(&path, Some(cfg))
+            ),
+        };
+        return Answer {
+            message,
+            next_step,
+            code: FailureCode::InstallationDirNotWritable,
+            retry_helps: false,
+        };
+    }
+    Answer {
+        message,
         next_step: format!(
             "Make {} writable by {user}, then run the same install command again.",
             display(&path, cfg)
@@ -334,28 +477,46 @@ pub fn not_writable(blocked: &Blocked, cfg: Option<&Config>) -> Answer {
     }
 }
 
-/// The answer for an error that reached main(). `blocked` is the state
-/// directory found unwritable, if any: an I/O error does not carry its path.
+/// Root with a home that belongs to someone else (`sudo` keeping HOME): every
+/// folder this run creates there would belong to root, and the user's own
+/// next run could not write it. Refuse before anything is written.
+pub fn root_refusal(
+    euid: u32,
+    home_owner: Option<u32>,
+    name: impl Fn(u32) -> String,
+) -> Option<Answer> {
+    match home_owner {
+        Some(owner) if euid == 0 && owner != 0 => Some(Answer {
+            message: format!(
+                "Don't run this as root: it would create files in {}'s home that only root can change.",
+                name(owner)
+            ),
+            next_step: "Run the same install command again without sudo.".into(),
+            code: FailureCode::RunningAsRoot,
+            retry_helps: false,
+        }),
+        _ => None,
+    }
+}
+
+/// The up-front check before `command` writes anything: refuse root in
+/// another user's home, then name a folder this user cannot write.
+pub fn preflight(cfg: &Config, command: &str) -> Option<Answer> {
+    #[cfg(unix)]
+    if let Some(answer) = root_refusal(current_uid(), owner_of(&cfg.user_home), account) {
+        return Some(answer);
+    }
+    blocked(cfg, command).map(|blocked| not_writable(&blocked, Some(cfg)))
+}
+
+/// The answer for an error that reached main() or failed an operation.
+/// `blocked` is the state directory found unwritable, if any: an I/O error
+/// does not carry its path.
 pub fn answer(error: &Error, cfg: Option<&Config>, blocked: Option<&Blocked>) -> Answer {
     let cause = classify(error);
     let answer = match (cause, blocked) {
         (Cause::PermissionDenied | Cause::ReadOnly, Some(blocked)) => not_writable(blocked, cfg),
-        (Cause::PermissionDenied, None) => Answer {
-            message: "Raft Computer can't write to a folder it needs: permission denied.".into(),
-            next_step: match cfg {
-                Some(cfg) => format!(
-                    "Make {} writable by {}, then run the same install command again.",
-                    display(&cfg.state_home, Some(cfg)),
-                    current_user()
-                ),
-                None => format!(
-                    "Make your home folder writable by {}, then run the same install command again.",
-                    current_user()
-                ),
-            },
-            code: FailureCode::InstallationDirNotWritable,
-            retry_helps: false,
-        },
+        (Cause::PermissionDenied, None) => unlocated_permission(cfg),
         (Cause::ReadOnly, None) => Answer {
             message: "Raft Computer can't write its files: the file system is read-only.".into(),
             next_step: "Make it writable, or set RAFT_HOME to a writable folder, then run the same install command again.".into(),
@@ -379,6 +540,50 @@ pub fn answer(error: &Error, cfg: Option<&Config>, blocked: Option<&Blocked>) ->
     answer
 }
 
+/// Permission denied somewhere no check could find (ownership mixed deeper
+/// inside the state home): give the whole state home back when it is a
+/// folder of its own under home.
+fn unlocated_permission(cfg: Option<&Config>) -> Answer {
+    let user = current_user();
+    let (message, next_step) = match cfg {
+        #[cfg(unix)]
+        Some(cfg)
+            if cfg.state_home.starts_with(&cfg.user_home) && cfg.state_home != cfg.user_home =>
+        {
+            (
+                format!(
+                    "Raft Computer can't write to a folder inside {}: permission denied.",
+                    display(&cfg.state_home, Some(cfg))
+                ),
+                format!(
+                    "Fix the owner, then run the same install command again: sudo chown -R {} {}",
+                    crate::shell_path::shell_word(&user),
+                    word(&cfg.state_home, Some(cfg))
+                ),
+            )
+        }
+        Some(cfg) => (
+            "Raft Computer can't write to a folder it needs: permission denied.".into(),
+            format!(
+                "Make {} writable by {user}, then run the same install command again.",
+                display(&cfg.state_home, Some(cfg))
+            ),
+        ),
+        None => (
+            "Raft Computer can't write to a folder it needs: permission denied.".into(),
+            format!(
+                "Make your home folder writable by {user}, then run the same install command again."
+            ),
+        ),
+    };
+    Answer {
+        message,
+        next_step,
+        code: FailureCode::InstallationDirNotWritable,
+        retry_helps: false,
+    }
+}
+
 /// One line, only when the private record of this failure could not be kept.
 pub const NOT_SAVED_LINE: &str = "Details of this failure could not be saved on this computer.";
 
@@ -392,7 +597,7 @@ pub fn report(error: &Error, json: bool) -> u8 {
         .is_some_and(|cfg| crate::diagnostic::preserve_top_level_failure(cfg, error));
     let cause = classify(error);
     let blocked = match (cause, cfg.as_ref()) {
-        (Cause::PermissionDenied | Cause::ReadOnly, Some(cfg)) => blocked(cfg, true),
+        (Cause::PermissionDenied | Cause::ReadOnly, Some(cfg)) => blocked(cfg, "upgrade"),
         _ => None,
     };
     let answer = answer(error, cfg.as_ref(), blocked.as_ref());
@@ -524,20 +729,23 @@ mod tests {
     fn chown_target_is_the_topmost_unowned_directory_under_home() {
         let home = Path::new("/home/u");
         let blocked = Path::new("/home/u/.raft/computer/installer");
+        let target = |p: &str| {
+            Some(ChownTarget {
+                path: PathBuf::from(p),
+                link: None,
+            })
+        };
         let foreign = [
             Path::new("/home/u/.raft"),
             Path::new("/home/u/.raft/computer"),
         ];
         let owned = |p: &Path| !foreign.contains(&p);
-        assert_eq!(
-            chown_target(blocked, home, owned),
-            Some(PathBuf::from("/home/u/.raft"))
-        );
+        assert_eq!(chown_target(blocked, home, owned), target("/home/u/.raft"));
         // Only a deeper directory is foreign.
         let owned = |p: &Path| p != Path::new("/home/u/.raft/computer");
         assert_eq!(
             chown_target(blocked, home, owned),
-            Some(PathBuf::from("/home/u/.raft/computer"))
+            target("/home/u/.raft/computer")
         );
         // Everything owned: nothing to chown (a mode problem).
         assert_eq!(chown_target(blocked, home, |_| true), None);
@@ -545,6 +753,213 @@ mod tests {
         assert_eq!(chown_target(home, home, |_| false), None);
         assert_eq!(chown_target(Path::new("/srv/rw"), home, |_| false), None);
         assert_eq!(chown_target(Path::new("/"), home, |_| false), None);
+    }
+
+    #[cfg(unix)]
+    fn accounts<'a>(
+        owner: &'a dyn Fn(&Path) -> Option<u32>,
+        name: &'a dyn Fn(u32) -> String,
+    ) -> Accounts<'a> {
+        Accounts {
+            uid: 1000,
+            user: "u".into(),
+            owner,
+            name,
+        }
+    }
+
+    #[cfg(unix)]
+    fn names(uid: u32) -> String {
+        if uid == 0 {
+            "root".into()
+        } else {
+            format!("user{uid}")
+        }
+    }
+
+    fn denied_at(path: &Path) -> Blocked {
+        Blocked {
+            path: path.to_path_buf(),
+            read_only: false,
+        }
+    }
+
+    /// An odd state home and user name are quoted for pasting.
+    #[cfg(unix)]
+    #[test]
+    fn the_chown_command_quotes_odd_paths_and_names() {
+        let home = Path::new("/home/u");
+        let mut cfg = config(home);
+        cfg.state_home = home.join("my raft $x'q");
+        cfg.installer_dir = cfg.state_home.join("computer/installer");
+        let foreign = cfg.state_home.clone();
+        let owner = move |p: &Path| Some(if p == foreign { 0 } else { 1000 });
+        let mut look = accounts(&owner, &names);
+        look.user = "a b".into();
+        let answer = not_writable_for(&denied_at(&cfg.state_home), Some(&cfg), &look);
+        assert_eq!(
+            answer.message,
+            "Raft Computer can't write to ~/my raft $x'q: permission denied (it belongs to root)."
+        );
+        assert_eq!(
+            answer.next_step,
+            "Fix the owner, then run the same install command again: sudo chown -R 'a b' ~/'my raft $x'\\''q'"
+        );
+    }
+
+    /// Home itself, or `/`, is never handed to chown or chmod.
+    #[cfg(unix)]
+    #[test]
+    fn home_and_root_are_never_the_folder_to_fix() {
+        let home = Path::new("/home/u");
+        let cfg = config(home);
+        let owner = |_: &Path| Some(0);
+        let look = accounts(&owner, &names);
+        let answer = not_writable_for(&denied_at(home), Some(&cfg), &look);
+        assert_eq!(
+            answer.next_step,
+            "Make ~/ writable by u, then run the same install command again."
+        );
+        let answer = not_writable_for(&denied_at(Path::new("/")), Some(&cfg), &look);
+        assert_eq!(
+            answer.next_step,
+            "Make / writable by u, then run the same install command again."
+        );
+    }
+
+    /// A user-owned ~/.raft with a root-owned folder inside: the reason names
+    /// that folder's owner, the fix covers the state home.
+    #[cfg(unix)]
+    #[test]
+    fn the_reason_names_the_owner_of_the_folder_that_blocks() {
+        let home = Path::new("/home/u");
+        let cfg = config(home);
+        let inner = cfg.installer_dir.clone();
+        let owner = move |p: &Path| Some(if p == inner { 0 } else { 1000 });
+        let look = accounts(&owner, &names);
+        let answer = not_writable_for(&denied_at(&cfg.installer_dir), Some(&cfg), &look);
+        assert_eq!(
+            answer.line(),
+            "Raft Computer can't write to ~/.raft: permission denied (a folder inside it belongs to root). Fix the owner, then run the same install command again: sudo chown -R u ~/.raft"
+        );
+    }
+
+    /// RAFT_HOME is the home itself: the folder under home is named, not `~/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_home_equal_to_home_names_the_folder_under_it() {
+        let home = Path::new("/home/u");
+        let mut cfg = config(home);
+        cfg.state_home = home.to_path_buf();
+        cfg.k_state = home.join("computer/k");
+        cfg.installer_dir = home.join("computer/installer");
+        let inner = cfg.installer_dir.clone();
+        let owner = move |p: &Path| Some(if p == inner { 0 } else { 1000 });
+        let look = accounts(&owner, &names);
+        let answer = not_writable_for(&denied_at(&cfg.installer_dir), Some(&cfg), &look);
+        assert_eq!(
+            answer.line(),
+            "Raft Computer can't write to ~/computer: permission denied (a folder inside it belongs to root). Fix the owner, then run the same install command again: sudo chown -R u ~/computer"
+        );
+    }
+
+    /// A linked ~/.raft: chown -R on the link would change only the link, so
+    /// the folder it points to is named and fixed.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_state_home_is_fixed_at_its_target() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let data = elsewhere.path().canonicalize().unwrap().join("data");
+        std::fs::create_dir_all(data.join("computer")).unwrap();
+        std::os::unix::fs::symlink(&data, home.path().join(".raft")).unwrap();
+        let cfg = config(home.path());
+        let foreign = data.clone();
+        let owner = move |p: &Path| Some(if p == foreign { 0 } else { 1000 });
+        let look = accounts(&owner, &names);
+        let blocked = denied_at(&cfg.state_home.join("computer"));
+        let answer = not_writable_for(&blocked, Some(&cfg), &look);
+        assert_eq!(
+            answer.next_step,
+            format!(
+                "~/.raft is a link to {0}. Fix the owner of that folder, then run the same install command again: sudo chown -R u {0}",
+                data.display()
+            )
+        );
+    }
+
+    #[test]
+    fn root_is_refused_only_in_another_users_home() {
+        let name = |uid: u32| {
+            if uid == 1000 {
+                "u".to_string()
+            } else {
+                uid.to_string()
+            }
+        };
+        let answer = root_refusal(0, Some(1000), name).unwrap();
+        assert_eq!(
+            answer.line(),
+            "Don't run this as root: it would create files in u's home that only root can change. Run the same install command again without sudo."
+        );
+        assert_eq!(answer.code, FailureCode::RunningAsRoot);
+        answer.reply("id-r").validate("id-r").unwrap();
+        assert_eq!(root_refusal(0, Some(0), name), None);
+        assert_eq!(root_refusal(1000, Some(1000), name), None);
+        assert_eq!(root_refusal(0, None, name), None);
+    }
+
+    /// Permission denied that no check located: the whole state home is
+    /// given back.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlocated_permission_failure_offers_the_state_home_chown() {
+        let cfg = config(Path::new("/home/u"));
+        let error = Error::Io(io::Error::from(io::ErrorKind::PermissionDenied));
+        let answer = answer(&error, Some(&cfg), None);
+        assert_eq!(
+            answer.message,
+            "Raft Computer can't write to a folder inside ~/.raft: permission denied."
+        );
+        assert!(
+            answer.next_step.starts_with(
+                "Fix the owner, then run the same install command again: sudo chown -R "
+            ),
+            "{}",
+            answer.next_step
+        );
+        assert!(answer.next_step.ends_with(" ~/.raft"));
+    }
+
+    /// `status` checks only what it always writes; an unwritable lock folder
+    /// is found for every command.
+    #[cfg(unix)]
+    #[test]
+    fn status_checks_only_the_folders_it_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let cfg = config(home.path());
+        let bin = cfg.installer_dir.join("bin");
+        let claims = cfg.installer_dir.join("gate/upgrade.lock.claims");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&claims).unwrap();
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&bin, 0o555);
+        let status = blocked(&cfg, "status");
+        let upgrade = blocked(&cfg, "upgrade");
+        mode(&bin, 0o755);
+        assert_eq!(status, None);
+        assert_eq!(upgrade, Some(denied_at(&bin)));
+        mode(&claims, 0o555);
+        let status = blocked(&cfg, "status");
+        mode(&claims, 0o755);
+        assert_eq!(status, Some(denied_at(&claims)));
     }
 
     #[test]
@@ -607,7 +1022,7 @@ mod tests {
         let cfg = config(home.path());
         std::fs::create_dir(&cfg.state_home).unwrap();
         std::fs::set_permissions(&cfg.state_home, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let found = blocked(&cfg, false);
+        let found = blocked(&cfg, "status");
         std::fs::set_permissions(&cfg.state_home, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             found,
@@ -633,7 +1048,7 @@ mod tests {
             "Make it writable, then run the same install command again: chmod u+w ~/.raft"
         );
         // A writable home has nothing blocked.
-        assert_eq!(blocked(&cfg, true), None);
+        assert_eq!(blocked(&cfg, "upgrade"), None);
     }
 
     /// A blocked folder inside the private state is shown and fixed as the
@@ -651,7 +1066,7 @@ mod tests {
         std::fs::create_dir_all(&cfg.installer_dir).unwrap();
         std::fs::set_permissions(&cfg.installer_dir, std::fs::Permissions::from_mode(0o555))
             .unwrap();
-        let found = blocked(&cfg, false);
+        let found = blocked(&cfg, "status");
         std::fs::set_permissions(&cfg.installer_dir, std::fs::Permissions::from_mode(0o755))
             .unwrap();
         let found = found.unwrap();

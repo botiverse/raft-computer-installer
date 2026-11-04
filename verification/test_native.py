@@ -21,7 +21,7 @@ FAILURE_CODES = {
     "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
-    "request_conflict", "result_unreadable", "unexpected_error",
+    "request_conflict", "result_unreadable", "running_as_root", "unexpected_error",
 }
 
 
@@ -1076,6 +1076,32 @@ class InstallerContract(unittest.TestCase):
                 self.assertEqual(runtime_offenders(result.stderr), [])
         self.assertEqual(sorted(p.name for p in blocked.iterdir()), [])
         self.assertEqual(self.server.requests, [])
+
+    @unittest.skipIf(WINDOWS or os.geteuid() == 0, "Unix permissions; root bypasses them")
+    def test_unwritable_lock_folder_is_found_up_front(self):
+        # A lock folder a sudo run left behind: only the up-front check names
+        # it (installation_dir_not_writable) without starting an operation;
+        # past it, the operation fails on the lock instead.
+        machine = self.machine()
+        machine.json(["status"])
+        claims = machine.state / "gate" / "upgrade.lock.claims"
+        supervisors = machine.state / "scratch" / "supervisors"
+        self.assertTrue(claims.is_dir())
+        before = sorted(p.name for p in supervisors.iterdir())
+        claims.chmod(0o555)
+        self.addCleanup(claims.chmod, 0o755)
+        for args in (["status", "--json"], ["install", "--version", "1.0.0", "--json"]):
+            with self.subTest(args=args):
+                result = machine.run(args)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                reply = json.loads(result.stdout)
+                self.assert_failure_contract(reply)
+                self.assertEqual(reply["code"], "installation_dir_not_writable")
+                self.assertIn("can't write to ~/computer: permission denied (a folder inside it", reply["line"])
+                self.assertEqual(reply["nextStep"],
+                    "Make it writable, then run the same install command again: chmod -R u+w ~/computer")
+                self.assertEqual(runtime_offenders(result.stderr), [])
+        self.assertEqual(sorted(p.name for p in supervisors.iterdir()), before)
 
     def test_top_level_failure_preserves_a_private_bounded_diagnostic(self):
         machine = self.machine()

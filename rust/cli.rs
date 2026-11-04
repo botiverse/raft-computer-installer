@@ -147,17 +147,29 @@ async fn worker(cfg: &Config) -> Result<u8> {
                         }
                 );
             let diagnostic = diagnostic::safe_error(&error);
-            Reply::failure(
-                &request.id,
-                if unresolved { 3 } else { 1 },
-                failure_line(),
-                if unresolved {
-                    FailureCode::RecoveryUnresolved
-                } else {
-                    FailureCode::InstallFailed
-                },
-                "The installation could not finish.",
-            )
+            let code = if unresolved {
+                FailureCode::RecoveryUnresolved
+            } else {
+                FailureCode::InstallFailed
+            };
+            let exit_code = if unresolved { 3 } else { 1 };
+            // A permission, read-only or full-disk failure fails the same way
+            // on every run: name it and its fix instead of "run it again"
+            // (for example a lock folder a sudo run left owned by root).
+            if crate::failure::classify(&error).retry_helps() {
+                Reply::failure(
+                    &request.id,
+                    exit_code,
+                    failure_line(),
+                    code,
+                    "The installation could not finish.",
+                )
+            } else {
+                let blocked = crate::failure::blocked(cfg, &request.command);
+                let answer = crate::failure::answer(&error, Some(cfg), blocked.as_ref());
+                Reply::failure(&request.id, exit_code, answer.line(), code, answer.message)
+                    .with_next_step(answer.next_step)
+            }
             .with_diagnostic(diagnostic)
         }
     };
@@ -295,13 +307,13 @@ pub async fn run() -> Result<u8> {
         }
     }
     // Every command writes under the state home first (the supervisor's
-    // scratch, receipts). A directory this user cannot write (for example a
+    // scratch, the operation gate). A directory this user cannot write (for example a
     // ~/.raft created by root) fails identically on every run: say which one
     // and how to fix it before anything is downloaded or stopped. Only
     // metadata is read; nothing is created (#proj-raft-computer:#44).
-    let installs = ["install", "upgrade", "repair"].contains(&args.request.command.as_str());
-    if let Some(blocked) = crate::failure::blocked(&cfg, installs) {
-        let answer = crate::failure::not_writable(&blocked, Some(&cfg));
+    // Root in another user's home is refused here too, before it creates
+    // folders that user could not write afterwards.
+    if let Some(answer) = crate::failure::preflight(&cfg, &args.request.command) {
         let reply = answer.reply(&args.request.id);
         eprintln!("{}", answer.line());
         if args.json {

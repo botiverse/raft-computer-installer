@@ -40,11 +40,12 @@ pub enum FailureCode {
     RepairNotNeeded,
     RequestConflict,
     ResultUnreadable,
+    RunningAsRoot,
     UnexpectedError,
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::CallerNotComputer,
         Self::CandidateStartFailed,
         Self::DowngradeNotAllowed,
@@ -61,6 +62,7 @@ impl FailureCode {
         Self::RepairNotNeeded,
         Self::RequestConflict,
         Self::ResultUnreadable,
+        Self::RunningAsRoot,
         Self::UnexpectedError,
     ];
 
@@ -82,6 +84,7 @@ impl FailureCode {
             Self::RepairNotNeeded => "repair_not_needed",
             Self::RequestConflict => "request_conflict",
             Self::ResultUnreadable => "result_unreadable",
+            Self::RunningAsRoot => "running_as_root",
             Self::UnexpectedError => "unexpected_error",
         }
     }
@@ -222,10 +225,11 @@ mod failure_code_tests {
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 17);
+        assert_eq!(values.len(), 18);
         assert_eq!(values[0], "\"caller_not_computer\"");
         assert_eq!(values[15], "\"result_unreadable\"");
-        assert_eq!(values[16], "\"unexpected_error\"");
+        assert_eq!(values[16], "\"running_as_root\"");
+        assert_eq!(values[17], "\"unexpected_error\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),
