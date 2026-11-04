@@ -432,6 +432,23 @@ pub fn not_writable_for(blocked: &Blocked, cfg: Option<&Config>, accounts: &Acco
     {
         let owned = |p: &Path| (accounts.owner)(p) == Some(accounts.uid);
         let next_step = match chown_target(&blocked.path, &cfg.user_home, owned) {
+            Some(ChownTarget {
+                path: target,
+                link: Some(link),
+            }) if !strictly_inside(&target, &cfg.user_home) => {
+                // A link out of home (or to home itself, or to `/`): never
+                // hand that folder to a recursive chown. Name it and its
+                // owner; the user decides.
+                let owner = match (accounts.owner)(&target) {
+                    Some(owner) => (accounts.name)(owner),
+                    None => "another user".into(),
+                };
+                format!(
+                    "{} is a link to {}, which belongs to {owner}. Fix that folder's owner yourself, or set RAFT_HOME to a folder you own, then run the same install command again.",
+                    display(&link, Some(cfg)),
+                    display(&target, Some(cfg))
+                )
+            }
             Some(ChownTarget { path: target, link }) => {
                 let target = shown(&target, Some(cfg));
                 let command = format!(
@@ -475,6 +492,15 @@ pub fn not_writable_for(blocked: &Blocked, cfg: Option<&Config>, accounts: &Acco
         code: FailureCode::InstallationDirNotWritable,
         retry_helps: false,
     }
+}
+
+/// `path` lies below `home` (not home itself, an ancestor of it, or outside
+/// it), comparing against the home as given and as resolved.
+fn strictly_inside(path: &Path, home: &Path) -> bool {
+    let resolved = std::fs::canonicalize(home).ok();
+    std::iter::once(home)
+        .chain(resolved.as_deref())
+        .any(|home| path.starts_with(home) && path != home)
 }
 
 /// Root with a home that belongs to someone else (`sudo` keeping HOME): every
@@ -864,7 +890,8 @@ mod tests {
     }
 
     /// A linked ~/.raft: chown -R on the link would change only the link, so
-    /// the folder it points to is named and fixed.
+    /// the folder it points to is named. Outside home, that folder is never
+    /// handed to a recursive chown; inside home, it is.
     #[cfg(unix)]
     #[test]
     fn a_linked_state_home_is_fixed_at_its_target() {
@@ -882,9 +909,69 @@ mod tests {
         assert_eq!(
             answer.next_step,
             format!(
-                "~/.raft is a link to {0}. Fix the owner of that folder, then run the same install command again: sudo chown -R u {0}",
+                "~/.raft is a link to {}, which belongs to root. Fix that folder's owner yourself, or set RAFT_HOME to a folder you own, then run the same install command again.",
                 data.display()
             )
+        );
+        assert!(!answer.line().contains("chown"));
+    }
+
+    #[cfg(unix)]
+    fn linked_answer(target: &Path) -> Answer {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let link_target = if target == Path::new("HOME") {
+            home_path.clone()
+        } else {
+            target.to_path_buf()
+        };
+        std::os::unix::fs::symlink(&link_target, home_path.join(".raft")).unwrap();
+        let cfg = config(&home_path);
+        // Nothing on the resolved side belongs to this user.
+        let owner = |_: &Path| Some(0);
+        let look = accounts(&owner, &names);
+        not_writable_for(&denied_at(&cfg.state_home), Some(&cfg), &look)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_root_home_or_outside_never_gets_a_chown() {
+        let outside = tempfile::tempdir().unwrap();
+        for target in [Path::new("/"), Path::new("HOME"), outside.path()] {
+            let answer = linked_answer(target);
+            assert!(
+                !answer.line().contains("chown"),
+                "{target:?}: {}",
+                answer.line()
+            );
+            assert!(
+                answer.next_step.contains("is a link to")
+                    && answer.next_step.contains("which belongs to root")
+                    && answer
+                        .next_step
+                        .contains("set RAFT_HOME to a folder you own"),
+                "{target:?}: {}",
+                answer.next_step
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_folder_inside_home_gets_the_chown() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let data = home_path.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::os::unix::fs::symlink(&data, home_path.join(".raft")).unwrap();
+        let cfg = config(&home_path);
+        let foreign = data.clone();
+        let owner = move |p: &Path| Some(if p == foreign { 0 } else { 1000 });
+        let look = accounts(&owner, &names);
+        let answer = not_writable_for(&denied_at(&cfg.state_home), Some(&cfg), &look);
+        assert_eq!(
+            answer.next_step,
+            "~/.raft is a link to ~/data. Fix the owner of that folder, then run the same install command again: sudo chown -R u ~/data"
         );
     }
 
