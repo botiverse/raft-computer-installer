@@ -496,6 +496,7 @@ pub fn not_writable_for(blocked: &Blocked, cfg: Option<&Config>, accounts: &Acco
 
 /// `path` lies below `home` (not home itself, an ancestor of it, or outside
 /// it), comparing against the home as given and as resolved.
+#[cfg(unix)]
 fn strictly_inside(path: &Path, home: &Path) -> bool {
     let resolved = std::fs::canonicalize(home).ok();
     std::iter::once(home)
@@ -803,6 +804,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn denied_at(path: &Path) -> Blocked {
         Blocked {
             path: path.to_path_buf(),
