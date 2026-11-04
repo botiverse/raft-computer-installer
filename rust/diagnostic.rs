@@ -21,14 +21,12 @@ pub fn safe_error(error: &Error) -> String {
     computer::diagnostic_stderr(error.to_string().as_bytes()).0
 }
 
-/// Preserve a last-resort launcher failure when configuration is usable. A
-/// configuration error may make the state root unknowable; that case remains
-/// fail-closed instead of guessing another user's or profile's directory.
-pub fn preserve_top_level_failure(error: &Error) {
-    let Ok(cfg) = Config::load() else {
-        return;
-    };
-    let _ = write_cli_diagnostic(&cfg, error);
+/// Preserve a last-resort launcher failure when configuration is usable (the
+/// caller loads it). A configuration error may make the state root
+/// unknowable; that case remains fail-closed instead of guessing another
+/// user's or profile's directory. Returns whether the record was kept.
+pub fn preserve_top_level_failure(cfg: &Config, error: &Error) -> bool {
+    write_cli_diagnostic(cfg, error).is_ok()
 }
 
 fn write_cli_diagnostic(cfg: &Config, error: &Error) -> Result<()> {

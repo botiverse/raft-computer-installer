@@ -18,8 +18,11 @@ pub fn failure_line() -> &'static str {
     "The installation could not finish. Run the same install command again."
 }
 
-pub fn preserve_top_level_failure(error: &Error) {
-    diagnostic::preserve_top_level_failure(error);
+/// Report an error that reached main(): the cause, one runnable next step,
+/// and with `--json` one reply object on stdout. Returns the exit code.
+pub fn report_top_level_failure(error: &Error) -> u8 {
+    let json = env::args().skip(1).any(|arg| arg == "--json");
+    crate::failure::report(error, json)
 }
 
 const HELP: &str = "Raft Computer installation commands
@@ -290,6 +293,21 @@ pub async fn run() -> Result<u8> {
                 return Ok(reply.exit_code);
             }
         }
+    }
+    // Every command writes under the state home first (the supervisor's
+    // scratch, receipts). A directory this user cannot write (for example a
+    // ~/.raft created by root) fails identically on every run: say which one
+    // and how to fix it before anything is downloaded or stopped. Only
+    // metadata is read; nothing is created (#proj-raft-computer:#44).
+    let installs = ["install", "upgrade", "repair"].contains(&args.request.command.as_str());
+    if let Some(blocked) = crate::failure::blocked(&cfg, installs) {
+        let answer = crate::failure::not_writable(&blocked, Some(&cfg));
+        let reply = answer.reply(&args.request.id);
+        eprintln!("{}", answer.line());
+        if args.json {
+            println!("{}", serde_json::to_string(&reply)?);
+        }
+        return Ok(reply.exit_code);
     }
     // Started inside the systemd unit that runs the service (Computer up to
     // 1.0.47 launches it there): continue from a scope of its own, so stopping

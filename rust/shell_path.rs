@@ -154,8 +154,7 @@ fn steps(lines: &[&str]) -> Vec<String> {
 }
 
 /// `~/…` for a path under the user's home, as people type it.
-#[cfg(unix)]
-fn display_under_home(path: &std::path::Path, home: &std::path::Path) -> String {
+pub(crate) fn display_under_home(path: &std::path::Path, home: &std::path::Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
@@ -165,7 +164,7 @@ fn display_under_home(path: &std::path::Path, home: &std::path::Path) -> String 
 /// A shell word that pastes safely: plain paths stay as they are; anything
 /// else is single-quoted (a leading `~/` stays outside so it still expands).
 #[cfg(unix)]
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     let plain = |s: &str| {
         s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+~".contains(c))

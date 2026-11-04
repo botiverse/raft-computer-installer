@@ -6,6 +6,7 @@ pub mod cli;
 pub mod computer;
 pub mod config;
 mod diagnostic;
+pub mod failure;
 pub mod host;
 pub mod host_supervisor;
 pub mod launch_policy;
