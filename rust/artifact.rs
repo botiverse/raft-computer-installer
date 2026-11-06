@@ -144,6 +144,23 @@ async fn download(
     .await
 }
 
+/// The bytes a release transfers: its gzip representation when it has one.
+fn transfer_size(release: &Release) -> u64 {
+    release.gzip.as_ref().map_or(release.size, |gzip| gzip.size)
+}
+
+/// The installer's downloader for one release: the installer's roots and
+/// proxy settings (`source::downloader`) and at least `MINIMUM_ATTEMPT_MS`
+/// for its transfer. K's runner downloads an upgrade candidate with this, not
+/// with K's own `Downloader::new()`.
+pub fn release_downloader(release: &Release) -> Result<Downloader> {
+    let downloader = crate::source::downloader()?;
+    Ok(Downloader {
+        policy: with_minimum_attempt(downloader.policy, transfer_size(release)),
+        ..downloader
+    })
+}
+
 async fn download_with_retries(
     downloader: &Downloader,
     release: &Release,
@@ -151,10 +168,9 @@ async fn download_with_retries(
     label: &'static str,
     delays: &[Duration],
 ) -> Result<Vec<u8>> {
-    let size = release.gzip.as_ref().map_or(release.size, |gzip| gzip.size);
     let downloader = Downloader {
         client: downloader.client.clone(),
-        policy: with_minimum_attempt(downloader.policy, size),
+        policy: with_minimum_attempt(downloader.policy, transfer_size(release)),
     };
     let mut delays = delays.iter();
     loop {
