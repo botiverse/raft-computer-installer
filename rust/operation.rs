@@ -334,7 +334,7 @@ async fn settle_k(cfg: &Config) -> Result<()> {
     if let OperationRead::Observed { operation } = FileStore::new(&cfg.k_state).read_operation()
         && operation.outcome.is_none()
     {
-        runner::create(cfg.clone(), Arc::new(OfflineSource), false)?
+        runner::create(cfg.clone(), Arc::new(OfflineSource), false, None)?
             .recover(None)
             .await?;
     }
@@ -554,6 +554,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         cfg.clone(),
         Arc::new(FrozenSource(plan.manifest.clone())),
         plan.request.allow_downgrade,
+        Some(&plan.manifest.release),
     )?;
     let response = if recovery {
         match store.read_operation() {
