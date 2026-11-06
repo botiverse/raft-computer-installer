@@ -7,7 +7,7 @@ use crate::{
     version,
 };
 use k_carrier::{
-    artifact::{Downloader, Progress, Release, sha256},
+    artifact::{Downloader, Progress, Release, TransferPolicy, sha256},
     error::invalid,
     storage::{ensure_dir, write_durable, write_json},
 };
@@ -16,6 +16,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 const PROGRESS_BAR_WIDTH: u64 = 30;
@@ -68,16 +69,110 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     ))
 }
 
+/// Pauses before the second and the third attempt of one download. Each
+/// attempt resumes from the partial file the previous one left behind.
+const DOWNLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
+/// The least overall time any one attempt gets. K budgets a transfer at its
+/// size over 64 KiB/s plus the 30 s first-response allowance, so a small file
+/// on a slow link (#proj-raft-computer:#49: the support file over a slow
+/// Windows connection) failed after well under a minute, every time.
+const MINIMUM_ATTEMPT_MS: u64 = 120_000;
+
+/// K's policy exposes no minimum overall budget, so the floor is reached by
+/// lowering the required rate for a small transfer until its size takes at
+/// least the floor minus the first-response allowance. The first-response and
+/// idle timeouts stay as K sets them: a stall there is retried instead. Large
+/// transfers, whose own budget exceeds the floor, keep K's policy unchanged.
+fn with_minimum_attempt(policy: TransferPolicy, size: u64) -> TransferPolicy {
+    let body_ms = MINIMUM_ATTEMPT_MS.saturating_sub(policy.response_ms);
+    if body_ms == 0 {
+        return policy;
+    }
+    // Rounded down, so size / rate is never shorter than body_ms.
+    let rate = u64::try_from(u128::from(size) * 1000 / u128::from(body_ms))
+        .unwrap_or(u64::MAX)
+        .max(1);
+    TransferPolicy {
+        minimum_bytes_per_second: policy.minimum_bytes_per_second.min(rate),
+        maximum_overall_ms: policy.maximum_overall_ms.max(MINIMUM_ATTEMPT_MS),
+        ..policy
+    }
+}
+
+/// A failure the same request may not repeat: a timeout, a dropped or refused
+/// connection, or a server error (5xx). A refusal (4xx), bytes that do not
+/// match the release, a rejected certificate, a redirect loop and local I/O
+/// errors are final.
+fn transient(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::Http(error) => {
+            !crate::source::certificate_rejected(error)
+                && (error.is_timeout()
+                    || error.is_connect()
+                    || error.is_request()
+                    || error.is_body()
+                    || error.is_decode())
+        }
+        crate::Error::Invalid(message) => {
+            message
+                .strip_prefix("DOWNLOAD_FAILED: ")
+                .is_some_and(|detail| {
+                    detail.ends_with(" timeout")
+                        || detail
+                            .strip_prefix("HTTP ")
+                            .is_some_and(|status| status.starts_with('5'))
+                })
+        }
+        _ => false,
+    }
+}
+
 async fn download(
     downloader: &Downloader,
     release: &Release,
     resume_dir: &Path,
     label: &'static str,
 ) -> Result<Vec<u8>> {
-    downloader
-        .download(release, Some(resume_dir), Some(download_progress(label)))
-        .await
-        .map_err(|error| download_failure(label, release, error))
+    download_with_retries(
+        downloader,
+        release,
+        resume_dir,
+        label,
+        &DOWNLOAD_RETRY_DELAYS,
+    )
+    .await
+}
+
+async fn download_with_retries(
+    downloader: &Downloader,
+    release: &Release,
+    resume_dir: &Path,
+    label: &'static str,
+    delays: &[Duration],
+) -> Result<Vec<u8>> {
+    let size = release.gzip.as_ref().map_or(release.size, |gzip| gzip.size);
+    let downloader = Downloader {
+        client: downloader.client.clone(),
+        policy: with_minimum_attempt(downloader.policy, size),
+    };
+    let mut delays = delays.iter();
+    loop {
+        let error = match downloader
+            .download(release, Some(resume_dir), Some(download_progress(label)))
+            .await
+        {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => error,
+        };
+        match delays.next() {
+            Some(delay) if transient(&error) => {
+                eprintln!("The {label} download was interrupted; trying again.");
+                tokio::time::sleep(*delay).await;
+            }
+            _ => return Err(download_failure(label, release, error)),
+        }
+    }
 }
 
 /// One redrawn terminal line: `Downloading Raft Computer [#######·····]  42%`.
@@ -616,5 +711,288 @@ mod progress_tests {
             "Downloading Raft Computer [##############################] 100%"
         );
         assert_eq!(progress_line("x", 250), progress_line("x", 100));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    /// What the test server does with one connection.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Read the request and never answer.
+        Stall,
+        /// Answer 200 with the full length but send only the first `n` bytes, then close.
+        Drop(usize),
+        /// Answer with this status and no body.
+        Status(u16),
+        /// Answer the request in full, honouring a Range header.
+        Serve,
+    }
+
+    struct Server {
+        url: String,
+        requests: mpsc::Receiver<String>,
+    }
+
+    impl Server {
+        fn start(body: Vec<u8>, script: Vec<Reply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/file", listener.local_addr().unwrap());
+            let (sender, requests) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for reply in script {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let request = read_request(&mut stream);
+                    let _ = sender.send(request.clone());
+                    match reply {
+                        Reply::Stall => held.push(stream),
+                        Reply::Drop(n) => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(&body[..n]);
+                            let _ = stream.flush();
+                        }
+                        Reply::Status(status) => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
+                        Reply::Serve => serve(&mut stream, &request, &body),
+                    }
+                }
+            });
+            Self { url, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.try_iter().collect()
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+            request.push(byte[0]);
+        }
+        String::from_utf8_lossy(&request).to_ascii_lowercase()
+    }
+
+    fn serve(stream: &mut TcpStream, request: &str, body: &[u8]) {
+        let offset = request
+            .lines()
+            .find_map(|line| line.strip_prefix("range: bytes="))
+            .and_then(|range| range.trim().strip_suffix('-'))
+            .and_then(|first| first.parse::<usize>().ok());
+        let _ = match offset {
+            Some(first) => write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{}/{}\r\nConnection: close\r\n\r\n",
+                body.len() - first,
+                body.len() - 1,
+                body.len()
+            )
+            .and_then(|()| stream.write_all(&body[first..])),
+            None => write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .and_then(|()| stream.write_all(body)),
+        };
+        let _ = stream.flush();
+    }
+
+    fn body() -> Vec<u8> {
+        (0..64 * 1024).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn release(url: &str, body: &[u8]) -> Release {
+        Release {
+            version: "1.0.0".into(),
+            url: url.into(),
+            sha256: sha256(body),
+            size: body.len() as u64,
+            gzip: None,
+        }
+    }
+
+    /// A client that ignores any proxy in the test environment, and a short
+    /// first-response allowance so a stall costs the test little time.
+    fn downloader() -> Downloader {
+        Downloader {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            policy: TransferPolicy {
+                response_ms: 500,
+                idle_ms: 500,
+                ..TransferPolicy::default()
+            },
+        }
+    }
+
+    const NO_WAIT: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];
+
+    async fn fetch(server: &Server, body: &[u8], dir: &Path) -> Result<Vec<u8>> {
+        download_with_retries(
+            &downloader(),
+            &release(&server.url, body),
+            dir,
+            "Raft Computer support file",
+            &NO_WAIT,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_retried_from_the_partial_file() {
+        let body = body();
+        let server = Server::start(body.clone(), vec![Reply::Drop(20_000), Reply::Serve]);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(!requests[0].contains("range:"), "{}", requests[0]);
+        assert!(
+            requests[1].contains("range: bytes=20000-"),
+            "the retry resumes: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_and_a_server_error_are_retried() {
+        let body = body();
+        let server = Server::start(
+            body.clone(),
+            vec![Reply::Stall, Reply::Status(503), Reply::Serve],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        assert_eq!(server.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn three_transient_failures_fail_the_download() {
+        let body = body();
+        let server = Server::start(
+            body.clone(),
+            vec![
+                Reply::Status(502),
+                Reply::Status(503),
+                Reply::Status(504),
+                Reply::Serve,
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        assert!(is_download_failure(&error), "{error}");
+        assert!(error.to_string().contains("HTTP 504"), "{error}");
+        assert_eq!(server.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_not_retried() {
+        let body = body();
+        let server = Server::start(body.clone(), vec![Reply::Status(404), Reply::Serve]);
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 404"), "{error}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bytes_that_do_not_match_the_release_are_not_retried() {
+        let body = body();
+        let mut other = body.clone();
+        other[0] ^= 1;
+        let server = Server::start(other, vec![Reply::Serve, Reply::Serve]);
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the published release"),
+            "{error}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn transient_failures_are_told_from_final_ones() {
+        for message in [
+            "DOWNLOAD_FAILED: response timeout",
+            "DOWNLOAD_FAILED: idle timeout",
+            "DOWNLOAD_FAILED: overall timeout",
+            "DOWNLOAD_FAILED: HTTP 500 Internal Server Error",
+            "DOWNLOAD_FAILED: HTTP 503 Service Unavailable",
+        ] {
+            assert!(transient(&invalid(message)), "{message}");
+        }
+        for message in [
+            "DOWNLOAD_FAILED: HTTP 404 Not Found",
+            "DOWNLOAD_FAILED: HTTP 403 Forbidden",
+            "DOWNLOAD_FAILED: mismatched Content-Range",
+            "SHA256_MISMATCH",
+            "SIZE_MISMATCH: response exceeds declared size",
+            "MANIFEST_INVALID",
+        ] {
+            assert!(!transient(&invalid(message)), "{message}");
+        }
+        assert!(!transient(&crate::Error::Io(std::io::Error::other("disk"))));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_transient() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(transient(&crate::Error::Http(error)));
+    }
+
+    #[test]
+    fn a_small_transfer_gets_at_least_two_minutes() {
+        let policy = TransferPolicy::default();
+        for size in [100_u64, 64 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
+            let budgets = with_minimum_attempt(policy, size).budgets(size).unwrap();
+            assert!(
+                budgets.overall_ms >= MINIMUM_ATTEMPT_MS,
+                "{size}: {budgets:?}"
+            );
+            assert_eq!(budgets.response_ms, policy.response_ms);
+            assert_eq!(budgets.idle_ms, policy.idle_ms);
+        }
+        // K's own budget for this size is already wider: unchanged.
+        let large = 100 * 1024 * 1024;
+        assert_eq!(
+            with_minimum_attempt(policy, large)
+                .budgets(large)
+                .unwrap()
+                .overall_ms,
+            policy.budgets(large).unwrap().overall_ms
+        );
     }
 }
