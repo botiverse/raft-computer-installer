@@ -625,7 +625,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         ));
     }
     let Some(outcome) = operation.outcome else {
-        return Err(Error::Uncertain("upgrade still requires recovery".into()));
+        return Err(Error::Uncertain(STILL_REQUIRES_RECOVERY.into()));
     };
     let outcome = match outcome {
         k_carrier::state::Outcome::Promoted => Outcome::Promoted,
@@ -982,6 +982,31 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     Err(invalid("unexpected operation phase"))
 }
 
+/// Raised when K returns the operation still open. It names no cause of its
+/// own: K's error, saved as the diagnostic just before, does.
+const STILL_REQUIRES_RECOVERY: &str = "upgrade still requires recovery";
+
+/// Records a failed run's error as the receipt diagnostic. The generic
+/// "still requires recovery" never replaces the more specific cause already
+/// recorded (K's error from this run, or the initiating failure of an earlier
+/// one); it is prefixed to it once instead, so every unresolved upgrade does
+/// not report the same text.
+fn record_failure_diagnostic(detail: &mut BTreeMap<String, String>, error: &Error) {
+    let text = error.to_string();
+    if error.is_uncertain()
+        && text == STILL_REQUIRES_RECOVERY
+        && let Some(cause) = detail.get("diagnostic")
+        && !cause.trim().is_empty()
+    {
+        if !cause.starts_with(STILL_REQUIRES_RECOVERY) {
+            let combined = format!("{STILL_REQUIRES_RECOVERY}: {cause}");
+            detail.insert("diagnostic".into(), combined);
+        }
+        return;
+    }
+    detail.insert("diagnostic".into(), text);
+}
+
 async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if let Some(old) = report::read(cfg, &plan.request.id)?
         && old.outcome != Outcome::Unresolved
@@ -1006,7 +1031,7 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
     match result {
         Ok(reply) => Ok(reply),
         Err(error) => {
-            plan.detail.insert("diagnostic".into(), error.to_string());
+            record_failure_diagnostic(&mut plan.detail, &error);
             // A run that disabled the supervisor and failed before restoring
             // it: restore now, best effort (only when nothing runs; a running
             // service was started through the supervisor, which enabled it).
@@ -1502,6 +1527,69 @@ mod recovery_hint_tests {
             reason,
             "Raft Computer's current status couldn't be confirmed."
         );
+    }
+}
+
+#[cfg(test)]
+mod failure_diagnostic_tests {
+    use super::*;
+
+    fn diagnostic(detail: &BTreeMap<String, String>) -> Option<&str> {
+        detail.get("diagnostic").map(String::as_str)
+    }
+
+    /// #proj-raft-computer:#49: an upgrade K left open used to report only
+    /// "upgrade still requires recovery", losing K's error saved just before.
+    #[test]
+    fn an_open_operation_keeps_the_cause_k_reported() {
+        let mut detail = BTreeMap::new();
+        detail.insert(
+            "diagnostic".into(),
+            "artifact download timed out after 60s".into(),
+        );
+        let error = Error::Uncertain(STILL_REQUIRES_RECOVERY.into());
+        record_failure_diagnostic(&mut detail, &error);
+        assert_eq!(
+            diagnostic(&detail),
+            Some("upgrade still requires recovery: artifact download timed out after 60s")
+        );
+        // A second unresolved run does not stack the prefix.
+        record_failure_diagnostic(&mut detail, &error);
+        assert_eq!(
+            diagnostic(&detail),
+            Some("upgrade still requires recovery: artifact download timed out after 60s")
+        );
+    }
+
+    #[test]
+    fn an_open_operation_without_an_earlier_cause_says_so() {
+        let mut detail = BTreeMap::new();
+        record_failure_diagnostic(
+            &mut detail,
+            &Error::Uncertain(STILL_REQUIRES_RECOVERY.into()),
+        );
+        assert_eq!(diagnostic(&detail), Some(STILL_REQUIRES_RECOVERY));
+        let mut blank = BTreeMap::from([("diagnostic".to_owned(), " ".to_owned())]);
+        record_failure_diagnostic(
+            &mut blank,
+            &Error::Uncertain(STILL_REQUIRES_RECOVERY.into()),
+        );
+        assert_eq!(diagnostic(&blank), Some(STILL_REQUIRES_RECOVERY));
+    }
+
+    #[test]
+    fn any_other_failure_names_itself() {
+        let mut detail = BTreeMap::from([("diagnostic".to_owned(), "older cause".to_owned())]);
+        record_failure_diagnostic(
+            &mut detail,
+            &Error::Uncertain("previous product process is still running".into()),
+        );
+        assert_eq!(
+            diagnostic(&detail),
+            Some("previous product process is still running")
+        );
+        record_failure_diagnostic(&mut detail, &invalid("disk full"));
+        assert_eq!(diagnostic(&detail), Some("disk full"));
     }
 }
 
