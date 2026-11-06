@@ -118,6 +118,64 @@ pub fn is_cli_entry<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> bool {
         .is_some_and(|argument| argument.as_ref() == CLI_ENTRY)
 }
 
+/// `later` was created strictly after `earlier`; `None` when their creation
+/// identities cannot be compared (unparsable, or another Linux boot).
+pub fn created_after(later: &Identity, earlier: &Identity) -> Option<bool> {
+    let (later_scope, later_at) = creation_instant(&later.created)?;
+    let (earlier_scope, earlier_at) = creation_instant(&earlier.created)?;
+    (later_scope == earlier_scope).then_some(later_at > earlier_at)
+}
+
+#[cfg(windows)]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    windows_creation_instant(created)
+}
+#[cfg(target_os = "linux")]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    linux_creation_instant(created)
+}
+#[cfg(target_os = "macos")]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    macos_creation_instant(created)
+}
+
+/// Windows: the creation FILETIME as `high:low`.
+#[cfg(any(windows, test))]
+fn windows_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (high, low) = created.split_once(':')?;
+    let ticks =
+        (u128::from(high.parse::<u32>().ok()?) << 32) | u128::from(low.parse::<u32>().ok()?);
+    Some(("", ticks))
+}
+
+/// Linux: `boot-id:start-ticks`; ticks compare only within one boot.
+#[cfg(any(target_os = "linux", test))]
+fn linux_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (boot, ticks) = created.rsplit_once(':')?;
+    Some((boot, ticks.parse().ok()?))
+}
+
+/// macOS: `seconds:microseconds` of the process start.
+#[cfg(any(target_os = "macos", test))]
+fn macos_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (seconds, micros) = created.split_once(':')?;
+    let micros = micros.parse::<u128>().ok()?;
+    (micros < 1_000_000).then_some(())?;
+    Some(("", seconds.parse::<u128>().ok()? * 1_000_000 + micros))
+}
+
+/// A creation identity at `instant` in this platform's format, for tests.
+#[cfg(test)]
+pub(crate) fn test_creation(instant: u64) -> String {
+    if cfg!(windows) {
+        format!("{}:{}", instant >> 32, instant & 0xffff_ffff)
+    } else if cfg!(target_os = "macos") {
+        format!("{instant}:0")
+    } else {
+        format!("test-boot:{instant}")
+    }
+}
+
 /// The observed instance runs the product binary's CLI entry. Arguments that
 /// cannot be read (access denied, exited, any OS error) leave it a product
 /// process, as it was before this check existed.
@@ -1747,5 +1805,68 @@ mod cli_entry_tests {
         let other = spawn(&["--exact", FIXTURE, "--ignored", CLI_ENTRY]);
         assert!(classified(&cli), "`<binary> __cli ...` is a CLI invocation");
         assert!(!classified(&other), "a later __cli is not the entry");
+    }
+}
+
+#[cfg(test)]
+mod creation_order_tests {
+    use super::*;
+
+    fn at(created: &str) -> Identity {
+        Identity {
+            pid: 1,
+            executable: PathBuf::from("/x"),
+            created: created.into(),
+        }
+    }
+
+    #[test]
+    fn each_platform_format_orders_creation() {
+        assert_eq!(windows_creation_instant("1:0"), Some(("", 1 << 32)));
+        assert!(
+            windows_creation_instant("0:4294967295").unwrap().1
+                < windows_creation_instant("1:0").unwrap().1
+        );
+        assert_eq!(windows_creation_instant("x:1"), None);
+        let boot = "6d3a1c1e-0000-4000-8000-000000000000";
+        assert_eq!(
+            linux_creation_instant(&format!("{boot}:42")),
+            Some((boot, 42))
+        );
+        assert_eq!(linux_creation_instant("no-ticks"), None);
+        assert_eq!(macos_creation_instant("2:5"), Some(("", 2_000_005)));
+        assert!(
+            macos_creation_instant("1:999999").unwrap().1
+                < macos_creation_instant("2:0").unwrap().1
+        );
+        assert_eq!(macos_creation_instant("1:1000000"), None);
+    }
+
+    #[test]
+    fn created_after_compares_this_platforms_identities() {
+        let (old, new) = (at(&test_creation(10)), at(&test_creation(20)));
+        assert_eq!(created_after(&new, &old), Some(true));
+        assert_eq!(created_after(&old, &new), Some(false));
+        assert_eq!(created_after(&old, &old), Some(false));
+        assert_eq!(created_after(&at("garbage"), &old), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_boot_is_not_ordered() {
+        assert_eq!(created_after(&at("boot-b:1"), &at("boot-a:9")), None);
+    }
+
+    #[test]
+    fn a_child_is_never_created_before_its_live_parent() {
+        let own = observe(std::process::id()).unwrap().unwrap();
+        let Some(parent) = observe(native::parent().unwrap()).unwrap() else {
+            return; // a parent of another user or a protected one
+        };
+        assert_ne!(created_after(&parent, &own), Some(true));
+        assert!(
+            created_after(&own, &own).is_some(),
+            "own identity is ordered"
+        );
     }
 }

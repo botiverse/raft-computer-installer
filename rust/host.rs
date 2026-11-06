@@ -180,22 +180,54 @@ pub fn product_ancestor(
     if products.is_empty() {
         return Ok(None);
     }
+    ancestor_among(&products, caller, process::parent_of, process::observe)
+}
+
+/// The walk behind `product_ancestor`, over injectable process queries.
+///
+/// Windows records a parent PID once, at creation, and never updates it: when
+/// that parent exits, its PID can be reused by any later process, the
+/// Computer's service included. A "parent" created after its child is such a
+/// reuse, not the child's parent, so the real ancestry ends there. This made a
+/// CI upgrade run as an ordinary child of the test harness be refused as
+/// started from inside the Computer (#proj-raft-computer:#49). Unix reparents
+/// orphans to an older process, so the rule never cuts a real ancestry there.
+/// When either creation time is unknown the link is followed, as before.
+fn ancestor_among<P, O>(
+    products: &[process::Identity],
+    caller: &process::Identity,
+    mut parent_of: P,
+    mut observe: O,
+) -> Result<Option<process::Identity>>
+where
+    P: FnMut(u32) -> Result<Option<u32>>,
+    O: FnMut(u32) -> Result<Option<process::Identity>>,
+{
+    let mut child = Some(caller.clone());
     let mut pid = caller.pid;
     let mut seen = vec![pid];
     for _ in 0..ANCESTOR_LIMIT {
-        let Some(parent) = process::parent_of(pid)? else {
+        let Some(parent) = parent_of(pid)? else {
             return Ok(None);
         };
         if seen.contains(&parent) {
             return Ok(None);
         }
         seen.push(parent);
+        // Only for the creation order: an unobservable parent (another user,
+        // a protected process) is walked through as before.
+        let observed = observe(parent).ok().flatten();
+        if let (Some(parent), Some(child)) = (&observed, &child)
+            && process::created_after(parent, child) == Some(true)
+        {
+            return Ok(None);
+        }
         if let Some(product) = products.iter().find(|product| product.pid == parent)
-            && process::observe(parent)?
-                .is_some_and(|identity| process::same_instance(&identity, product))
+            && observe(parent)?.is_some_and(|identity| process::same_instance(&identity, product))
         {
             return Ok(Some(product.clone()));
         }
+        child = observed;
         pid = parent;
     }
     Ok(None)
@@ -1121,5 +1153,78 @@ mod legacy_layout_tests {
                 .iter()
                 .any(|p| p.pid == child.0.id())
         );
+    }
+}
+
+#[cfg(test)]
+mod ancestor_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A process created at `instant`, in this platform's creation format.
+    fn process(pid: u32, instant: u64) -> process::Identity {
+        process::Identity {
+            pid,
+            executable: PathBuf::from(format!("/p/{pid}")),
+            created: process::test_creation(instant),
+        }
+    }
+
+    /// `tree` maps a pid to (parent pid, creation instant).
+    fn walk(
+        products: &[process::Identity],
+        caller: &process::Identity,
+        tree: &BTreeMap<u32, (u32, Option<u64>)>,
+    ) -> Option<u32> {
+        ancestor_among(
+            products,
+            caller,
+            |pid| Ok(tree.get(&pid).map(|(parent, _)| *parent)),
+            |pid| {
+                Ok(products
+                    .iter()
+                    .find(|product| product.pid == pid)
+                    .cloned()
+                    .or_else(|| {
+                        tree.get(&pid)
+                            .and_then(|(_, created)| created.map(|at| process(pid, at)))
+                    }))
+            },
+        )
+        .unwrap()
+        .map(|product| product.pid)
+    }
+
+    #[test]
+    fn a_computer_above_the_caller_is_found() {
+        let product = process(708, 100);
+        let caller = process(50, 300);
+        // caller 50 -> shell 40 -> computer 708
+        let tree = BTreeMap::from([(50, (40, Some(300))), (40, (708, Some(200)))]);
+        assert_eq!(walk(&[product], &caller, &tree), Some(708));
+    }
+
+    // #proj-raft-computer:#49 (Windows CI): the harness's ancestor 30 was
+    // started by a process that had long exited; the Computer started later
+    // was given that PID. It is not 30's parent.
+    #[test]
+    fn a_reused_parent_pid_newer_than_its_child_is_not_an_ancestor() {
+        let product = process(708, 500);
+        let caller = process(50, 900);
+        let tree = BTreeMap::from([
+            (50, (40, Some(900))),
+            (40, (30, Some(800))),
+            (30, (708, Some(10))),
+        ]);
+        assert_eq!(walk(&[product], &caller, &tree), None);
+    }
+
+    #[test]
+    fn an_unknown_creation_time_keeps_the_link() {
+        let product = process(708, 500);
+        let caller = process(50, 900);
+        // 30 cannot be observed (another user, protected): its link is kept.
+        let tree = BTreeMap::from([(50, (30, Some(900))), (30, (708, None))]);
+        assert_eq!(walk(&[product], &caller, &tree), Some(708));
     }
 }
