@@ -140,6 +140,12 @@ fn of_this_state_home(cfg: &Config, identity: &process::Identity) -> Result<bool
         .is_none_or(|home| process::same_path(&home, &cfg.state_home)))
 }
 
+/// This installation's running product: every OS-identified instance of a
+/// product executable, except the waiting caller, another state home's
+/// Computer, and a CLI invocation (`<binary> __cli`, the `raft` command an
+/// agent runs). A CLI is short-lived and not the service: counting it could
+/// fail an upgrade as "product service restarted while stopping" or "product
+/// became active before publication" whenever an agent ran a command.
 pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity>> {
     let caller = cfg.waiting_caller.as_ref();
     let mut processes = Vec::new();
@@ -148,6 +154,7 @@ pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity
             if !caller.is_some_and(|c| process::same_instance(c, &identity))
                 && !processes.contains(&identity)
                 && of_this_state_home(cfg, &identity)?
+                && !process::is_cli_invocation(&identity)
             {
                 processes.push(identity);
             }
@@ -1045,6 +1052,60 @@ mod legacy_layout_tests {
         assert!(found(&cfg, default.0.id()));
         cfg.state_home = root.path().join("state");
         assert!(!found(&cfg, default.0.id()));
+    }
+
+    /// Runs a copy of /bin/sh as the installed binary with `argument` first:
+    /// sh reads that file from `directory`, a script that sleeps.
+    fn spawn_with_first_argument(
+        cfg: &Config,
+        directory: &std::path::Path,
+        argument: &str,
+    ) -> Killed {
+        if !cfg.binary.exists() {
+            fs::create_dir_all(&cfg.install_dir).unwrap();
+            fs::copy("/bin/sh", &cfg.binary).unwrap();
+        }
+        fs::write(directory.join(argument), "sleep 30\n:\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        Killed(loop {
+            let mut command = Command::new(&cfg.binary);
+            command
+                .arg(argument)
+                .current_dir(directory)
+                .env("RAFT_HOME", &cfg.state_home);
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("binary fixture did not start: {error}"),
+            }
+        })
+    }
+
+    // #proj-raft-computer:#49: an agent's `raft` command runs the installed
+    // binary as `<binary> __cli`; it is not the service to stop or wait for.
+    #[test]
+    fn a_cli_invocation_of_the_binary_is_not_the_running_product() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let scripts = root.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let service = spawn_with_first_argument(&cfg, &scripts, "service");
+        let cli = spawn_with_first_argument(&cfg, &scripts, process::CLI_ENTRY);
+        assert!(found(&cfg, service.0.id()), "the service is the product");
+        let identity = process::observe(cli.0.id()).unwrap().expect("cli observed");
+        assert!(process::is_cli_invocation(&identity));
+        assert!(
+            !installed_product_processes(&cfg)
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == cli.0.id()),
+            "a CLI invocation must not count as a running product",
+        );
     }
 
     #[test]
