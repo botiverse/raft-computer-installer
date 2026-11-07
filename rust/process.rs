@@ -1,5 +1,7 @@
 //! Process identity comes from the OS executable path and creation identity,
 //! never a name, command-line substring, or an unqualified persisted PID.
+//! Arguments only ever exclude an identified product process: the product
+//! binary's short-lived CLI entry (`__cli`) is not its service.
 use crate::{Error, Result};
 use k_carrier::error::invalid;
 use serde::{Deserialize, Serialize};
@@ -101,6 +103,176 @@ pub fn environment(identity: &Identity) -> Result<Option<Vec<(OsString, OsString
         return Ok(None);
     }
     Ok(Some(environment))
+}
+
+/// The first argument with which the product binary runs as a command-line
+/// client: the `raft` command agents run is `<binary> __cli ...`. Such a
+/// process is short-lived and is not the service, so it is never counted,
+/// stopped or waited for as a running product.
+pub const CLI_ENTRY: &str = "__cli";
+
+/// `argv` runs the CLI entry: `__cli` is the first argument after the
+/// executable. Only the exact argument counts, not a prefix or a later one.
+pub fn is_cli_entry<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> bool {
+    argv.get(1)
+        .is_some_and(|argument| argument.as_ref() == CLI_ENTRY)
+}
+
+/// `later` was created strictly after `earlier`; `None` when their creation
+/// identities cannot be compared (unparsable, or another Linux boot).
+pub fn created_after(later: &Identity, earlier: &Identity) -> Option<bool> {
+    let (later_scope, later_at) = creation_instant(&later.created)?;
+    let (earlier_scope, earlier_at) = creation_instant(&earlier.created)?;
+    (later_scope == earlier_scope).then_some(later_at > earlier_at)
+}
+
+#[cfg(windows)]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    windows_creation_instant(created)
+}
+#[cfg(target_os = "linux")]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    linux_creation_instant(created)
+}
+#[cfg(target_os = "macos")]
+fn creation_instant(created: &str) -> Option<(&str, u128)> {
+    macos_creation_instant(created)
+}
+
+/// Windows: the creation FILETIME as `high:low`.
+#[cfg(any(windows, test))]
+fn windows_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (high, low) = created.split_once(':')?;
+    let ticks =
+        (u128::from(high.parse::<u32>().ok()?) << 32) | u128::from(low.parse::<u32>().ok()?);
+    Some(("", ticks))
+}
+
+/// Linux: `boot-id:start-ticks`; ticks compare only within one boot.
+#[cfg(any(target_os = "linux", test))]
+fn linux_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (boot, ticks) = created.rsplit_once(':')?;
+    Some((boot, ticks.parse().ok()?))
+}
+
+/// macOS: `seconds:microseconds` of the process start.
+#[cfg(any(target_os = "macos", test))]
+fn macos_creation_instant(created: &str) -> Option<(&str, u128)> {
+    let (seconds, micros) = created.split_once(':')?;
+    let micros = micros.parse::<u128>().ok()?;
+    (micros < 1_000_000).then_some(())?;
+    Some(("", seconds.parse::<u128>().ok()? * 1_000_000 + micros))
+}
+
+/// A creation identity at `instant` in this platform's format, for tests.
+#[cfg(test)]
+pub(crate) fn test_creation(instant: u64) -> String {
+    if cfg!(windows) {
+        format!("{}:{}", instant >> 32, instant & 0xffff_ffff)
+    } else if cfg!(target_os = "macos") {
+        format!("{instant}:0")
+    } else {
+        format!("test-boot:{instant}")
+    }
+}
+
+/// The observed instance runs the product binary's CLI entry. Arguments that
+/// cannot be read (access denied, exited, any OS error) leave it a product
+/// process, as it was before this check existed.
+pub fn is_cli_invocation(identity: &Identity) -> bool {
+    let Ok(Some(argv)) = native::arguments(identity.pid) else {
+        return false;
+    };
+    // The PID may have been reused while reading; only the observed instance counts.
+    is_cli_entry(&argv)
+        && matches!(observe(identity.pid), Ok(Some(current)) if current == *identity)
+}
+
+/// `/proc/<pid>/cmdline`: each argument NUL-terminated.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn parse_cmdline(bytes: &[u8]) -> Vec<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .strip_suffix(&[0])
+        .unwrap_or(bytes)
+        .split(|b| *b == 0)
+        .map(|argument| std::ffi::OsStr::from_bytes(argument).to_owned())
+        .collect()
+}
+
+/// KERN_PROCARGS2 (macOS): argc, the exec path, NUL padding, argv, then the
+/// environment, each NUL-terminated. Returns argc and the entries from argv[0].
+#[cfg(any(target_os = "macos", test))]
+fn procargs_entries(buffer: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
+    let (count, rest) = buffer.split_first_chunk::<4>()?;
+    let argc = i32::from_ne_bytes(*count).max(0) as usize;
+    let mut entries = rest.split(|b| *b == 0);
+    // The exec path, then the padding NULs before argv[0].
+    entries.next()?;
+    Some((argc, entries.skip_while(|entry| entry.is_empty()).collect()))
+}
+
+/// A Windows command line split as the Microsoft C runtime splits it into
+/// argv: in the program name quotes only toggle quoting, with no escapes, and
+/// a blank outside quotes ends it; in later arguments 2n backslashes before a
+/// quote are n backslashes and toggle quoting, 2n+1 are n and a literal
+/// quote, and `""` inside quotes is a literal quote.
+#[cfg(any(windows, test))]
+fn split_windows_command_line(line: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut program = String::new();
+    let mut quoted = false;
+    while let Some(&c) = chars.peek() {
+        if !quoted && (c == ' ' || c == '\t') {
+            break;
+        }
+        chars.next();
+        if c == '"' {
+            quoted = !quoted;
+        } else {
+            program.push(c);
+        }
+    }
+    arguments.push(program);
+    loop {
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        if chars.peek().is_none() {
+            return arguments;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    let mut backslashes = 1;
+                    while chars.next_if_eq(&'\\').is_some() {
+                        backslashes += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                        if backslashes % 2 == 1 {
+                            argument.push('"');
+                            chars.next();
+                        }
+                    } else {
+                        argument.extend(std::iter::repeat_n('\\', backslashes));
+                    }
+                }
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    argument.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ' ' | '\t' if !quoted => break,
+                c => argument.push(c),
+            }
+        }
+        arguments.push(argument);
+    }
 }
 
 /// `NAME=value` entries separated by NUL, as in `/proc/<pid>/environ`; stops
@@ -648,6 +820,14 @@ mod native {
         }
     }
 
+    pub fn arguments(pid: u32) -> Result<Option<Vec<OsString>>> {
+        match fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => Ok(Some(parse_cmdline(&bytes))),
+            Err(e) if exited(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn pids() -> Result<Vec<u32>> {
         let mut pids = Vec::new();
         for entry in fs::read_dir("/proc")? {
@@ -803,7 +983,8 @@ mod native {
         }))
     }
 
-    pub fn environment(pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
+    /// The KERN_PROCARGS2 buffer: argv, then the environment.
+    fn procargs(pid: u32) -> Result<Option<Vec<u8>>> {
         if pid > i32::MAX as u32 {
             return Ok(None);
         }
@@ -824,8 +1005,6 @@ mod native {
         {
             return Err(std::io::Error::last_os_error().into());
         }
-        // KERN_PROCARGS2: argc, the exec path, NUL padding, argv, then the
-        // environment, each NUL-terminated.
         let mut buffer = vec![0u8; argmax as usize];
         let mut size = buffer.len();
         let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
@@ -850,17 +1029,33 @@ mod native {
             return Err(error.into());
         }
         buffer.truncate(size);
-        let Some((count, rest)) = buffer.split_first_chunk::<4>() else {
+        Ok(Some(buffer))
+    }
+
+    pub fn environment(pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
+        let Some(buffer) = procargs(pid)? else {
             return Ok(None);
         };
-        let argc = i32::from_ne_bytes(*count).max(0) as usize;
-        let mut entries = rest.split(|b| *b == 0);
-        // The exec path, then the padding NULs before argv[0].
-        if entries.next().is_none() {
+        let Some((argc, entries)) = procargs_entries(&buffer) else {
             return Ok(None);
-        }
-        let mut entries = entries.skip_while(|entry| entry.is_empty()).skip(argc);
-        Ok(Some(parse_environment(&mut entries)))
+        };
+        Ok(Some(parse_environment(entries.into_iter().skip(argc))))
+    }
+
+    pub fn arguments(pid: u32) -> Result<Option<Vec<OsString>>> {
+        let Some(buffer) = procargs(pid)? else {
+            return Ok(None);
+        };
+        let Some((argc, entries)) = procargs_entries(&buffer) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            entries
+                .into_iter()
+                .take(argc)
+                .map(|argument| OsString::from_vec(argument.to_vec()))
+                .collect(),
+        ))
     }
 
     pub fn pids() -> Result<Vec<u32>> {
@@ -942,6 +1137,71 @@ mod native {
     /// Another process's environment is not exposed by a supported Windows API.
     pub fn environment(_pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
         Ok(None)
+    }
+
+    /// The command line through ProcessCommandLineInformation (Windows 8.1
+    /// and later; limited query access suffices), split as the C runtime
+    /// splits it. `None` when the process cannot be opened or queried.
+    pub fn arguments(pid: u32) -> Result<Option<Vec<OsString>>> {
+        use windows_sys::{
+            Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation},
+            Win32::Foundation::UNICODE_STRING,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Ok(None);
+        }
+        let handle = Handle(handle);
+        let mut needed = 0u32;
+        // Sizing call: fails with STATUS_INFO_LENGTH_MISMATCH and the length.
+        unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        let header = size_of::<UNICODE_STRING>();
+        if (needed as usize) < header || needed > 1 << 20 {
+            return Ok(None);
+        }
+        // u64 storage keeps the UNICODE_STRING header aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        let length = (buffer.len() * size_of::<u64>()) as u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                ProcessCommandLineInformation,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut needed,
+            )
+        };
+        if status < 0 {
+            return Ok(None);
+        }
+        let text = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+        let units = usize::from(text.Length) / 2;
+        let start = buffer.as_ptr() as usize;
+        let end = start + buffer.len() * size_of::<u64>();
+        let first = text.Buffer as usize;
+        // The text is returned inside the same buffer, after the header.
+        if units == 0
+            || text.Buffer.is_null()
+            || first < start + header
+            || first.saturating_add(units * 2) > end
+        {
+            return Ok(None);
+        }
+        let line = unsafe { std::slice::from_raw_parts(text.Buffer, units) };
+        Ok(Some(
+            split_windows_command_line(&String::from_utf16_lossy(line))
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        ))
     }
 
     fn identity(handle: HANDLE, pid: u32) -> Result<Option<Identity>> {
@@ -1382,6 +1642,231 @@ mod environment_tests {
         assert_eq!(
             parse_environment(bytes.split(|b| *b == 0)),
             vec![("A".into(), "1".into()), ("B".into(), "x=y".into())],
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_entry_tests {
+    use super::*;
+    use std::process::{Child, Command};
+
+    #[test]
+    fn only_cli_as_the_first_argument_is_the_cli_entry() {
+        assert!(is_cli_entry(&["/x/raft-computer", "__cli"]));
+        assert!(is_cli_entry(&["raft-computer", "__cli", "agent", "list"]));
+        assert!(!is_cli_entry(&["/x/raft-computer"]));
+        assert!(!is_cli_entry::<&str>(&[]));
+        assert!(!is_cli_entry(&["/x/raft-computer", "serve"]));
+        assert!(!is_cli_entry(&["/x/raft-computer", "start", "__cli"]));
+        assert!(!is_cli_entry(&["/x/raft-computer", "__cli2"]));
+        assert!(!is_cli_entry(&["/x/raft-computer", "__CLI"]));
+        assert!(!is_cli_entry(&["/x/raft-computer", " __cli"]));
+        // argv[0] is the executable, never the entry.
+        assert!(!is_cli_entry(&["__cli", "serve"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_cmdline_splits_on_nul() {
+        let argv = parse_cmdline(b"/x/raft-computer\0__cli\0agent\0\0list\0");
+        assert_eq!(argv, ["/x/raft-computer", "__cli", "agent", "", "list"]);
+        assert!(is_cli_entry(&argv));
+        assert!(parse_cmdline(b"").is_empty());
+        // A process that rewrote its title into one space-joined string.
+        assert!(!is_cli_entry(&parse_cmdline(b"raft-computer __cli agent")));
+    }
+
+    #[test]
+    fn macos_procargs_yield_argv_before_the_environment() {
+        let mut buffer = 3_i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/x/raft-computer\0\0\0\0");
+        buffer.extend_from_slice(b"raft-computer\0__cli\0status\0HOME=/u\0\0");
+        let (argc, entries) = procargs_entries(&buffer).unwrap();
+        assert_eq!(argc, 3);
+        assert_eq!(
+            &entries[..argc],
+            [&b"raft-computer"[..], b"__cli", b"status"]
+        );
+        assert!(is_cli_entry(
+            &entries[..argc]
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
+        ));
+        assert_eq!(
+            parse_environment_for_test(entries.into_iter().skip(argc)),
+            vec![("HOME".to_owned(), "/u".to_owned())]
+        );
+        assert!(procargs_entries(b"\x01\0").is_none());
+    }
+
+    fn parse_environment_for_test<'a>(
+        entries: impl Iterator<Item = &'a [u8]>,
+    ) -> Vec<(String, String)> {
+        entries
+            .take_while(|entry| !entry.is_empty())
+            .filter_map(|entry| {
+                let text = String::from_utf8_lossy(entry);
+                let (name, value) = text.split_once('=')?;
+                Some((name.to_owned(), value.to_owned()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn windows_command_lines_split_as_the_c_runtime_does() {
+        let split = split_windows_command_line;
+        assert_eq!(
+            split(r#""C:\Program Files\Raft\raft-computer.exe" __cli agent list"#),
+            [
+                r"C:\Program Files\Raft\raft-computer.exe",
+                "__cli",
+                "agent",
+                "list"
+            ]
+        );
+        assert_eq!(
+            split(r"C:\Users\a\raft-computer.exe   __cli"),
+            [r"C:\Users\a\raft-computer.exe", "__cli"]
+        );
+        // A quoted entry is the same argument; a quote-joined one is not.
+        assert_eq!(split(r#"raft-computer.exe "__cli" x"#)[1], "__cli");
+        assert_eq!(split(r#"raft-computer.exe __cli"x y" z"#)[1], "__clix y");
+        // Backslashes before a quote, and "" inside quotes.
+        assert_eq!(
+            split(r#"a.exe "x\"y" \\"z" w\\\"v "p""q""#),
+            ["a.exe", r#"x"y"#, r"\z", r#"w\"v"#, r#"p"q"#]
+        );
+        assert_eq!(split(r"a.exe c:\dir\ x"), ["a.exe", r"c:\dir\", "x"]);
+        // argv[0] takes no escapes: its quotes only toggle quoting.
+        assert_eq!(split(r#""a\"b __cli"#), [r"a\b", "__cli"]);
+        assert_eq!(split(r#"a"b c"d x"#), ["ab cd", "x"]);
+        assert_eq!(split("a.exe"), ["a.exe"]);
+        assert_eq!(split("a.exe \t "), ["a.exe"]);
+        assert!(is_cli_entry(&split("raft-computer.exe\t__cli")));
+        assert!(!is_cli_entry(&split("raft-computer.exe serve __cli")));
+    }
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    const FIXTURE: &str = "process::cli_entry_tests::cli_fixture_child";
+
+    /// Not a test: the child the next test reads. Sleeps only when asked.
+    #[test]
+    #[ignore]
+    fn cli_fixture_child() {
+        if std::env::var_os("RAFT_CLI_FIXTURE_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    /// The test binary as a child with these arguments; libtest takes
+    /// `__cli` as one more name filter, so the child runs only the fixture.
+    fn spawn(arguments: &[&str]) -> OwnedChild {
+        OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(arguments)
+                .env("RAFT_CLI_FIXTURE_CHILD", "1")
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn classified(child: &OwnedChild) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(identity) = observe(child.0.id()).unwrap()
+                && native::arguments(identity.pid)
+                    .unwrap()
+                    .is_some_and(|argv| argv.len() > 1)
+            {
+                return is_cli_invocation(&identity);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child arguments were not read"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Reads a live process's arguments through this platform's API
+    // (/proc cmdline, KERN_PROCARGS2, or the Windows command line).
+    #[test]
+    fn a_live_process_is_classified_by_its_first_argument() {
+        let cli = spawn(&[CLI_ENTRY, "--exact", FIXTURE, "--ignored"]);
+        let other = spawn(&["--exact", FIXTURE, "--ignored", CLI_ENTRY]);
+        assert!(classified(&cli), "`<binary> __cli ...` is a CLI invocation");
+        assert!(!classified(&other), "a later __cli is not the entry");
+    }
+}
+
+#[cfg(test)]
+mod creation_order_tests {
+    use super::*;
+
+    fn at(created: &str) -> Identity {
+        Identity {
+            pid: 1,
+            executable: PathBuf::from("/x"),
+            created: created.into(),
+        }
+    }
+
+    #[test]
+    fn each_platform_format_orders_creation() {
+        assert_eq!(windows_creation_instant("1:0"), Some(("", 1 << 32)));
+        assert!(
+            windows_creation_instant("0:4294967295").unwrap().1
+                < windows_creation_instant("1:0").unwrap().1
+        );
+        assert_eq!(windows_creation_instant("x:1"), None);
+        let boot = "6d3a1c1e-0000-4000-8000-000000000000";
+        assert_eq!(
+            linux_creation_instant(&format!("{boot}:42")),
+            Some((boot, 42))
+        );
+        assert_eq!(linux_creation_instant("no-ticks"), None);
+        assert_eq!(macos_creation_instant("2:5"), Some(("", 2_000_005)));
+        assert!(
+            macos_creation_instant("1:999999").unwrap().1
+                < macos_creation_instant("2:0").unwrap().1
+        );
+        assert_eq!(macos_creation_instant("1:1000000"), None);
+    }
+
+    #[test]
+    fn created_after_compares_this_platforms_identities() {
+        let (old, new) = (at(&test_creation(10)), at(&test_creation(20)));
+        assert_eq!(created_after(&new, &old), Some(true));
+        assert_eq!(created_after(&old, &new), Some(false));
+        assert_eq!(created_after(&old, &old), Some(false));
+        assert_eq!(created_after(&at("garbage"), &old), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_boot_is_not_ordered() {
+        assert_eq!(created_after(&at("boot-b:1"), &at("boot-a:9")), None);
+    }
+
+    #[test]
+    fn a_child_is_never_created_before_its_live_parent() {
+        let own = observe(std::process::id()).unwrap().unwrap();
+        let Some(parent) = observe(native::parent().unwrap()).unwrap() else {
+            return; // a parent of another user or a protected one
+        };
+        assert_ne!(created_after(&parent, &own), Some(true));
+        assert!(
+            created_after(&own, &own).is_some(),
+            "own identity is ordered"
         );
     }
 }

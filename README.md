@@ -115,6 +115,12 @@ environment resolves to another home is left running (on its old image until
 that home restarts it). Where the environment cannot be read (Windows, access
 denied) the process counts as this home's, as before.
 
+A process of the binary whose first argument is `__cli` (the `raft` command an
+agent runs) is a short-lived client, not the service: it is never counted as a
+running product, stopped or waited for. Its arguments are read from
+`/proc/<pid>/cmdline`, `KERN_PROCARGS2` (macOS) or the process command line
+(Windows); a process whose arguments cannot be read counts as the product.
+
 Computer raw/gzip and `photon_rs_bg.wasm` identities come from one Hands
 `updates/check` selection. Exact versions and channels both freeze immutable
 Hands release URLs; there is no product CDN manifest fallback. Missing WASM,
