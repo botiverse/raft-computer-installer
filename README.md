@@ -129,6 +129,13 @@ cross-release URLs, or hash/size mismatches stop installation before service cha
 and published beside its matching binary, including during rollback. Product
 bytes run from the installation directory, outside K's slots.
 
+K downloads, verifies and stages an upgrade's candidate before it hands over.
+When K stops there without recording an outcome (a failed candidate download),
+nothing was stopped or replaced: the installer settles K's operation as failed,
+under K's lock and only while K's transaction is at rest on the source
+version, and reports the upgrade failed with nothing changed. An operation
+left open at the handover or later stays unresolved for recovery.
+
 ### Service managers
 
 A service the product runs under a service manager is that manager's to stop

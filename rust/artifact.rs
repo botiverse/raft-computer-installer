@@ -69,6 +69,14 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     ))
 }
 
+/// K's error text for a candidate it failed to download (an upgrade's
+/// candidate is fetched inside K, which reports its error as text), in the
+/// words of `download_failure`. None when the text is not a transfer failure.
+pub fn named_download_failure(label: &str, release: &Release, message: &str) -> Option<String> {
+    let error = download_failure(label, release, invalid(message));
+    is_download_failure(&error).then(|| error.to_string())
+}
+
 /// Pauses before the second and the third attempt of one download. Each
 /// attempt resumes from the partial file the previous one left behind.
 const DOWNLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
