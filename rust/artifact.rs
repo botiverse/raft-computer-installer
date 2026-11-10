@@ -7,7 +7,7 @@ use crate::{
     version,
 };
 use k_carrier::{
-    artifact::{Downloader, Progress, Release, TransferPolicy, sha256},
+    artifact::{Downloader, Progress, Release, TransferPolicy, partial_path, sha256},
     error::invalid,
     storage::{ensure_dir, write_durable, write_json},
 };
@@ -69,9 +69,25 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     ))
 }
 
-/// Pauses before the second and the third attempt of one download. Each
-/// attempt resumes from the partial file the previous one left behind.
-const DOWNLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+/// K's error text for a candidate it failed to download (an upgrade's
+/// candidate is fetched inside K, which reports its error as text), in the
+/// words of `download_failure`. None when the text is not a transfer failure.
+pub fn named_download_failure(label: &str, release: &Release, message: &str) -> Option<String> {
+    let error = download_failure(label, release, invalid(message));
+    is_download_failure(&error).then(|| error.to_string())
+}
+
+/// Pauses before the second to the fifth attempt of one download. Each
+/// attempt resumes from the partial file the previous one left behind (K
+/// sends `Range: bytes=<partial size>-`). Five attempts, up from three: an
+/// unstable edge (Cloudflare incident 88hc76jnq2gn) cut ~42 MB packages
+/// more often than three attempts could absorb.
+const DOWNLOAD_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(9),
+    Duration::from_secs(27),
+];
 
 /// The least overall time any one attempt gets. K budgets a transfer at its
 /// size over 64 KiB/s plus the 30 s first-response allowance, so a small file
@@ -128,6 +144,46 @@ fn transient(error: &crate::Error) -> bool {
     }
 }
 
+/// The server would not continue the partial file: HTTP 416, or a 206 whose
+/// Content-Range is missing, unreadable or does not continue it (K checks
+/// it). K keeps the partial file then, so every later attempt and run would
+/// fail the same way; only a transfer from the first byte can succeed.
+fn resume_refused(error: &crate::Error) -> bool {
+    let crate::Error::Invalid(message) = error else {
+        return false;
+    };
+    let Some(detail) = message.strip_prefix("DOWNLOAD_FAILED: ") else {
+        return false;
+    };
+    detail.starts_with("HTTP 416") || detail.ends_with(" Content-Range")
+}
+
+/// HTTP 403. A release download redirects to a presigned object-storage URL;
+/// one that refuses a resume may have expired, so the transfer restarts from
+/// the release URL (a fresh redirect) once. Without a partial file, or a
+/// second time, a 403 is final as before.
+fn forbidden(error: &crate::Error) -> bool {
+    let crate::Error::Invalid(message) = error else {
+        return false;
+    };
+    message.starts_with("DOWNLOAD_FAILED: HTTP 403")
+}
+
+/// The partial file K resumes from: present, not empty and shorter than the
+/// transfer (K starts over from a file that is not).
+fn resumes(partial: &Path, size: u64) -> bool {
+    fs::symlink_metadata(partial)
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0 && meta.len() < size)
+}
+
+fn remove_partial(partial: &Path) -> Result<()> {
+    match fs::remove_file(partial) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn download(
     downloader: &Downloader,
     release: &Release,
@@ -147,6 +203,11 @@ async fn download(
 /// The bytes a release transfers: its gzip representation when it has one.
 fn transfer_size(release: &Release) -> u64 {
     release.gzip.as_ref().map_or(release.size, |gzip| gzip.size)
+}
+
+/// The URL a release transfers from, which names K's partial file.
+fn transfer_url(release: &Release) -> &str {
+    release.gzip.as_ref().map_or(&release.url, |gzip| &gzip.url)
 }
 
 /// The installer's downloader for one release: the installer's roots and
@@ -172,8 +233,11 @@ async fn download_with_retries(
         client: downloader.client.clone(),
         policy: with_minimum_attempt(downloader.policy, transfer_size(release)),
     };
+    let partial = partial_path(resume_dir, transfer_url(release));
     let mut delays = delays.iter();
+    let mut restarted_after_forbidden = false;
     loop {
+        let resuming = resumes(&partial, transfer_size(release));
         let error = match downloader
             .download(release, Some(resume_dir), Some(download_progress(label)))
             .await
@@ -181,7 +245,19 @@ async fn download_with_retries(
             Ok(bytes) => return Ok(bytes),
             Err(error) => error,
         };
+        // A resume the server refused starts over from the first byte. A
+        // 200 answer to the Range request already does, inside K.
+        let restart = resuming
+            && (resume_refused(&error) || (forbidden(&error) && !restarted_after_forbidden));
+        if restart {
+            restarted_after_forbidden |= forbidden(&error);
+            remove_partial(&partial)?;
+        }
         match delays.next() {
+            Some(delay) if restart => {
+                eprintln!("The {label} download could not resume; starting over.");
+                tokio::time::sleep(*delay).await;
+            }
             Some(delay) if transient(&error) => {
                 eprintln!("The {label} download was interrupted; trying again.");
                 tokio::time::sleep(*delay).await;
@@ -748,6 +824,13 @@ mod retry_tests {
         Status(u16),
         /// Answer the request in full, honouring a Range header.
         Serve,
+        /// Answer 200 with the whole body, ignoring a Range header.
+        Full,
+        /// Answer 206 from the first byte, whatever the Range header asks.
+        Shifted,
+        /// Answer 302 to `/object` on this server, as Hands redirects a
+        /// release download to a presigned object-storage URL.
+        Redirect,
     }
 
     struct Server {
@@ -786,6 +869,14 @@ mod retry_tests {
                             );
                         }
                         Reply::Serve => serve(&mut stream, &request, &body),
+                        Reply::Full => serve(&mut stream, "", &body),
+                        Reply::Shifted => serve(&mut stream, "range: bytes=0-", &body),
+                        Reply::Redirect => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 302 Found\r\nLocation: /object\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
                     }
                 }
             });
@@ -861,7 +952,10 @@ mod retry_tests {
         }
     }
 
-    const NO_WAIT: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];
+    const NO_WAIT: [Duration; 4] = [Duration::from_millis(10); 4];
+
+    /// The Range header of a retry after `Reply::Drop(20_000)`.
+    const RESUMED: &str = "range: bytes=20000-";
 
     async fn fetch(server: &Server, body: &[u8], dir: &Path) -> Result<Vec<u8>> {
         download_with_retries(
@@ -903,12 +997,14 @@ mod retry_tests {
     }
 
     #[tokio::test]
-    async fn three_transient_failures_fail_the_download() {
+    async fn five_transient_failures_fail_the_download() {
         let body = body();
         let server = Server::start(
             body.clone(),
             vec![
                 Reply::Status(502),
+                Reply::Status(503),
+                Reply::Status(500),
                 Reply::Status(503),
                 Reply::Status(504),
                 Reply::Serve,
@@ -918,7 +1014,150 @@ mod retry_tests {
         let error = fetch(&server, &body, dir.path()).await.unwrap_err();
         assert!(is_download_failure(&error), "{error}");
         assert!(error.to_string().contains("HTTP 504"), "{error}");
-        assert_eq!(server.requests().len(), 3);
+        assert_eq!(server.requests().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_resume_answered_in_full_starts_over() {
+        let body = body();
+        let server = Server::start(body.clone(), vec![Reply::Drop(20_000), Reply::Full]);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].contains(RESUMED), "{requests:?}");
+    }
+
+    // A 416, or a 206 that does not continue the partial file, used to be
+    // final and left that file behind: every later run failed the same way.
+    #[tokio::test]
+    async fn a_refused_resume_starts_over_from_the_first_byte() {
+        for refusal in [Reply::Status(416), Reply::Shifted] {
+            let body = body();
+            let server = Server::start(
+                body.clone(),
+                vec![Reply::Drop(20_000), refusal, Reply::Serve],
+            );
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+            let requests = server.requests();
+            assert_eq!(requests.len(), 3, "{requests:?}");
+            assert!(requests[1].contains(RESUMED), "{requests:?}");
+            assert!(!requests[2].contains("range:"), "{requests:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_resume_on_the_last_attempt_leaves_no_partial_file() {
+        let body = body();
+        let script = vec![Reply::Drop(20_000), Reply::Status(416)];
+        let server = Server::start(body.clone(), script);
+        let dir = tempfile::tempdir().unwrap();
+        let release = release(&server.url, &body);
+        let retry = [Duration::from_millis(10)];
+        let label = "Raft Computer";
+        let downloader = downloader();
+        let fetched = download_with_retries(&downloader, &release, dir.path(), label, &retry);
+        let error = fetched.await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 416"), "{error}");
+        assert_eq!(server.requests().len(), 2);
+        assert!(!partial_path(dir.path(), &server.url).exists());
+    }
+
+    // Hands redirects a release download to a presigned URL, which may have
+    // expired by the time a resume is sent: the fetch restarts from the
+    // release URL (a fresh redirect) once.
+    #[tokio::test]
+    async fn a_resume_follows_the_redirect_and_a_forbidden_one_restarts_once() {
+        let body = body();
+        let server = Server::start(
+            body.clone(),
+            vec![
+                Reply::Drop(20_000),
+                Reply::Redirect,
+                Reply::Status(403),
+                Reply::Redirect,
+                Reply::Serve,
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(requests[2].starts_with("get /object "), "{requests:?}");
+        assert!(
+            requests[2].contains(RESUMED),
+            "the Range header reaches the redirect target: {requests:?}"
+        );
+        assert!(!requests[3].contains("range:"), "{requests:?}");
+        assert!(!requests[4].contains("range:"), "{requests:?}");
+
+        // A second forbidden resume is final, as a 403 without one is.
+        let server = Server::start(
+            body.clone(),
+            vec![
+                Reply::Drop(20_000),
+                Reply::Status(403),
+                Reply::Drop(20_000),
+                Reply::Status(403),
+                Reply::Serve,
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 403"), "{error}");
+        assert_eq!(server.requests().len(), 4);
+        let server = Server::start(body.clone(), vec![Reply::Status(403), Reply::Serve]);
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 403"), "{error}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_file_that_does_not_match_fails_and_is_removed() {
+        let body = body();
+        // The first 20000 bytes match; the resumed rest does not.
+        let mut served = body.clone();
+        *served.last_mut().unwrap() ^= 1;
+        let server = Server::start(
+            served,
+            vec![Reply::Drop(20_000), Reply::Serve, Reply::Serve],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("does not match the published release"),
+            "{message}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].contains(RESUMED), "{requests:?}");
+        assert!(!partial_path(dir.path(), &server.url).exists());
+    }
+
+    #[test]
+    fn a_refused_resume_is_told_from_other_failures() {
+        for message in [
+            "DOWNLOAD_FAILED: HTTP 416 Range Not Satisfiable",
+            "DOWNLOAD_FAILED: mismatched Content-Range",
+            "DOWNLOAD_FAILED: missing Content-Range",
+            "DOWNLOAD_FAILED: invalid Content-Range",
+        ] {
+            assert!(resume_refused(&invalid(message)), "{message}");
+        }
+        for message in [
+            "DOWNLOAD_FAILED: HTTP 403 Forbidden",
+            "DOWNLOAD_FAILED: idle timeout",
+            "SHA256_MISMATCH",
+        ] {
+            assert!(!resume_refused(&invalid(message)), "{message}");
+        }
+        let refused = invalid("DOWNLOAD_FAILED: HTTP 403 Forbidden");
+        assert!(forbidden(&refused));
+        let not_found = invalid("DOWNLOAD_FAILED: HTTP 404 Not Found");
+        assert!(!forbidden(&not_found));
     }
 
     #[tokio::test]

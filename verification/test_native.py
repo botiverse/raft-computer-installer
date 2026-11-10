@@ -1447,6 +1447,29 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(runtime_offenders(failed["line"]), [])
         self.assertFalse(machine.binary.exists())
 
+    def test_upgrade_download_failure_changes_nothing_and_the_retry_upgrades(self):
+        # #proj-raft-computer:#49 (c3353daa): K's own candidate download
+        # failed before the handover and left its operation open, so the
+        # upgrade was reported unresolved although nothing had changed.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        self.server.authority_lies.add("1.1.0")
+        failed = machine.json(["upgrade", "--version", "1.1.0"], expected=1)
+        self.assert_failure_contract(failed)
+        self.assertEqual(failed["receipt"]["outcome"], "failed")
+        self.assertEqual(failed["code"], "install_failed")
+        self.assertIn("Could not download Raft Computer from " + self.server.base + "/dl/raft-computer-cli/releases/", failed["line"])
+        self.assertIn("does not match the published release", failed["line"])
+        self.assertTrue(failed["line"].endswith("Nothing was changed. Run the same install command again."), failed["line"])
+        operation = json.loads((machine.k / "operation.json").read_text())
+        self.assertEqual((operation["phase"], operation["outcome"]), ("failed", "failed"))
+        self.assertEqual(machine.self_version(), "1.0.0")
+        self.assertEqual(machine.json(["status"])["exitCode"], 0)
+        self.server.authority_lies.discard("1.1.0")
+        upgraded = machine.json(["upgrade", "--version", "1.1.0"])
+        self.assertEqual(upgraded["receipt"]["outcome"], "promoted")
+        self.assertEqual(machine.self_version(), "1.1.0")
+
     def test_invalid_channel_is_rejected_without_release_downloads(self):
         machine = self.machine()
         result = machine.run(["install", "--channel", "../outside"])

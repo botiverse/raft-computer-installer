@@ -19,7 +19,7 @@ use k_carrier::{
     error::invalid,
     lock::UpgradeLock,
     protocol,
-    state::{OperationRead, Slot},
+    state::{Operation as KOperation, OperationPhase, OperationRead, Slot},
     storage::{FileStore, ensure_dir, exists, now_ms, sync_dir, write_durable, write_json},
 };
 use serde::{Deserialize, Serialize};
@@ -562,15 +562,32 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 if operation.id == plan.request.id
                     && operation.target_version == plan.manifest.version =>
             {
-                runner
-                    .execute(&protocol::Request::Recover {
+                // Left open before the handover by an earlier run: settled as
+                // failed, as below. K's recovery would close it as rolled
+                // back, as if a candidate had run; it runs when the record
+                // cannot be settled.
+                let cause = recorded_cause(&plan.detail);
+                let settling = settle_before_handover(&cfg.k_state, &operation, cause);
+                if let Ok(Some(operation)) = settling.await {
+                    protocol::Response {
                         protocol_version: 1,
-                        expected: Some(protocol::Expected {
-                            id: plan.request.id.clone(),
-                            target_version: plan.manifest.version.clone(),
-                        }),
-                    })
-                    .await?
+                        action: "recover".into(),
+                        exit_code: 1,
+                        result: "failed".into(),
+                        operation: OperationRead::Observed { operation },
+                        error: None,
+                    }
+                } else {
+                    runner
+                        .execute(&protocol::Request::Recover {
+                            protocol_version: 1,
+                            expected: Some(protocol::Expected {
+                                id: plan.request.id.clone(),
+                                target_version: plan.manifest.version.clone(),
+                            }),
+                        })
+                        .await?
+                }
             }
             _ => {
                 return finish(
@@ -625,6 +642,12 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             "upgrade returned a different operation receipt".into(),
         ));
     }
+    // Left open before the handover: settled as failed, nothing changed.
+    let settled = settle_before_handover(&cfg.k_state, &operation, recorded_cause(&plan.detail))
+        .await
+        .ok()
+        .flatten();
+    let operation = settled.unwrap_or(operation);
     let Some(outcome) = operation.outcome else {
         return Err(Error::Uncertain(STILL_REQUIRES_RECOVERY.into()));
     };
@@ -718,10 +741,10 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 "The requested upgrade was not allowed.".into(),
             )),
         ),
+        // K fails an operation only before the handover (the candidate
+        // could not be fetched, verified or prepared): nothing was changed.
         _ => (
-            format!(
-                "Could not upgrade to {target}. Run the same install command again to check and continue."
-            ),
+            failed_before_handover_line(target, &plan.manifest.release, &plan.detail),
             Some((
                 FailureCode::InstallFailed,
                 format!("Raft Computer could not be upgraded to {target}."),
@@ -986,6 +1009,86 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
 /// Raised when K returns the operation still open. It names no cause of its
 /// own: K's error, saved as the diagnostic just before, does.
 const STILL_REQUIRES_RECOVERY: &str = "upgrade still requires recovery";
+
+/// K's operation is still open in a phase before the handover: checking,
+/// downloading, verifying or staging the candidate. K has not stopped the
+/// service or replaced an installed file there. A failed candidate download
+/// returns from K this way (#proj-raft-computer:#49): K records no outcome
+/// for it, and the upgrade was reported unresolved although nothing changed.
+fn open_before_handover(operation: &KOperation) -> bool {
+    operation.outcome.is_none()
+        && matches!(
+            operation.phase,
+            OperationPhase::Checking
+                | OperationPhase::Downloading
+                | OperationPhase::Verifying
+                | OperationPhase::Staging
+        )
+}
+
+/// The cause recorded for this upgrade (K's error), without the prefix an
+/// earlier unresolved run added to it.
+fn recorded_cause(detail: &BTreeMap<String, String>) -> Option<&str> {
+    let cause = detail.get("diagnostic")?.as_str();
+    let cause = cause
+        .strip_prefix(STILL_REQUIRES_RECOVERY)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(cause);
+    (!cause.trim().is_empty()).then_some(cause)
+}
+
+/// Settles an operation K left open before the handover as K settles its
+/// other failures there (phase and outcome `Failed`, the cause as its
+/// reason), so the receipt says the upgrade failed and changed nothing, and
+/// the record no longer reads as an upgrade in progress. Under K's lock, and
+/// only while the record is still the one K returned and its transaction is
+/// at rest on the operation's source version; otherwise None, and the
+/// upgrade stays unresolved for recovery as before.
+async fn settle_before_handover(
+    k_state: &Path,
+    operation: &KOperation,
+    cause: Option<&str>,
+) -> Result<Option<KOperation>> {
+    if !open_before_handover(operation) {
+        return Ok(None);
+    }
+    let _lock = UpgradeLock::acquire(k_state)?;
+    let store = FileStore::new(k_state);
+    let OperationRead::Observed { operation: current } = store.read_operation() else {
+        return Ok(None);
+    };
+    if current != *operation {
+        return Ok(None);
+    }
+    let state = store.transaction_state().await?;
+    if !state.phase().at_rest() || state.stable() != operation.from_version {
+        return Ok(None);
+    }
+    let mut settled = operation.clone();
+    settled.phase = OperationPhase::Failed;
+    settled.outcome = Some(k_carrier::state::Outcome::Failed);
+    let reason = settled.reason.take().or_else(|| cause.map(str::to_owned));
+    settled.reason = Some(reason.unwrap_or_else(|| "stopped before handover".into()));
+    settled.updated_at_ms = now_ms();
+    store.persist_operation(&settled)?;
+    Ok(Some(settled))
+}
+
+/// The line for an upgrade K failed: why, when it was the download, and
+/// that nothing was changed.
+fn failed_before_handover_line(
+    target: &str,
+    release: &Release,
+    detail: &BTreeMap<String, String>,
+) -> String {
+    let download = recorded_cause(detail)
+        .and_then(|cause| artifact::named_download_failure("Raft Computer", release, cause));
+    let line = match download {
+        Some(download) => format!("{download}. Nothing was changed."),
+        None => format!("Could not upgrade to {target}. Nothing was changed."),
+    };
+    bounded_line(format!("{line} Run the same install command again."))
+}
 
 /// Records a failed run's error as the receipt diagnostic. The generic
 /// "still requires recovery" never replaces the more specific cause already
@@ -1750,5 +1853,198 @@ mod supervisor_marker_tests {
         let mut fresh = BTreeMap::new();
         carry_over_disabled_marker(&cfg, &mut fresh);
         assert!(fresh.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod before_handover_tests {
+    use super::*;
+
+    /// A host K never needs here: no test below reaches the handover.
+    struct NoHost;
+    #[async_trait]
+    impl k_carrier::host::Host for NoHost {
+        async fn quiesce(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self, _: Slot) -> Result<()> {
+            Ok(())
+        }
+        async fn start(&self, _: Slot) -> Result<()> {
+            Ok(())
+        }
+        async fn probe(&self) -> Result<k_carrier::state::Evidence> {
+            Err(invalid("no host in this test"))
+        }
+        async fn resume(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn operation(id: &str, from: &str, phase: OperationPhase) -> KOperation {
+        KOperation {
+            format_version: 1,
+            id: id.into(),
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            from_version: from.into(),
+            target_version: "1.1.0".into(),
+            previous_stable_version: from.into(),
+            phase,
+            outcome: None,
+            reason: None,
+            provenance: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// K state with stable 1.0.0 and `open` as its operation record.
+    fn k_state(open: &KOperation) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("stable.bin");
+        fs::write(&source, b"stable").unwrap();
+        let store = FileStore::new(dir.path().join("k"));
+        store.bootstrap_locked("1.0.0", &source).unwrap();
+        store.persist_operation(open).unwrap();
+        dir
+    }
+
+    fn recorded(dir: &tempfile::TempDir) -> KOperation {
+        match FileStore::new(dir.path().join("k")).read_operation() {
+            OperationRead::Observed { operation } => operation,
+            other => panic!("no operation record: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_an_open_operation_before_the_handover_qualifies() {
+        for phase in [
+            OperationPhase::Checking,
+            OperationPhase::Downloading,
+            OperationPhase::Verifying,
+            OperationPhase::Staging,
+        ] {
+            let open = operation("a", "1.0.0", phase);
+            assert!(open_before_handover(&open), "{phase:?}");
+        }
+        for phase in [
+            OperationPhase::HandingOver,
+            OperationPhase::Probing,
+            OperationPhase::Recovering,
+        ] {
+            let open = operation("a", "1.0.0", phase);
+            assert!(!open_before_handover(&open), "{phase:?}");
+        }
+        let mut settled = operation("a", "1.0.0", OperationPhase::Downloading);
+        settled.outcome = Some(k_carrier::state::Outcome::Failed);
+        assert!(!open_before_handover(&settled));
+    }
+
+    // #proj-raft-computer:#49 (c3353daa): K's candidate download timed out,
+    // nothing was stopped, and the upgrade was reported unresolved.
+    #[tokio::test]
+    async fn a_failed_download_is_settled_as_failed_and_the_next_upgrade_runs() {
+        let open = operation("first", "1.0.0", OperationPhase::Downloading);
+        let dir = k_state(&open);
+        let k = dir.path().join("k");
+        let cause = "DOWNLOAD_FAILED: overall timeout";
+        let settled = settle_before_handover(&k, &open, Some(cause)).await;
+        let settled = settled.unwrap().expect("settled");
+        assert_eq!(settled.phase, OperationPhase::Failed);
+        assert_eq!(settled.outcome, Some(k_carrier::state::Outcome::Failed));
+        assert_eq!(settled.reason.as_deref(), Some(cause));
+        assert_eq!(recorded(&dir), settled, "persisted");
+
+        // The next upgrade request is accepted: K archives the settled
+        // record and starts its own (failing here at the release lookup).
+        let runner = k_carrier::runner::Runner::new(
+            FileStore::new(&k),
+            Arc::new(NoHost),
+            Arc::new(OfflineSource),
+        )
+        .unwrap();
+        let response = runner
+            .execute(&protocol::Request::Upgrade {
+                protocol_version: 1,
+                id: "second".into(),
+                target_version: "1.1.0".into(),
+                consented: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.result, "failed", "{response:?}");
+        let error = response.error.clone().unwrap_or_default();
+        assert!(!error.contains("OPERATION_IN_PROGRESS"), "{response:?}");
+        let OperationRead::Observed { operation } = &response.operation else {
+            panic!("{response:?}");
+        };
+        assert_eq!(operation.id, "second");
+        let archived = FileStore::new(k).read_archive("first");
+        let OperationRead::Observed { operation } = archived else {
+            panic!("the settled record is archived");
+        };
+        assert_eq!(operation.outcome, Some(k_carrier::state::Outcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn the_handover_or_later_is_left_for_recovery() {
+        for phase in [OperationPhase::HandingOver, OperationPhase::Recovering] {
+            let open = operation("first", "1.0.0", phase);
+            let dir = k_state(&open);
+            let k = dir.path().join("k");
+            let settled = settle_before_handover(&k, &open, Some("cause")).await;
+            assert!(settled.unwrap().is_none(), "{phase:?}");
+            assert_eq!(recorded(&dir), open, "{phase:?} unchanged");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_that_no_longer_matches_is_left_for_recovery() {
+        // K's stable is not the operation's source version.
+        let open = operation("first", "0.9.0", OperationPhase::Downloading);
+        let dir = k_state(&open);
+        let k = dir.path().join("k");
+        let settled = settle_before_handover(&k, &open, None).await;
+        assert!(settled.unwrap().is_none());
+        assert_eq!(recorded(&dir), open);
+        // The record on disk is another operation than the one K returned.
+        let open = operation("first", "1.0.0", OperationPhase::Downloading);
+        let dir = k_state(&operation("other", "1.0.0", OperationPhase::Downloading));
+        let k = dir.path().join("k");
+        let settled = settle_before_handover(&k, &open, None).await;
+        assert!(settled.unwrap().is_none());
+        assert_eq!(recorded(&dir).id, "other");
+    }
+
+    fn release() -> Release {
+        Release {
+            version: "1.1.0".into(),
+            url: "https://hands.example/dl/raft-computer-cli/releases/1/linux-x64".into(),
+            sha256: "0".repeat(64),
+            size: 1,
+            gzip: None,
+        }
+    }
+
+    fn detail(diagnostic: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("diagnostic".to_owned(), diagnostic.to_owned())])
+    }
+
+    #[test]
+    fn a_download_failure_names_its_cause_and_that_nothing_changed() {
+        let timed_out = "Could not download Raft Computer from https://hands.example/dl/raft-computer-cli/releases/1/linux-x64: the download timed out. Nothing was changed. Run the same install command again.";
+        for diagnostic in [
+            "DOWNLOAD_FAILED: overall timeout",
+            "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout",
+        ] {
+            let line = failed_before_handover_line("1.1.0", &release(), &detail(diagnostic));
+            assert_eq!(line, timed_out);
+        }
+        let generic =
+            "Could not upgrade to 1.1.0. Nothing was changed. Run the same install command again.";
+        let line = failed_before_handover_line("1.1.0", &release(), &detail("check failed"));
+        assert_eq!(line, generic);
+        let line = failed_before_handover_line("1.1.0", &release(), &BTreeMap::new());
+        assert_eq!(line, generic);
     }
 }
