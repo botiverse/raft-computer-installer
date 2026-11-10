@@ -1056,7 +1056,8 @@ mod retry_tests {
         let release = release(&server.url, &body);
         let retry = [Duration::from_millis(10)];
         let label = "Raft Computer";
-        let fetched = download_with_retries(&downloader(), &release, dir.path(), label, &retry);
+        let downloader = downloader();
+        let fetched = download_with_retries(&downloader, &release, dir.path(), label, &retry);
         let error = fetched.await.unwrap_err();
         assert!(error.to_string().contains("HTTP 416"), "{error}");
         assert_eq!(server.requests().len(), 2);
