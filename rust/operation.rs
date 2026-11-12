@@ -430,11 +430,49 @@ fn service_unit(plan: &Plan) -> Option<crate::systemd::ServiceUnit> {
         .and_then(|unit| serde_json::from_str(unit).ok())
 }
 
-async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
-    Ok(crate::systemd::product_unit(cfg)
+/// The refusal's line and reason, or None to go on. Going on from inside the
+/// unit is safe only where the unit's actual `KillMode=` (read from systemd,
+/// never assumed) leaves every process but the main one running; that is
+/// recorded in the receipt (`systemdKillMode`). Why moving out failed
+/// (systemd-run's or the copy's stderr, from cli.rs) is a raw cause: it goes
+/// to `detail.diagnostic`, never into the reason.
+async fn systemd_confinement(cfg: &Config, plan: &mut Plan) -> Result<Option<String>> {
+    let Some(unit) = crate::systemd::product_unit(cfg)
         .await?
         .filter(crate::systemd::self_inside)
-        .map(|unit| crate::systemd::confinement_reason(&unit)))
+    else {
+        return Ok(None);
+    };
+    let note = plan.request.escape_failure.clone();
+    if let Some(mode) = crate::systemd::kill_mode(&unit).await
+        && crate::systemd::kill_mode_spares_others(&mode)
+    {
+        plan.detail.insert(
+            "systemdKillMode".into(),
+            format!(
+                "{} has KillMode={mode}: stopping it does not stop this upgrade, which continued inside it.",
+                unit.name
+            ),
+        );
+        if let Some(note) = note {
+            plan.detail.insert("systemdEscape".into(), note);
+        }
+        return Ok(None);
+    }
+    Ok(Some(confined(&unit, note, &mut plan.detail)))
+}
+
+/// The held reason for a run that stays inside the unit: product language
+/// only, with the escape note kept as the raw cause.
+fn confined(
+    unit: &crate::systemd::ServiceUnit,
+    note: Option<String>,
+    detail: &mut BTreeMap<String, String>,
+) -> String {
+    if let Some(note) = note {
+        detail.insert("diagnostic".into(), note);
+    }
+    crate::systemd::confinement_reason(unit)
 }
 
 /// The supervisor Raft Desktop registered when a repair began (see
@@ -532,7 +570,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
-        if let Some(reason) = systemd_confinement(cfg).await? {
+        if let Some(reason) = systemd_confinement(cfg, plan).await? {
             return refuse_confined(cfg, plan, reason);
         }
         if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
@@ -806,7 +844,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
         }
         if plan.kind == Kind::Repair {
-            if let Some(reason) = systemd_confinement(cfg).await? {
+            if let Some(reason) = systemd_confinement(cfg, plan).await? {
                 return refuse_confined(cfg, plan, reason);
             }
             if let Some(unit) = crate::systemd::product_unit(cfg).await? {
@@ -2046,5 +2084,26 @@ mod before_handover_tests {
         assert_eq!(line, generic);
         let line = failed_before_handover_line("1.1.0", &release(), &BTreeMap::new());
         assert_eq!(line, generic);
+    }
+}
+
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+    use crate::systemd::{confinement_reason, unit_of_cgroup};
+
+    #[test]
+    fn the_escape_note_is_a_diagnostic_and_the_reason_stays_product_language() {
+        let unit = unit_of_cgroup("/system.slice/raft-computer.service").unwrap();
+        let note = "systemd-run --scope exited with status 1: Access denied";
+        let mut detail = BTreeMap::new();
+        let reason = confined(&unit, Some(note.into()), &mut detail);
+        assert_eq!(reason, confinement_reason(&unit));
+        assert!(!reason.contains("systemd-run"));
+        assert_eq!(detail.get("diagnostic").map(String::as_str), Some(note));
+
+        let mut untouched = BTreeMap::new();
+        assert_eq!(confined(&unit, None, &mut untouched), reason);
+        assert!(untouched.is_empty());
     }
 }

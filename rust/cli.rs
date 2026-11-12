@@ -66,6 +66,7 @@ fn parse(args: &[String]) -> Result<Args> {
         approved_by,
         recovery_only: false,
         waiting_caller: None,
+        escape_failure: None,
     };
     let mut json = false;
     let mut position = 0;
@@ -223,11 +224,23 @@ pub async fn run() -> Result<u8> {
         }
         // The waiting CLI may run from the installed binary or, on a legacy
         // two-layer install, from the slot artifact its launcher execs into.
-        let parent = crate::process::immediate_parent(&host::product_executables(&cfg))?;
+        let mut parent = crate::process::immediate_parent(&host::product_executables(&cfg))?;
         if marker.is_some() && parent.is_none() {
             return Err(invalid(
                 "waiting caller is not the installed immediate parent",
             ));
+        }
+        // The copy systemd::escape() started from a web upgrade's run: its
+        // parent is that run, not the service. It stands in the service the
+        // original was started by, so it gets exactly the original's verdict
+        // below, only when the process tree proves it (same executable bytes
+        // as its parent, whose parent is a Computer); the variable alone
+        // never exempts anything.
+        if parent.is_none() && marker.is_none() {
+            parent = crate::systemd::escaped_from_service(
+                &cfg,
+                env::var_os(crate::systemd::ESCAPED_ENV).is_some(),
+            )?;
         }
         // A command run from inside the Computer (an agent on this computer,
         // through the CLI or by calling this installer directly): stopping the
@@ -330,8 +343,8 @@ pub async fn run() -> Result<u8> {
         && let Some(unit) = crate::systemd::product_unit(&cfg).await?
         && crate::systemd::self_inside(&unit)
     {
-        match crate::systemd::escape(&unit, &raw_args).await {
-            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0)) => {
+        match crate::systemd::escape(&unit, &raw_args, &cfg.scratch()).await {
+            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0), _) => {
                 if !args.json {
                     println!(
                         "Continuing the {} outside systemd unit {}.",
@@ -342,7 +355,7 @@ pub async fn run() -> Result<u8> {
             }
             // The copy got as far as settling this request: its receipt is
             // the answer, never a second, contradicting one from here.
-            crate::systemd::Escape::Exited(_) => {
+            crate::systemd::Escape::Exited(code, stderr) => {
                 if let Some(receipt) = crate::report::read(&cfg, &args.request.id)? {
                     let reply = Reply::receipt(receipt);
                     if args.json {
@@ -352,10 +365,15 @@ pub async fn run() -> Result<u8> {
                     }
                     return Ok(reply.exit_code);
                 }
+                args.request.escape_failure = Some(crate::systemd::escape_note(code, &stderr));
             }
-            crate::systemd::Escape::Failed => {}
+            crate::systemd::Escape::Failed(detail) => {
+                args.request.escape_failure = Some(crate::systemd::failure_note(&detail));
+            }
         }
-        // Could not leave the unit: the operation refuses before stopping.
+        // Could not leave the unit: the operation refuses before stopping,
+        // with this note as the receipt's detail.diagnostic (or continues
+        // where the unit's KillMode spares this process; operation.rs).
     }
     // Windows: the same for the job object of Raft Desktop's logon task. A
     // copy that could not break away is refused in operation.rs before
@@ -367,7 +385,7 @@ pub async fn run() -> Result<u8> {
             .is_some()
     {
         match crate::host_supervisor::break_away(&raw_args).await {
-            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0)) => {
+            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0), _) => {
                 if !args.json {
                     println!(
                         "Continuing the {} outside the Computer service's job.",
@@ -376,7 +394,7 @@ pub async fn run() -> Result<u8> {
                 }
                 return Ok(0);
             }
-            crate::systemd::Escape::Exited(_) => {
+            crate::systemd::Escape::Exited(..) => {
                 if let Some(receipt) = crate::report::read(&cfg, &args.request.id)? {
                     let reply = Reply::receipt(receipt);
                     if args.json {
@@ -387,7 +405,7 @@ pub async fn run() -> Result<u8> {
                     return Ok(reply.exit_code);
                 }
             }
-            crate::systemd::Escape::Failed => {}
+            crate::systemd::Escape::Failed(_) => {}
         }
     }
     let reply = supervisor::run(&cfg, &args.request).await?;

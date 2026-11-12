@@ -23,6 +23,12 @@ pub struct Request {
     pub recovery_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_caller: Option<crate::process::Identity>,
+    /// Why this run could not move out of the systemd unit that runs the
+    /// service (cli.rs, from systemd-run's or the copy's stderr), kept as the
+    /// held receipt's `detail.diagnostic`. Set by the CLI only, never read from
+    /// the environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escape_failure: Option<String>,
 }
 
 impl Request {
@@ -48,6 +54,12 @@ impl Request {
                 || !caller.executable.is_absolute())
         {
             return Err(invalid("invalid waiting caller identity"));
+        }
+        if let Some(note) = &self.escape_failure
+            && (note.len() > crate::systemd::ESCAPE_NOTE_LIMIT
+                || note.chars().any(char::is_control))
+        {
+            return Err(invalid("invalid escape note"));
         }
         if let Some(version) = &self.version {
             version::exact(version)?;
