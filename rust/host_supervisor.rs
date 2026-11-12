@@ -603,7 +603,7 @@ pub async fn break_away(args: &[String]) -> crate::systemd::Escape {
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let Ok(executable) = std::env::current_exe() else {
-        return Escape::Failed;
+        return Escape::Failed(String::new());
     };
     let mut command = tokio::process::Command::new(executable);
     command
@@ -612,11 +612,11 @@ pub async fn break_away(args: &[String]) -> crate::systemd::Escape {
         .stdin(std::process::Stdio::null())
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW);
     let Ok(mut child) = command.spawn() else {
-        return Escape::Failed;
+        return Escape::Failed(String::new());
     };
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) => Escape::Exited(status.code()),
-        Ok(Err(_)) => Escape::Failed,
+        Ok(Ok(status)) => Escape::Exited(status.code(), String::new()),
+        Ok(Err(_)) => Escape::Failed(String::new()),
         Err(_) => Escape::Running,
     }
 }

@@ -430,11 +430,40 @@ fn service_unit(plan: &Plan) -> Option<crate::systemd::ServiceUnit> {
         .and_then(|unit| serde_json::from_str(unit).ok())
 }
 
-async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
-    Ok(crate::systemd::product_unit(cfg)
+/// The refusal's line and reason, or None to go on. Going on from inside the
+/// unit is safe only where the unit's actual `KillMode=` (read from systemd,
+/// never assumed) leaves every process but the main one running; that is
+/// recorded in the receipt (`systemdKillMode`). The reason carries why moving
+/// out failed (systemd-run's or the copy's stderr, from cli.rs).
+async fn systemd_confinement(cfg: &Config, plan: &mut Plan) -> Result<Option<(String, String)>> {
+    let Some(unit) = crate::systemd::product_unit(cfg)
         .await?
         .filter(crate::systemd::self_inside)
-        .map(|unit| crate::systemd::confinement_reason(&unit)))
+    else {
+        return Ok(None);
+    };
+    let note = plan.request.escape_failure.clone();
+    if let Some(mode) = crate::systemd::kill_mode(&unit).await
+        && crate::systemd::kill_mode_spares_others(&mode)
+    {
+        plan.detail.insert(
+            "systemdKillMode".into(),
+            format!(
+                "{} has KillMode={mode}: stopping it does not stop this upgrade, which continued inside it.",
+                unit.name
+            ),
+        );
+        if let Some(note) = note {
+            plan.detail.insert("systemdEscape".into(), note);
+        }
+        return Ok(None);
+    }
+    let line = crate::systemd::confinement_reason(&unit);
+    let reason = match note {
+        Some(note) => crate::systemd::clip(format!("{line} Moving out failed: {note}"), 2048),
+        None => line.clone(),
+    };
+    Ok(Some((line, reason)))
 }
 
 /// The supervisor Raft Desktop registered when a repair began (see
@@ -504,13 +533,17 @@ fn carry_over_disabled_marker(cfg: &Config, detail: &mut BTreeMap<String, String
     }
 }
 
-fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
+fn refuse_confined(
+    cfg: &Config,
+    plan: &mut Plan,
+    (line, reason): (String, String),
+) -> Result<Reply> {
     finish(
         cfg,
         plan,
         Outcome::Held,
-        Some((FailureCode::InstallationHeld, reason.clone())),
-        &reason,
+        Some((FailureCode::InstallationHeld, reason)),
+        line,
     )
 }
 
@@ -532,8 +565,8 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
-        if let Some(reason) = systemd_confinement(cfg).await? {
-            return refuse_confined(cfg, plan, reason);
+        if let Some(refusal) = systemd_confinement(cfg, plan).await? {
+            return refuse_confined(cfg, plan, refusal);
         }
         if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
             return refuse_supervised(cfg, plan, refusal);
@@ -806,8 +839,8 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
         }
         if plan.kind == Kind::Repair {
-            if let Some(reason) = systemd_confinement(cfg).await? {
-                return refuse_confined(cfg, plan, reason);
+            if let Some(refusal) = systemd_confinement(cfg, plan).await? {
+                return refuse_confined(cfg, plan, refusal);
             }
             if let Some(unit) = crate::systemd::product_unit(cfg).await? {
                 plan.detail

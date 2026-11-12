@@ -143,6 +143,15 @@ and start, never `raft-computer stop`/`start` beside it:
 
 - **A systemd unit** found at runtime (a user's own unit): the installer leaves
   the unit's control group first (`systemd-run --scope`) and uses `systemctl`.
+  The copy in the scope gets the original run's inside-Computer verdict only
+  when the process tree proves it is that copy (its parent runs the same
+  executable bytes and was started by the Computer service);
+  `RAFT_COMPUTER_INSTALLER_SCOPE` alone exempts nothing. A system unit run as
+  another user than root tries that user's manager (`systemd-run --user`)
+  when the system manager refuses the scope. When it cannot leave, it goes on
+  only if the unit's actual `KillMode=` is `process` or `none` (noted as
+  `systemdKillMode` in the receipt); otherwise (`control-group`, `mixed`, or
+  unreadable) it is held, with systemd-run's error in the reason.
 - **Raft Desktop's registration** (`rust/host_supervisor.rs`): format 2 of
   `<RAFT_HOME>/computer/host-lifecycle-owner.json` names a launchd agent, a
   systemd `--user` unit or a Windows logon task. Stop disables it first, so
