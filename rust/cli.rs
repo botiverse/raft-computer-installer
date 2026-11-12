@@ -372,8 +372,8 @@ pub async fn run() -> Result<u8> {
             }
         }
         // Could not leave the unit: the operation refuses before stopping,
-        // with this note in its reason (or continues where the unit's
-        // KillMode spares this process; operation.rs).
+        // with this note as the receipt's detail.diagnostic (or continues
+        // where the unit's KillMode spares this process; operation.rs).
     }
     // Windows: the same for the job object of Raft Desktop's logon task. A
     // copy that could not break away is refused in operation.rs before

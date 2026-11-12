@@ -151,7 +151,8 @@ and start, never `raft-computer stop`/`start` beside it:
   when the system manager refuses the scope. When it cannot leave, it goes on
   only if the unit's actual `KillMode=` is `process` or `none` (noted as
   `systemdKillMode` in the receipt); otherwise (`control-group`, `mixed`, or
-  unreadable) it is held, with systemd-run's error in the reason.
+  unreadable) it is held, with systemd-run's error as the receipt's
+  `detail.diagnostic`.
 - **Raft Desktop's registration** (`rust/host_supervisor.rs`): format 2 of
   `<RAFT_HOME>/computer/host-lifecycle-owner.json` names a launchd agent, a
   systemd `--user` unit or a Windows logon task. Stop disables it first, so

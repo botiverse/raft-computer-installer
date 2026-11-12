@@ -433,9 +433,10 @@ fn service_unit(plan: &Plan) -> Option<crate::systemd::ServiceUnit> {
 /// The refusal's line and reason, or None to go on. Going on from inside the
 /// unit is safe only where the unit's actual `KillMode=` (read from systemd,
 /// never assumed) leaves every process but the main one running; that is
-/// recorded in the receipt (`systemdKillMode`). The reason carries why moving
-/// out failed (systemd-run's or the copy's stderr, from cli.rs).
-async fn systemd_confinement(cfg: &Config, plan: &mut Plan) -> Result<Option<(String, String)>> {
+/// recorded in the receipt (`systemdKillMode`). Why moving out failed
+/// (systemd-run's or the copy's stderr, from cli.rs) is a raw cause: it goes
+/// to `detail.diagnostic`, never into the reason.
+async fn systemd_confinement(cfg: &Config, plan: &mut Plan) -> Result<Option<String>> {
     let Some(unit) = crate::systemd::product_unit(cfg)
         .await?
         .filter(crate::systemd::self_inside)
@@ -458,12 +459,20 @@ async fn systemd_confinement(cfg: &Config, plan: &mut Plan) -> Result<Option<(St
         }
         return Ok(None);
     }
-    let line = crate::systemd::confinement_reason(&unit);
-    let reason = match note {
-        Some(note) => crate::systemd::clip(format!("{line} Moving out failed: {note}"), 2048),
-        None => line.clone(),
-    };
-    Ok(Some((line, reason)))
+    Ok(Some(confined(&unit, note, &mut plan.detail)))
+}
+
+/// The held reason for a run that stays inside the unit: product language
+/// only, with the escape note kept as the raw cause.
+fn confined(
+    unit: &crate::systemd::ServiceUnit,
+    note: Option<String>,
+    detail: &mut BTreeMap<String, String>,
+) -> String {
+    if let Some(note) = note {
+        detail.insert("diagnostic".into(), note);
+    }
+    crate::systemd::confinement_reason(unit)
 }
 
 /// The supervisor Raft Desktop registered when a repair began (see
@@ -533,17 +542,13 @@ fn carry_over_disabled_marker(cfg: &Config, detail: &mut BTreeMap<String, String
     }
 }
 
-fn refuse_confined(
-    cfg: &Config,
-    plan: &mut Plan,
-    (line, reason): (String, String),
-) -> Result<Reply> {
+fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
     finish(
         cfg,
         plan,
         Outcome::Held,
-        Some((FailureCode::InstallationHeld, reason)),
-        line,
+        Some((FailureCode::InstallationHeld, reason.clone())),
+        &reason,
     )
 }
 
@@ -565,8 +570,8 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
-        if let Some(refusal) = systemd_confinement(cfg, plan).await? {
-            return refuse_confined(cfg, plan, refusal);
+        if let Some(reason) = systemd_confinement(cfg, plan).await? {
+            return refuse_confined(cfg, plan, reason);
         }
         if let Some(refusal) = supervisor_refusal(cfg, plan).await? {
             return refuse_supervised(cfg, plan, refusal);
@@ -839,8 +844,8 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 .insert("hostSupervisor".into(), serde_json::to_string(&supervisor)?);
         }
         if plan.kind == Kind::Repair {
-            if let Some(refusal) = systemd_confinement(cfg, plan).await? {
-                return refuse_confined(cfg, plan, refusal);
+            if let Some(reason) = systemd_confinement(cfg, plan).await? {
+                return refuse_confined(cfg, plan, reason);
             }
             if let Some(unit) = crate::systemd::product_unit(cfg).await? {
                 plan.detail
@@ -2079,5 +2084,26 @@ mod before_handover_tests {
         assert_eq!(line, generic);
         let line = failed_before_handover_line("1.1.0", &release(), &BTreeMap::new());
         assert_eq!(line, generic);
+    }
+}
+
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+    use crate::systemd::{confinement_reason, unit_of_cgroup};
+
+    #[test]
+    fn the_escape_note_is_a_diagnostic_and_the_reason_stays_product_language() {
+        let unit = unit_of_cgroup("/system.slice/raft-computer.service").unwrap();
+        let note = "systemd-run --scope exited with status 1: Access denied";
+        let mut detail = BTreeMap::new();
+        let reason = confined(&unit, Some(note.into()), &mut detail);
+        assert_eq!(reason, confinement_reason(&unit));
+        assert!(!reason.contains("systemd-run"));
+        assert_eq!(detail.get("diagnostic").map(String::as_str), Some(note));
+
+        let mut untouched = BTreeMap::new();
+        assert_eq!(confined(&unit, None, &mut untouched), reason);
+        assert!(untouched.is_empty());
     }
 }

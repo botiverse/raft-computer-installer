@@ -393,7 +393,7 @@ pub fn clip(mut text: String, limit: usize) -> String {
     text
 }
 
-/// The note on a failed escape, for the held receipt's reason.
+/// The note on a failed escape, for the held receipt's `detail.diagnostic`.
 pub fn escape_note(code: Option<i32>, stderr: &str) -> String {
     let status = code.map_or_else(
         || "was killed by a signal".to_string(),

@@ -24,8 +24,9 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_caller: Option<crate::process::Identity>,
     /// Why this run could not move out of the systemd unit that runs the
-    /// service (cli.rs, from systemd-run's or the copy's stderr), for the held
-    /// receipt's reason. Set by the CLI only, never read from the environment.
+    /// service (cli.rs, from systemd-run's or the copy's stderr), kept as the
+    /// held receipt's `detail.diagnostic`. Set by the CLI only, never read from
+    /// the environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escape_failure: Option<String>,
 }
