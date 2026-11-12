@@ -630,7 +630,9 @@ mod tests {
         assert!(scope_denied(
             "Failed to start transient scope unit: Interactive authentication required."
         ));
-        assert!(scope_denied("Failed to start transient scope unit: Access denied"));
+        assert!(scope_denied(
+            "Failed to start transient scope unit: Access denied"
+        ));
         assert!(!scope_denied(
             "Failed to start transient scope unit: Unit run-r1.scope already exists."
         ));
@@ -644,7 +646,10 @@ mod tests {
     #[test]
     fn an_escape_note_is_bounded_and_says_how_systemd_run_ended() {
         assert_eq!(
-            escape_note(Some(1), "  Failed to start transient scope unit: Access denied "),
+            escape_note(
+                Some(1),
+                "  Failed to start transient scope unit: Access denied "
+            ),
             "systemd-run --scope exited with status 1: Failed to start transient scope unit: Access denied"
         );
         assert_eq!(
