@@ -1,6 +1,4 @@
-# Raft Computer Installer
-
-[![Built with Raft](https://raw.githubusercontent.com/raft-builders/awesome-raft-build/main/badge/built-with-raft.svg)](https://raft.build)
+# Raft Computer Installer [![Built with Raft](https://raw.githubusercontent.com/raft-builders/awesome-raft-build/main/badge/built-with-raft.svg)](https://raft.build)
 
 An independent installer, upgrader and repair tool for Raft Computer, written in
 Rust and built on [K](https://github.com/botiverse/k-carrier). It is released
