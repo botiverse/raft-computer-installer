@@ -733,6 +733,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "uuid",

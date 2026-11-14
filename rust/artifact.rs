@@ -1213,10 +1213,19 @@ mod retry_tests {
 
     #[tokio::test]
     async fn a_refused_connection_is_transient() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        // Bound but never listening: connections are refused, and the port stays
+        // ours, so a test running in parallel cannot start a server on it.
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
         let error = reqwest::Client::builder()
             .no_proxy()
             .build()

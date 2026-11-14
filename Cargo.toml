@@ -36,6 +36,10 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+# Already in the tree via tokio; a bound, non-listening socket for refused-connection tests.
+socket2 = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 # Internet Settings proxy, parsed in rust/proxy.rs.
 windows-registry = "0.6"
