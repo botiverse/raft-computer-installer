@@ -17,9 +17,28 @@ import urllib.parse
 from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, exchange, sha, wait_for
 from test_no_installer_wording import runtime_offenders
 
+def gate_pid(gate):
+    """The pid a fixture gate recorded, once the file is complete."""
+    try:
+        return json.loads(gate.read_text())["pid"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def process_alive(pid):
+    if WINDOWS:
+        listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True).stdout
+        return str(pid) in listed.split()
+    # An exited orphan may stay a zombie until init reaps it: not alive.
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
 FAILURE_CODES = {
     "caller_not_computer", "candidate_check_failed", "candidate_check_timed_out",
-    "candidate_start_failed", "downgrade_not_allowed", "earlier_recovery_pending", "escape_failed",
+    "candidate_start_failed", "downgrade_not_allowed", "download_stalled", "earlier_recovery_pending", "escape_failed",
     "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
@@ -1034,8 +1053,10 @@ class InstallerContract(unittest.TestCase):
             "RCI_FIXTURE_PUBLISHED_PATH": str(machine.binary), "RCI_FIXTURE_PUBLISHED_VERSION": version}
         supervisor = subprocess.Popen(machine.command([*args, "--json"]), env=machine.env(extra),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        gated = None
         try:
-            wait_for(gate.exists)
+            wait_for(lambda: gate_pid(gate) is not None)
+            gated = gate_pid(gate)
             worker = json.loads((machine.state / "gate/upgrade.lock").read_text())["pid"]
             self.assertNotIn(worker, (os.getpid(), supervisor.pid, 0, 1))
             for pid in (supervisor.pid, worker):
@@ -1048,6 +1069,10 @@ class InstallerContract(unittest.TestCase):
             if supervisor.poll() is None:
                 supervisor.kill()
             supervisor.communicate(timeout=20)
+            # The gated `--version` outlives the killed worker; let it exit
+            # before the next request checks for product processes.
+            if gated is not None:
+                wait_for(lambda: not process_alive(gated))
 
     def assert_refusal_stays_unresolved(self, machine):
         # Exit 3 lets the supervisor go on to its next worker, whose reply is
@@ -1071,7 +1096,8 @@ class InstallerContract(unittest.TestCase):
         self.interrupt_at_published_check(machine, ["install", "--version", "1.1.0"], "1.1.0")
         (machine.k / "operation.json").write_text("broken")
         self.assert_refusal_stays_unresolved(machine)
-        self.assertEqual(machine.receipt("interrupted")["outcome"], "installed")
+        interrupted = machine.receipt("interrupted")
+        self.assertEqual(interrupted["outcome"], "installed", msg=interrupted.get("detail"))
         self.assertEqual(machine.self_version(), "1.1.0")
 
     def test_refusal_after_settling_k_stays_unresolved(self):

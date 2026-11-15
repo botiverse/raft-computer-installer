@@ -18,6 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::time::Instant;
 
 const PROGRESS_BAR_WIDTH: u64 = 30;
 /// A download failure is user-facing and starts with this text, so the
@@ -50,7 +51,11 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
                     "the downloaded file does not match the published release; a company firewall or proxy may have replaced it. Ask your network administrator to allow {host} and *.r2.cloudflarestorage.com"
                 )
             } else if let Some(detail) = message.strip_prefix("DOWNLOAD_FAILED: ") {
-                if detail.ends_with("timeout") {
+                if detail == STALLED_DETAIL {
+                    stalled_cause()
+                } else if detail == "overall timeout" {
+                    "the connection was too slow to finish the download in time".into()
+                } else if detail.ends_with("timeout") {
                     "the download timed out".into()
                 } else if let Some(status) = detail.strip_prefix("HTTP ") {
                     format!("the server returned HTTP {status}")
@@ -89,17 +94,68 @@ const DOWNLOAD_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(27),
 ];
 
-/// The least overall time any one attempt gets. K budgets a transfer at its
-/// size over 64 KiB/s plus the 30 s first-response allowance, so a small file
-/// on a slow link (#proj-raft-computer:#49: the support file over a slow
-/// Windows connection) failed after well under a minute, every time.
+/// A transfer that receives no byte for this long is stalled, and its
+/// attempt ends: K's idle timeout between two body chunks, whose default
+/// this already was, now named and set explicitly. 30 s: by then TCP has
+/// backed off through about five retransmissions, so the connection is gone
+/// rather than slow, and a CDN does not pause a body it is sending that long.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The installer's own downloads for one request (a fresh install's or
+/// repair's support file and Raft Computer; an upgrade's support file):
+/// every attempt and the pauses between them end this long after the first
+/// began. They were unbounded (five attempts of K's size-based budget, ~14
+/// minutes each for the Computer's gzip). An upgrade's candidate is not
+/// bounded by this: K fetches it in one attempt with K's size-based budget
+/// (`release_downloader`).
+pub const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(600);
+
+/// When the installer's downloads for a request that starts them now end.
+pub fn download_deadline() -> Instant {
+    Instant::now() + DOWNLOAD_DEADLINE
+}
+
+/// K's error for a stalled attempt.
+const STALLED_DETAIL: &str = "idle timeout";
+
+fn stalled_cause() -> String {
+    format!(
+        "the download stopped receiving data for {} s; check this computer's internet connection",
+        STALL_TIMEOUT.as_secs()
+    )
+}
+
+/// The download ended because no data arrived: K's error text (an upgrade's
+/// recorded cause) or the user-facing failure built from it.
+pub fn download_stalled(message: &str) -> bool {
+    message.contains(&format!("DOWNLOAD_FAILED: {STALLED_DETAIL}"))
+        || (message.starts_with(DOWNLOAD_FAILURE) && message.contains(&stalled_cause()))
+}
+
+/// One attempt's policy: K's first-response and stall timeouts, and at most
+/// `remaining` overall. K's required rate drops to one byte per second, so
+/// the overall bound is `remaining` for any file of a few hundred bytes or
+/// more: progress is judged by the stall timeout, not by an average rate.
+fn attempt_policy(policy: TransferPolicy, remaining: Duration) -> TransferPolicy {
+    let remaining = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    TransferPolicy {
+        minimum_bytes_per_second: 1,
+        maximum_overall_ms: remaining.max(policy.response_ms),
+        ..policy
+    }
+}
+
+/// The least overall time an upgrade candidate's single attempt gets. K
+/// budgets a transfer at its size over 64 KiB/s plus the 30 s first-response
+/// allowance, so a small file on a slow link (#proj-raft-computer:#49)
+/// failed after well under a minute, every time.
 const MINIMUM_ATTEMPT_MS: u64 = 120_000;
 
 /// K's policy exposes no minimum overall budget, so the floor is reached by
 /// lowering the required rate for a small transfer until its size takes at
-/// least the floor minus the first-response allowance. The first-response and
-/// idle timeouts stay as K sets them: a stall there is retried instead. Large
-/// transfers, whose own budget exceeds the floor, keep K's policy unchanged.
+/// least the floor minus the first-response allowance. Large transfers,
+/// whose own budget exceeds the floor, keep K's size-based budget (~14
+/// minutes for the Computer's ~53 MB gzip).
 fn with_minimum_attempt(policy: TransferPolicy, size: u64) -> TransferPolicy {
     let body_ms = MINIMUM_ATTEMPT_MS.saturating_sub(policy.response_ms);
     if body_ms == 0 {
@@ -189,6 +245,7 @@ async fn download(
     release: &Release,
     resume_dir: &Path,
     label: &'static str,
+    ends: Instant,
 ) -> Result<Vec<u8>> {
     download_with_retries(
         downloader,
@@ -196,6 +253,7 @@ async fn download(
         resume_dir,
         label,
         &DOWNLOAD_RETRY_DELAYS,
+        ends,
     )
     .await
 }
@@ -210,10 +268,11 @@ fn transfer_url(release: &Release) -> &str {
     release.gzip.as_ref().map_or(&release.url, |gzip| &gzip.url)
 }
 
-/// The installer's downloader for one release: the installer's roots and
-/// proxy settings (`source::downloader`) and at least `MINIMUM_ATTEMPT_MS`
-/// for its transfer. K's runner downloads an upgrade candidate with this, not
-/// with K's own `Downloader::new()`.
+/// The installer's downloader for an upgrade's candidate: the installer's
+/// roots, proxy settings and stall timeout (`source::downloader`), and K's
+/// size-based budget with at least `MINIMUM_ATTEMPT_MS` for its transfer.
+/// K's runner downloads the candidate with this, not with K's own
+/// `Downloader::new()`, in a single attempt.
 pub fn release_downloader(release: &Release) -> Result<Downloader> {
     let downloader = crate::source::downloader()?;
     Ok(Downloader {
@@ -228,17 +287,21 @@ async fn download_with_retries(
     resume_dir: &Path,
     label: &'static str,
     delays: &[Duration],
+    ends: Instant,
 ) -> Result<Vec<u8>> {
-    let downloader = Downloader {
-        client: downloader.client.clone(),
-        policy: with_minimum_attempt(downloader.policy, transfer_size(release)),
-    };
     let partial = partial_path(resume_dir, transfer_url(release));
     let mut delays = delays.iter();
     let mut restarted_after_forbidden = false;
     loop {
         let resuming = resumes(&partial, transfer_size(release));
-        let error = match downloader
+        let attempt = Downloader {
+            client: downloader.client.clone(),
+            policy: attempt_policy(
+                downloader.policy,
+                ends.saturating_duration_since(Instant::now()),
+            ),
+        };
+        let error = match attempt
             .download(release, Some(resume_dir), Some(download_progress(label)))
             .await
         {
@@ -253,9 +316,17 @@ async fn download_with_retries(
             restarted_after_forbidden |= forbidden(&error);
             remove_partial(&partial)?;
         }
-        match delays.next() {
+        // Another attempt only while it would still have time to be answered.
+        let delay = delays.next().filter(|delay| {
+            Instant::now() + **delay + Duration::from_millis(downloader.policy.response_ms) <= ends
+        });
+        match delay {
             Some(delay) if restart => {
                 eprintln!("The {label} download could not resume; starting over.");
+                tokio::time::sleep(*delay).await;
+            }
+            Some(delay) if download_stalled(&error.to_string()) => {
+                eprintln!("The {label} download stopped receiving data; trying again.");
                 tokio::time::sleep(*delay).await;
             }
             Some(delay) if transient(&error) => {
@@ -570,7 +641,13 @@ pub fn adopt_installed_sidecar(cfg: &Config, version: &str) -> Result<()> {
     )
 }
 
-pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option<PathBuf>> {
+/// `ends`: when the request's downloads end (`download_deadline`), shared
+/// with the Raft Computer download after it on a fresh install.
+pub async fn acquire_sidecar(
+    cfg: &Config,
+    manifest: &Manifest,
+    ends: Instant,
+) -> Result<Option<PathBuf>> {
     let dir = cfg.sidecar_dir(&manifest.version)?;
     ensure_dir(&dir)?;
     let record = SidecarRecord {
@@ -603,6 +680,7 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
                     release,
                     &dir,
                     "Raft Computer support file",
+                    ends,
                 )
                 .await?;
                 write_durable(&path, &bytes, false)?;
@@ -632,12 +710,15 @@ pub async fn acquire(
     version::exact(&manifest.version)?;
     let scratch = cfg.scratch();
     ensure_dir(&scratch)?;
-    let sidecar = acquire_sidecar(cfg, manifest).await?;
+    // One deadline for both downloads: they share the first worker.
+    let ends = download_deadline();
+    let sidecar = acquire_sidecar(cfg, manifest, ends).await?;
     let bytes = download(
         &crate::source::downloader()?,
         &manifest.release,
         &scratch,
         "Raft Computer",
+        ends,
     )
     .await?;
     check_platform(&bytes)?;
@@ -673,11 +754,13 @@ pub async fn acquire_repair(
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
     let downloader = crate::source::downloader()?;
+    let ends = download_deadline();
     let bytes = download(
         &downloader,
         &manifest.release,
         &cfg.scratch(),
         "Raft Computer",
+        ends,
     )
     .await?;
     check_platform(&bytes)?;
@@ -693,6 +776,7 @@ pub async fn acquire_repair(
                 release,
                 &cfg.scratch(),
                 "Raft Computer support file",
+                ends,
             )
             .await?;
             write_durable(&directory.path().join(SIDECAR_NAME), &bytes, false)?;
@@ -892,6 +976,18 @@ mod retry_tests {
         /// Answer 302 to `/object` on this server, as Hands redirects a
         /// release download to a presigned object-storage URL.
         Redirect,
+        /// Answer as `Serve` (honouring a Range header), `piece` bytes at a
+        /// time with `pause_ms` between them.
+        Trickle { piece: usize, pause_ms: u64 },
+        /// Answer as `Serve`, send `n` bytes of the body, then keep the
+        /// connection open and send nothing more.
+        StallAfter(usize),
+        /// As `Trickle` for `pieces` pieces, then as `StallAfter`.
+        TrickleThenStall {
+            piece: usize,
+            pause_ms: u64,
+            pieces: usize,
+        },
     }
 
     struct Server {
@@ -938,7 +1034,43 @@ mod retry_tests {
                                 "HTTP/1.1 302 Found\r\nLocation: /object\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             );
                         }
+                        Reply::Trickle { piece, pause_ms } => {
+                            let rest = head(&mut stream, &request, &body);
+                            for part in rest.chunks(piece) {
+                                std::thread::sleep(Duration::from_millis(pause_ms));
+                                if stream
+                                    .write_all(part)
+                                    .and_then(|()| stream.flush())
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Reply::TrickleThenStall {
+                            piece,
+                            pause_ms,
+                            pieces,
+                        } => {
+                            let rest = head(&mut stream, &request, &body);
+                            for part in rest.chunks(piece).take(pieces) {
+                                std::thread::sleep(Duration::from_millis(pause_ms));
+                                let _ = stream.write_all(part).and_then(|()| stream.flush());
+                            }
+                            held.push(stream);
+                        }
+                        Reply::StallAfter(n) => {
+                            let rest = head(&mut stream, &request, &body);
+                            let _ = stream.write_all(&rest[..n.min(rest.len())]);
+                            let _ = stream.flush();
+                            held.push(stream);
+                        }
                     }
+                }
+                // A stalled connection stays open after the script ends, so
+                // the last attempt sees a stall, not a closed connection.
+                if !held.is_empty() {
+                    std::thread::sleep(Duration::from_secs(60));
                 }
             });
             Self { url, requests }
@@ -962,6 +1094,14 @@ mod retry_tests {
     }
 
     fn serve(stream: &mut TcpStream, request: &str, body: &[u8]) {
+        let rest = head(stream, request, body);
+        let _ = stream.write_all(rest);
+        let _ = stream.flush();
+    }
+
+    /// Write the status line and headers for `request` (200, or 206 for a
+    /// Range header) and return the body bytes that answer it.
+    fn head<'a>(stream: &mut TcpStream, request: &str, body: &'a [u8]) -> &'a [u8] {
         let offset = request
             .lines()
             .find_map(|line| line.strip_prefix("range: bytes="))
@@ -974,16 +1114,15 @@ mod retry_tests {
                 body.len() - first,
                 body.len() - 1,
                 body.len()
-            )
-            .and_then(|()| stream.write_all(&body[first..])),
+            ),
             None => write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            )
-            .and_then(|()| stream.write_all(body)),
+            ),
         };
         let _ = stream.flush();
+        &body[offset.unwrap_or(0)..]
     }
 
     fn body() -> Vec<u8> {
@@ -1019,12 +1158,22 @@ mod retry_tests {
     const RESUMED: &str = "range: bytes=20000-";
 
     async fn fetch(server: &Server, body: &[u8], dir: &Path) -> Result<Vec<u8>> {
+        fetch_within(server, body, dir, DOWNLOAD_DEADLINE).await
+    }
+
+    async fn fetch_within(
+        server: &Server,
+        body: &[u8],
+        dir: &Path,
+        deadline: Duration,
+    ) -> Result<Vec<u8>> {
         download_with_retries(
             &downloader(),
             &release(&server.url, body),
             dir,
             "Raft Computer support file",
             &NO_WAIT,
+            Instant::now() + deadline,
         )
         .await
     }
@@ -1118,7 +1267,8 @@ mod retry_tests {
         let retry = [Duration::from_millis(10)];
         let label = "Raft Computer";
         let downloader = downloader();
-        let fetched = download_with_retries(&downloader, &release, dir.path(), label, &retry);
+        let ends = download_deadline();
+        let fetched = download_with_retries(&downloader, &release, dir.path(), label, &retry, ends);
         let error = fetched.await.unwrap_err();
         assert!(error.to_string().contains("HTTP 416"), "{error}");
         assert_eq!(server.requests().len(), 2);
@@ -1298,27 +1448,184 @@ mod retry_tests {
         assert!(transient(&crate::Error::Http(error)));
     }
 
-    #[test]
-    fn a_small_transfer_gets_at_least_two_minutes() {
-        let policy = TransferPolicy::default();
-        for size in [100_u64, 64 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
-            let budgets = with_minimum_attempt(policy, size).budgets(size).unwrap();
-            assert!(
-                budgets.overall_ms >= MINIMUM_ATTEMPT_MS,
-                "{size}: {budgets:?}"
-            );
-            assert_eq!(budgets.response_ms, policy.response_ms);
-            assert_eq!(budgets.idle_ms, policy.idle_ms);
-        }
-        // K's own budget for this size is already wider: unchanged.
-        let large = 100 * 1024 * 1024;
-        assert_eq!(
-            with_minimum_attempt(policy, large)
-                .budgets(large)
-                .unwrap()
-                .overall_ms,
-            policy.budgets(large).unwrap().overall_ms
+    /// A transfer that keeps receiving data is not stalled, however long
+    /// it takes: here eight times the stall timeout, in 2 KiB pieces.
+    #[tokio::test]
+    async fn a_slow_transfer_that_keeps_receiving_data_completes() {
+        let body = body();
+        let trickle = Reply::Trickle {
+            piece: 2 * 1024,
+            pause_ms: 125,
+        };
+        let server = Server::start(body.clone(), vec![trickle]);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
         );
+        assert_eq!(server.requests().len(), 1, "one attempt, never stalled");
+    }
+
+    /// 11-15: a transfer that stops sending mid-body ends after the stall
+    /// timeout, not at its overall budget; each retry resumes where it
+    /// stopped, and the last one fails as stalled.
+    #[tokio::test]
+    async fn a_transfer_that_stops_sending_fails_fast_as_stalled() {
+        let body = body();
+        let script = vec![Reply::StallAfter(10_000); 5];
+        let server = Server::start(body.clone(), script);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = fetch(&server, &body, dir.path()).await.unwrap_err();
+        // Five attempts of 500 ms each, far from the 10-minute deadline.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(is_download_failure(&error), "{error}");
+        assert!(download_stalled(&error.to_string()), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Could not download Raft Computer support file from {}: the download stopped receiving data for 30 s; check this computer's internet connection",
+                server.url
+            )
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(!requests[0].contains("range:"), "{requests:?}");
+        for (attempt, request) in requests.iter().enumerate().skip(1) {
+            let resumed = format!("range: bytes={}-", attempt * 10_000);
+            assert!(request.contains(&resumed), "{attempt}: {requests:?}");
+        }
+        // The partial file is kept: the next run resumes from it.
+        let partial = partial_path(dir.path(), &server.url);
+        assert_eq!(fs::metadata(partial).unwrap().len(), 50_000);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_transfer_resumes_and_completes() {
+        let body = body();
+        let script = vec![Reply::StallAfter(20_000), Reply::Serve];
+        let server = Server::start(body.clone(), script);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fetch(&server, &body, dir.path()).await.unwrap(), body);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].contains(RESUMED), "{requests:?}");
+    }
+
+    /// Retries never run past the deadline: a transfer still trickling at
+    /// it fails then, not one attempt's size-based budget later.
+    #[tokio::test]
+    async fn the_deadline_bounds_every_attempt_together() {
+        let body = body();
+        let trickle = Reply::Trickle {
+            piece: 1024,
+            pause_ms: 100,
+        };
+        let server = Server::start(body.clone(), vec![trickle; 5]);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(1500);
+        let error = fetch_within(&server, &body, dir.path(), deadline)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!download_stalled(&error.to_string()), "{error}");
+        assert!(
+            error
+                .to_string()
+                .ends_with("the connection was too slow to finish the download in time"),
+            "{error}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// A retry gets what is left of the deadline, not a new one: the first
+    /// attempt runs ~2.5 s (2 s of data, then a stall), the second trickles
+    /// past the deadline and ends at it (4 s), not 4 s after it began.
+    #[tokio::test]
+    async fn a_retry_gets_only_the_time_left() {
+        let body = body();
+        let script = vec![
+            Reply::TrickleThenStall {
+                piece: 1024,
+                pause_ms: 200,
+                pieces: 10,
+            },
+            Reply::Trickle {
+                piece: 1024,
+                pause_ms: 100,
+            },
+        ];
+        let server = Server::start(body.clone(), script);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_secs(4);
+        let error = fetch_within(&server, &body, dir.path(), deadline)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(3900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(5500), "{elapsed:?}");
+        assert!(
+            error
+                .to_string()
+                .ends_with("the connection was too slow to finish the download in time"),
+            "{error}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].contains("range: bytes=10240-"), "{requests:?}");
+    }
+
+    /// An attempt is bounded by what is left of the deadline, whatever the
+    /// size (K's default gives ~14 minutes to 53 MB, 30 to 150 MB), and
+    /// keeps the first-response and stall timeouts it is given.
+    #[test]
+    fn an_attempt_gets_the_rest_of_the_deadline_whatever_its_size() {
+        let policy = crate::source::downloader().unwrap().policy;
+        assert_eq!(policy.idle_ms, 30_000);
+        let default = TransferPolicy::default();
+        assert!(default.budgets(53_000_000).unwrap().overall_ms > 13 * 60_000);
+        for size in [1024 * 1024_u64, 5 * 1024 * 1024, 53_000_000, 150_000_000] {
+            for remaining in [DOWNLOAD_DEADLINE, Duration::from_secs(45)] {
+                let budgets = attempt_policy(policy, remaining).budgets(size).unwrap();
+                assert_eq!(budgets.overall_ms, remaining.as_millis() as u64, "{size}");
+                assert_eq!(budgets.response_ms, policy.response_ms);
+                assert_eq!(budgets.idle_ms, policy.idle_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stall_is_told_from_other_failures() {
+        assert!(download_stalled("DOWNLOAD_FAILED: idle timeout"));
+        assert!(download_stalled(
+            "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout"
+        ));
+        let release = release("https://hands.example/dl/file", b"x");
+        let named =
+            named_download_failure("Raft Computer", &release, "DOWNLOAD_FAILED: idle timeout")
+                .unwrap();
+        assert!(download_stalled(&named), "{named}");
+        for message in [
+            "DOWNLOAD_FAILED: overall timeout",
+            "DOWNLOAD_FAILED: response timeout",
+            "DOWNLOAD_FAILED: HTTP 503 Service Unavailable",
+            "stopped receiving data",
+        ] {
+            assert!(!download_stalled(message), "{message}");
+        }
     }
 }
 

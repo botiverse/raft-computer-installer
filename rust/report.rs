@@ -152,6 +152,7 @@ pub enum FailureCode {
     CandidateCheckTimedOut,
     CandidateStartFailed,
     DowngradeNotAllowed,
+    DownloadStalled,
     EarlierRecoveryPending,
     EscapeFailed,
     InstallFailed,
@@ -172,12 +173,13 @@ pub enum FailureCode {
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::CallerNotComputer,
         Self::CandidateCheckFailed,
         Self::CandidateCheckTimedOut,
         Self::CandidateStartFailed,
         Self::DowngradeNotAllowed,
+        Self::DownloadStalled,
         Self::EarlierRecoveryPending,
         Self::EscapeFailed,
         Self::InstallFailed,
@@ -204,6 +206,7 @@ impl FailureCode {
             Self::CandidateCheckTimedOut => "candidate_check_timed_out",
             Self::CandidateStartFailed => "candidate_start_failed",
             Self::DowngradeNotAllowed => "downgrade_not_allowed",
+            Self::DownloadStalled => "download_stalled",
             Self::EarlierRecoveryPending => "earlier_recovery_pending",
             Self::EscapeFailed => "escape_failed",
             Self::InstallFailed => "install_failed",
@@ -477,15 +480,16 @@ mod failure_code_tests {
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 22);
+        assert_eq!(values.len(), 23);
         assert_eq!(values[0], "\"caller_not_computer\"");
         assert_eq!(values[1], "\"candidate_check_failed\"");
         assert_eq!(values[2], "\"candidate_check_timed_out\"");
-        assert_eq!(values[5], "\"earlier_recovery_pending\"");
-        assert_eq!(values[6], "\"escape_failed\"");
-        assert_eq!(values[19], "\"result_unreadable\"");
-        assert_eq!(values[20], "\"running_as_root\"");
-        assert_eq!(values[21], "\"unexpected_error\"");
+        assert_eq!(values[5], "\"download_stalled\"");
+        assert_eq!(values[6], "\"earlier_recovery_pending\"");
+        assert_eq!(values[7], "\"escape_failed\"");
+        assert_eq!(values[20], "\"result_unreadable\"");
+        assert_eq!(values[21], "\"running_as_root\"");
+        assert_eq!(values[22], "\"unexpected_error\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),

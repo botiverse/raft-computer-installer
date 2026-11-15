@@ -143,6 +143,21 @@ cross-release URLs, or hash/size mismatches stop installation before service cha
 and published beside its matching binary, including during rollback. Product
 bytes run from the installation directory, outside K's slots.
 
+A download that receives no data for 30 s is stalled and its attempt ends
+(K's idle timeout, now set explicitly). The installer's own downloads for one
+request (a fresh install's or repair's support file and Raft Computer, an
+upgrade's support file) retry up to five times, each attempt resuming from
+the partial file with a Range request, and all of them, pauses included, end
+within 10 minutes; a slow transfer that keeps receiving data may use all of
+it. An upgrade's candidate is fetched by K in one attempt with K's size-based
+budget (the size over 64 KiB/s plus 30 s: about 14 minutes for the
+Computer's gzip) and the same stall timeout. A download that ends stalled
+fails with `download_stalled`; one that runs out of time says the connection
+was too slow. Nothing was changed either way. The first worker's 20 minutes
+cover a typical upgrade, but not every bound at once: the support file
+(10 min), the candidate (~14), the preparation (5) and the handover (six host
+calls of up to 2 min and a 5-minute read-back) add up to about 46 minutes.
+
 K downloads, verifies and stages an upgrade's candidate before it hands over.
 When K stops there without recording an outcome (a failed candidate download),
 nothing was stopped or replaced: the installer settles K's operation as failed,

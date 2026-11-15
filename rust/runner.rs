@@ -52,9 +52,12 @@ pub const UPGRADE_HOST_BUDGET_MS: u64 = 300_000;
 
 /// `release` is the one this runner may download (an upgrade's frozen
 /// selection). Its candidate is then fetched with the installer's downloader
-/// (its roots, proxy settings and minimum attempt budget) instead of K's
-/// default one; K still makes a single attempt. A recovery runner downloads
-/// nothing and keeps K's default.
+/// (its roots, proxy settings, stall timeout and minimum attempt budget)
+/// instead of K's default one; K still makes a single attempt, with K's
+/// size-based budget (~14 minutes for the Computer's ~53 MB gzip), which a
+/// stall ends after `artifact::STALL_TIMEOUT`. The download is not inside the
+/// host budget (that bounds the preparation after it). A recovery runner
+/// downloads nothing and keeps K's default.
 pub fn create(
     cfg: Config,
     source: Arc<dyn ReleaseSource>,
@@ -139,16 +142,36 @@ mod tests {
             PhaseLog::default(),
         )
         .unwrap();
-        let expected = crate::artifact::release_downloader(&candidate)
-            .unwrap()
-            .policy
-            .budgets(size)
-            .unwrap();
         let budgets = runner.downloader.policy.budgets(size).unwrap();
-        assert_eq!(budgets.overall_ms, expected.overall_ms);
+        let stall = crate::artifact::STALL_TIMEOUT.as_millis() as u64;
         assert!(budgets.overall_ms >= 120_000, "{budgets:?}");
+        assert_eq!(budgets.idle_ms, stall, "{budgets:?}");
         // K's default would give this transfer well under a minute.
         assert!(TransferPolicy::default().budgets(size).unwrap().overall_ms < 60_000);
+        // A large candidate keeps K's size-based budget, unshortened: the
+        // ~53 MB gzip gets ~14 minutes (53e6 B / 64 KiB/s + 30 s), so a link
+        // that finishes it in 10-14 minutes still succeeds.
+        let gzip = 53_000_000;
+        let (_large_dir, large_cfg) = self::cfg();
+        let large = create(
+            large_cfg,
+            Arc::new(crate::source::FrozenSource(crate::source::Manifest {
+                version: candidate.version.clone(),
+                release: release(gzip),
+                sidecar: None,
+            })),
+            false,
+            Some(&release(gzip)),
+            PhaseLog::default(),
+        )
+        .unwrap();
+        let budgets = large.downloader.policy.budgets(gzip).unwrap();
+        assert_eq!(
+            budgets.overall_ms,
+            TransferPolicy::default().budgets(gzip).unwrap().overall_ms
+        );
+        assert_eq!(budgets.overall_ms, 838_716, "{budgets:?}");
+        assert_eq!(budgets.idle_ms, stall, "{budgets:?}");
         // A recovery runner downloads nothing and keeps K's default.
         let recovery = create(
             cfg,
@@ -200,6 +223,58 @@ mod tests {
         assert!(
             crate::supervisor::FIRST_ATTEMPT_BUDGET
                 >= std::time::Duration::from_millis(UPGRADE_HOST_BUDGET_MS) * 3,
+        );
+        assert!(
+            crate::supervisor::FIRST_ATTEMPT_BUDGET + crate::supervisor::RECOVERY_ATTEMPT_BUDGET
+                <= std::time::Duration::from_secs(30 * 60)
+        );
+    }
+
+    /// The first worker's worst case for an upgrade, honestly summed. It
+    /// does NOT fit: every bound below may run to its end, and their sum is
+    /// about 46 minutes against the worker's 20. This was already so before
+    /// the download deadline (the support file then had no bound at all);
+    /// a worker that runs out is followed by recovery workers. Typical runs
+    /// fit: the candidate download is the only long part (up to ~14 minutes
+    /// for the gzip), preparation and the handover take 1-3 minutes.
+    #[test]
+    fn an_upgrade_worst_case_overruns_the_first_worker() {
+        use std::time::Duration;
+        // acquire_sidecar, before K, in the same worker (DOWNLOAD_DEADLINE).
+        let support_file = crate::artifact::DOWNLOAD_DEADLINE;
+        // K's single attempt for the ~53 MB gzip (K's size-based budget).
+        let candidate = Duration::from_millis(
+            crate::artifact::release_downloader(&release(53_000_000))
+                .unwrap()
+                .policy
+                .budgets(53_000_000)
+                .unwrap()
+                .overall_ms,
+        );
+        let preparation = Duration::from_millis(UPGRADE_HOST_BUDGET_MS);
+        // k-carrier engine.rs upgrade: probe, quiesce, stop, start, probe and
+        // resume are CommandHost calls of up to 120 s each; the readback is
+        // bounded by the host budget.
+        let handover = Duration::from_secs(6 * 120) + preparation;
+        let worst = support_file + candidate + preparation + handover;
+        assert_eq!(worst.as_secs(), 600 + 838 + 300 + 1020);
+        assert!(worst > crate::supervisor::FIRST_ATTEMPT_BUDGET, "{worst:?}");
+        // Without the support file and the handover's worst case, the
+        // candidate and its preparation alone fit.
+        assert!(candidate + preparation <= crate::supervisor::FIRST_ATTEMPT_BUDGET);
+    }
+
+    /// A fresh install's or repair's downloads share one deadline; with the
+    /// candidate check and the check of the published program they leave
+    /// 350 s of the first worker for the stop, the swap and the start
+    /// (whose own bounds this does not model).
+    #[test]
+    fn an_install_s_downloads_and_checks_fit_the_first_worker() {
+        let check = crate::computer::FIRST_RUN_BUDGET + std::time::Duration::from_secs(5);
+        let used = crate::artifact::DOWNLOAD_DEADLINE + check * 2;
+        assert_eq!(
+            (crate::supervisor::FIRST_ATTEMPT_BUDGET - used).as_secs(),
+            350
         );
     }
 
