@@ -798,7 +798,7 @@ pub const CANDIDATE_CHECK_FAILED: &str = "CANDIDATE_CHECK_FAILED";
 /// The first execution of a just-written candidate: `--version` must name
 /// the selected version within `computer::FIRST_RUN_BUDGET`. Timed as the
 /// `candidate_check` phase.
-async fn self_check(
+pub(crate) async fn self_check(
     path: &Path,
     cfg: &Config,
     expected: &str,

@@ -330,7 +330,8 @@ fn settle_terminal_metadata(cfg: &Config, receipt: &report::Receipt) {
     let _ = settle();
 }
 
-async fn settle_k(cfg: &Config) -> Result<()> {
+/// Whether K's recovery ran (it may have changed the installation).
+async fn settle_k(cfg: &Config) -> Result<bool> {
     // A settled K receipt must not restart a service the user later stopped.
     if let OperationRead::Observed { operation } = FileStore::new(&cfg.k_state).read_operation()
         && operation.outcome.is_none()
@@ -344,8 +345,9 @@ async fn settle_k(cfg: &Config) -> Result<()> {
         )?
         .recover(None)
         .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn cached_artifact(cfg: &Config, plan: &Plan) -> Result<PathBuf> {
@@ -387,6 +389,11 @@ fn recovery_hint_copy(previous_version: Option<&str>, running: Option<bool>) -> 
             "Raft Computer's current status couldn't be confirmed.".into(),
         ),
     }
+}
+
+/// The published program's `--version`: a new file, so a first run.
+pub(crate) async fn published_report(cfg: &Config) -> Result<k_carrier::state::Evidence> {
+    computer::first_run_report(&cfg.binary, cfg).await
 }
 
 /// The line and reason of a candidate that failed its first check, before
@@ -1047,7 +1054,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         let started = Instant::now();
         // The published program is a new file too: its first run gets the
         // same allowance as the candidate's.
-        let report = computer::first_run_report(&cfg.binary, cfg).await;
+        let report = published_report(cfg).await;
         report::add_phase(&mut plan.detail, "verify", started.elapsed());
         if report?.version != plan.manifest.version {
             return Err(Error::Uncertain(
@@ -1325,21 +1332,44 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
     }
 }
 
+/// An earlier installation's state as a refusal finds it.
+#[derive(Clone, Copy)]
+struct Earlier {
+    unresolved: bool,
+    /// This request already ran recovery: resumed the earlier operation, ran
+    /// K's recovery, or is the supervisor's next worker after a failed one
+    /// (its settlement record exists).
+    recovery_attempted: bool,
+}
+
+impl Earlier {
+    /// Refused before an operation of its own started. Only when this request
+    /// has changed nothing is an earlier unresolved installation
+    /// `earlier_recovery_pending`; after its own recovery attempt the result
+    /// stays unresolved (exit 3), so the supervisor's next worker still
+    /// enters the repair decision.
+    fn settle(self, result: &mut Receipt) {
+        if self.recovery_attempted {
+            result.preserve_unresolved(self.unresolved);
+        } else {
+            result.refuse_for_earlier_recovery(self.unresolved);
+        }
+    }
+}
+
 fn reject(
     cfg: &Config,
     request: &Request,
     target: Option<String>,
     from: Option<String>,
-    unresolved: bool,
+    earlier: Earlier,
     failure: (FailureCode, String),
     line: &str,
 ) -> Result<Reply> {
     let mut result = receipt(request, target, from, Outcome::Held, line.into());
     result.code = Some(failure.0);
     result.reason = Some(failure.1);
-    // Refused before an operation of its own started: an earlier unresolved
-    // installation makes this `earlier_recovery_pending`, not unresolved.
-    result.refuse_for_earlier_recovery(unresolved);
+    earlier.settle(&mut result);
     Ok(Reply::receipt(result.finish(cfg)?))
 }
 
@@ -1408,6 +1438,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
     }
     let settlement = directory(cfg, &request.id).join("settlement-failed.json");
     let deferred = exists(&settlement)?;
+    let mut recovery_attempted = deferred;
     let mut unresolved = exists(&damage_path(cfg))?;
     let previous = match active(cfg) {
         Ok(previous) => previous,
@@ -1438,6 +1469,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 "This request ID already belongs to a different operation.",
             ));
         }
+        recovery_attempted = true;
         let resumed = resume(cfg, &mut previous, true).await;
         if matches!(&resumed, Err(Error::Locked(_))) {
             return resumed;
@@ -1486,26 +1518,31 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             }
         }
         unresolved = true;
-    } else if let Err(error) = settle_k(cfg).await {
-        if let Error::Locked(_) = error {
-            return Ok(Reply::failure(
-                &request.id,
-                2,
-                "Another upgrade is running on this machine.",
-                FailureCode::OperationBusy,
-                "Another upgrade is running on this machine.",
-            ));
-        }
-        unresolved = true;
-        write_json(&settlement, request)?;
-        if error.is_uncertain() {
-            return Ok(Reply::failure(
-                &request.id,
-                3,
-                "An earlier upgrade could not be recovered yet. Run the same install command again.",
-                FailureCode::RecoveryUnresolved,
-                "An earlier upgrade could not be recovered yet.",
-            ));
+        recovery_attempted = true;
+    } else {
+        let settled = settle_k(cfg).await;
+        recovery_attempted |= !matches!(settled, Ok(false));
+        if let Err(error) = settled {
+            if let Error::Locked(_) = error {
+                return Ok(Reply::failure(
+                    &request.id,
+                    2,
+                    "Another upgrade is running on this machine.",
+                    FailureCode::OperationBusy,
+                    "Another upgrade is running on this machine.",
+                ));
+            }
+            unresolved = true;
+            write_json(&settlement, request)?;
+            if error.is_uncertain() {
+                return Ok(Reply::failure(
+                    &request.id,
+                    3,
+                    "An earlier upgrade could not be recovered yet. Run the same install command again.",
+                    FailureCode::RecoveryUnresolved,
+                    "An earlier upgrade could not be recovered yet.",
+                ));
+            }
         }
     }
     let observed = world::read(cfg).await?;
@@ -1564,7 +1601,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             request,
             request.version.clone(),
             None,
-            unresolved,
+            Earlier {
+                unresolved,
+                recovery_attempted,
+            },
             (FailureCode::InstallationHeld, reason.clone()),
             &line,
         );
@@ -1576,7 +1616,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             request,
             request.version.clone(),
             observed.version().map(str::to_owned),
-            false,
+            Earlier {
+                unresolved: false,
+                recovery_attempted,
+            },
             (
                 FailureCode::RepairNotNeeded,
                 "This installation does not need repair.".into(),
@@ -1640,7 +1683,11 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 None => error.to_string(),
             };
             result.detail.insert("diagnostic".into(), diagnostic);
-            result.refuse_for_earlier_recovery(unresolved);
+            Earlier {
+                unresolved,
+                recovery_attempted,
+            }
+            .settle(&mut result);
             return Ok(Reply::receipt(result.finish(cfg)?));
         }
     };
@@ -1655,7 +1702,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             request,
             Some(manifest.version),
             from,
-            unresolved,
+            Earlier {
+                unresolved,
+                recovery_attempted,
+            },
             (
                 FailureCode::DowngradeNotAllowed,
                 "The selected version is older than the installed version.".into(),
@@ -1681,7 +1731,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 request,
                 Some(manifest.version),
                 from,
-                unresolved,
+                Earlier {
+                    unresolved,
+                    recovery_attempted,
+                },
                 (
                     FailureCode::InstallationDeclined,
                     "The installation was declined.".into(),
@@ -1802,6 +1855,85 @@ mod candidate_check_copy_tests {
             reply.validate("request").unwrap();
             assert_eq!(reply.exit_code, 1);
             assert_eq!(reply.code, Some(code));
+        }
+    }
+}
+
+#[cfg(test)]
+mod earlier_tests {
+    use super::*;
+
+    fn refused() -> Receipt {
+        let request = Request {
+            protocol_version: 1,
+            id: "request".into(),
+            command: "upgrade".into(),
+            version: Some("9.9.9".into()),
+            channel: None,
+            yes: true,
+            allow_downgrade: false,
+            presence: Presence::Unattended,
+            approved_by: "remote:request".into(),
+            recovery_only: false,
+            waiting_caller: None,
+            escape_failure: None,
+        };
+        let mut result = receipt(
+            &request,
+            Some("9.9.9".into()),
+            None,
+            Outcome::Failed,
+            "Could not resolve the requested release.".into(),
+        );
+        result.code = Some(FailureCode::ReleaseResolutionFailed);
+        result.reason = Some("The requested Raft Computer release could not be resolved.".into());
+        result
+    }
+
+    #[test]
+    fn a_request_that_changed_nothing_fails_behind_an_earlier_installation() {
+        let mut result = refused();
+        Earlier {
+            unresolved: true,
+            recovery_attempted: false,
+        }
+        .settle(&mut result);
+        assert_eq!(result.outcome, Outcome::Failed);
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.code, Some(FailureCode::EarlierRecoveryPending));
+    }
+
+    /// After its own recovery attempt (K's recovery ran, an earlier operation
+    /// was resumed, or this is the worker after a failed settlement) a
+    /// refusal stays unresolved: exit 3 lets the supervisor start the next
+    /// worker, which enters the repair decision.
+    #[test]
+    fn a_request_that_attempted_recovery_stays_unresolved() {
+        let mut result = refused();
+        Earlier {
+            unresolved: true,
+            recovery_attempted: true,
+        }
+        .settle(&mut result);
+        assert_eq!(result.outcome, Outcome::Unresolved);
+        assert_eq!(result.exit_code, 3);
+        assert_eq!(result.code, Some(FailureCode::RecoveryUnresolved));
+        assert_eq!(
+            result.detail.get("requestCode").map(String::as_str),
+            Some("release_resolution_failed")
+        );
+    }
+
+    #[test]
+    fn nothing_unresolved_leaves_the_refusal_as_it_is() {
+        for recovery_attempted in [false, true] {
+            let mut result = refused();
+            Earlier {
+                unresolved: false,
+                recovery_attempted,
+            }
+            .settle(&mut result);
+            assert_eq!(result, refused());
         }
     }
 }

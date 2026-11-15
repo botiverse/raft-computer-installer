@@ -1,4 +1,5 @@
 import faulthandler
+import hashlib
 import json
 import os
 import sys
@@ -866,6 +867,30 @@ class InstallerContract(unittest.TestCase):
         machine.json(["status"], expected=3)
         machine.json(["repair", "--version", "1.1.0"])
         self.assertEqual(machine.live()["version"], "1.1.0")
+
+    def test_refusal_after_this_requests_own_recovery_attempt_stays_unresolved(self):
+        # The supervisor's next worker after a failed settlement (its
+        # settlement record exists) has already attempted recovery: a refusal
+        # there stays unresolved (exit 3), so the supervisor keeps going.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.1.0"])
+        before = machine.login_start()
+        (machine.k / "operation.json").write_text("broken")
+        ident = "settlement-retry"
+        operation = machine.state / "operations" / hashlib.sha256(ident.encode()).hexdigest()
+        operation.mkdir(parents=True)
+        (operation / "settlement-failed.json").write_text(json.dumps({
+            "protocolVersion": 1, "id": ident, "command": "upgrade", "version": "9.9.9",
+            "channel": None, "yes": True, "allowDowngrade": False, "presence": "unattended",
+            "approvedBy": "unattended invocation", "recoveryOnly": False,
+        }))
+        result = machine.json(["upgrade", "--version", "9.9.9"], expected=3,
+            extra={"RAFT_COMPUTER_OPERATION_ID": ident})
+        self.assert_failure_contract(result)
+        self.assertEqual(result["code"], "recovery_unresolved")
+        self.assertEqual(result["receipt"]["outcome"], "unresolved")
+        self.assertEqual(result["receipt"]["detail"]["requestCode"], "release_resolution_failed")
+        self.assertEqual(machine.live(), before)
 
     def test_installer_metadata_damage_is_reported_then_cleaned_after_repair(self):
         for damaged in ("active", "plan", "receipt"):
