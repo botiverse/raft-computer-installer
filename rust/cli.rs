@@ -131,7 +131,7 @@ async fn await_escaped_copy(
     cfg: &Config,
     request: &Request,
     json: bool,
-    copy: crate::systemd::Copy,
+    copy: Box<crate::systemd::Copy>,
 ) -> Result<u8> {
     let exited = copy.wait(crate::systemd::COPY_WAIT).await;
     if let Ok(Some(receipt)) = crate::report::read(cfg, &request.id) {
@@ -683,14 +683,14 @@ mod escaped_copy_tests {
     }
 
     /// Stands in for systemd-run --scope, which execs the copy in place.
-    fn copy(script: &str, home: &Path) -> crate::systemd::Copy {
+    fn copy(script: &str, home: &Path) -> Box<crate::systemd::Copy> {
         let capture = tempfile::tempfile_in(home).unwrap();
         let child = tokio::process::Command::new("/bin/sh")
             .args(["-c", script])
             .stderr(capture.try_clone().unwrap())
             .spawn()
             .unwrap();
-        crate::systemd::Copy::new(child, Some(capture))
+        Box::new(crate::systemd::Copy::new(child, Some(capture)))
     }
 
     #[tokio::test]

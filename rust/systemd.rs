@@ -241,7 +241,7 @@ pub async fn systemctl(unit: &ServiceUnit, action: &str) -> Result<()> {
 pub enum Escape {
     /// The copy is running in its own scope and carries the operation; the
     /// copy itself when it can be awaited (systemd-run execs it in place).
-    Running(Option<Copy>),
+    Running(Option<Box<Copy>>),
     /// `systemd-run` (or the copy) exited within the first seconds, with what
     /// it wrote on stderr (sanitized and bounded; empty when not captured).
     Exited(Option<i32>, String),
@@ -265,7 +265,7 @@ impl Copy {
     /// Waits up to `limit` for the copy to exit: its status and stderr
     /// (passed on to this process's own stderr), or None while it still runs
     /// (it is left running).
-    pub async fn wait(mut self, limit: Duration) -> Option<(Option<i32>, String)> {
+    pub async fn wait(mut self: Box<Self>, limit: Duration) -> Option<(Option<i32>, String)> {
         match tokio::time::timeout(limit, self.child.wait()).await {
             Ok(Ok(status)) => Some((status.code(), self.capture.map(replay).unwrap_or_default())),
             Ok(Err(error)) => Some((None, format!("the copy could not be awaited: {error}"))),
@@ -350,7 +350,7 @@ async fn escape_with(user: bool, args: &[String], scratch: &std::path::Path) -> 
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) => Escape::Exited(status.code(), capture.map(replay).unwrap_or_default()),
         Ok(Err(error)) => Escape::Failed(format!("systemd-run could not be awaited: {error}")),
-        Err(_) => Escape::Running(Some(Copy::new(child, capture))),
+        Err(_) => Escape::Running(Some(Box::new(Copy::new(child, capture)))),
     }
 }
 
