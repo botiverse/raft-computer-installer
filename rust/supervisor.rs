@@ -26,14 +26,6 @@ pub const FIRST_ATTEMPT_BUDGET: Duration = Duration::from_secs(1200);
 pub const RECOVERY_ATTEMPT_BUDGET: Duration = Duration::from_secs(360);
 
 fn attempt_budget(attempt: usize) -> Duration {
-    // Verification builds only: the give-up path without waiting 32 minutes.
-    #[cfg(feature = "verification-fixture")]
-    if let Some(ms) = std::env::var("RCI_FIXTURE_ATTEMPT_BUDGET_MS")
-        .ok()
-        .and_then(|ms| ms.parse().ok())
-    {
-        return Duration::from_millis(ms);
-    }
     if attempt == 0 {
         FIRST_ATTEMPT_BUDGET
     } else {
@@ -250,4 +242,66 @@ fn persist_durable_installer(cfg: &Config, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| invalid("invalid durable binary path"))?;
     ensure_dir(parent)?;
     write_durable(&durable, bytes, true)
+}
+
+#[cfg(test)]
+mod give_up_tests {
+    use super::*;
+    use crate::{
+        presence::Presence,
+        report::{self, Outcome},
+    };
+
+    /// Every worker ends without a valid reply (this test binary stands in
+    /// for the worker: it rejects `--operation-worker` and exits, as a worker
+    /// killed at its deadline leaves no reply), so the supervisor gives up.
+    /// The request is a terminal run's, not a web upgrade's: the CLI writes
+    /// nothing for it, so the receipt can only be the supervisor's own.
+    #[tokio::test]
+    async fn a_supervisor_that_gives_up_persists_its_answer_as_the_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let state_home = home.path().join(".raft");
+        let cfg = Config {
+            user_home: home.path().to_path_buf(),
+            k_state: state_home.join("computer/k"),
+            installer_dir: state_home.join("computer/installer"),
+            state_home,
+            install_dir: home.path().join(".local/bin"),
+            binary: home.path().join(".local/bin/raft-computer"),
+            sidecar: home.path().join(".local/bin/photon_rs_bg.wasm"),
+            hands_origin: "https://hands.build".into(),
+            hands_app: "raft-computer-cli".into(),
+            waiting_caller: None,
+        };
+        let request = Request {
+            protocol_version: 1,
+            id: "local-given-up".into(),
+            command: "upgrade".into(),
+            version: Some("1.25.3".into()),
+            channel: None,
+            yes: true,
+            allow_downgrade: false,
+            presence: Presence::Unattended,
+            approved_by: "terminal operator".into(),
+            recovery_only: false,
+            waiting_caller: None,
+            escape_failure: None,
+        };
+        assert!(!crate::settle::from_web(&request));
+        let reply = run(&cfg, &request).await.unwrap();
+        assert_eq!(reply.exit_code, 3);
+        let receipt = report::read(&cfg, "local-given-up").unwrap().unwrap();
+        assert_eq!(reply.receipt.as_ref(), Some(&receipt));
+        assert_eq!(receipt.outcome, Outcome::Unresolved);
+        assert_eq!(receipt.code, Some(FailureCode::RecoveryUnresolved));
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some(crate::settle::UNRESOLVED_REASON)
+        );
+        assert_eq!(
+            receipt.detail.get("requestReason").map(String::as_str),
+            Some("The installation could not be completed or recovered.")
+        );
+        assert_eq!(receipt.target_version.as_deref(), Some("1.25.3"));
+    }
 }

@@ -539,17 +539,6 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(len(list((machine.state / "diagnostics").glob("cli-*.json"))), 1)
         self.assert_untouched(machine, before)
 
-    def test_a_web_upgrade_given_up_on_by_its_supervisor_leaves_a_receipt(self):
-        # Every worker timed out (a fixture-only budget of 1 ms): none wrote a
-        # receipt, so the supervisor's own unresolved answer becomes it.
-        machine = self.web_service()
-        receipt = self.web_upgrade(machine, "given-up-web", env={"RCI_FIXTURE_ATTEMPT_BUDGET_MS": "1"})
-        self.assertEqual(receipt["outcome"], "unresolved")
-        self.assertEqual(receipt["exitCode"], 3)
-        self.assertEqual(receipt["code"], "recovery_unresolved")
-        self.assertEqual(receipt["reason"], "The installation could not be completed or recovered.")
-        self.assertEqual(machine.self_version(), "1.0.0")
-
     def test_a_web_upgrade_refused_while_another_runs_leaves_a_receipt(self):
         machine = self.web_service()
         gate = machine.home / "stop-gate.json"
