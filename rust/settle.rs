@@ -45,6 +45,14 @@ pub const UNRESOLVED_LINE: &str =
 /// stays open until its deadline (a late success can still win) instead of
 /// being failed at once. See report::EARLIER_RECOVERY_PENDING_REASON, which
 /// must not contain it.
+///
+/// Tied to the server's text fallback: botiverse/slock
+/// `packages/server/src/services/computerUpgradeRequestService.ts`
+/// `UNRESOLVED_RECEIPT_TEXTS`, which holds this phrase open only for
+/// Computers that relay the reason and nothing else. Remove this text (and
+/// UNRESOLVED_REASON's use of it) together with that fallback, once the
+/// minimum web-upgradable Computer is 1.25.4 (it relays the receipt's outcome
+/// and code as fields).
 pub const HELD_OPEN_TEXT: &str = "An earlier installation could not be recovered";
 /// The reason of every unresolved receipt written here whose own reason does
 /// not say that already (that one is kept in `detail.requestReason`). The
