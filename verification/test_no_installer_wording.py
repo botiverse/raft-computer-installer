@@ -43,13 +43,17 @@ def allowed(literal):
     return " " not in literal and any(a in literal for a in ALLOWED_SUBSTRINGS)
 
 
+# `#[cfg(test)]`, and `#[cfg(all(test, ...))]` (a test module for one platform).
+TEST_ATTRIBUTE = re.compile(r"#\[cfg\((?:test|all\(test(?:,[^\]]*)?\))\)\]")
+
+
 def production_lines(text):
     """Yield (number, line) outside #[cfg(test)] blocks. A test block starts at
     the attribute and ends when the braces it opens close again, so production
     code after a mid-file test module is still scanned."""
     depth, in_tests, opened = 0, False, False
     for number, line in enumerate(text.splitlines(), 1):
-        if not in_tests and "#[cfg(test)]" in line:
+        if not in_tests and TEST_ATTRIBUTE.search(line):
             in_tests, depth, opened = True, 0, False
             continue
         if in_tests:
@@ -125,6 +129,20 @@ class NoInstallerWording(unittest.TestCase):
         lines = dict(production_lines(text))
         self.assertIn(6, lines)
         self.assertNotIn(4, lines)
+
+    def test_a_platform_test_block_is_not_production(self):
+        text = "\n".join([
+            "#[cfg(all(test, unix))]",
+            "mod tests {",
+            '    #[test] fn t() { assert!("installer".len() > 0); }',
+            "}",
+            "#[cfg(all(feature = \"x\", test))]",
+            'fn b() { let _ = "installer leaked"; }',
+        ])
+        lines = dict(production_lines(text))
+        self.assertNotIn(3, lines)
+        # `test` must come first for the form to count; anything else is scanned.
+        self.assertIn(6, lines)
 
     def test_runtime_checker_rejects_a_reinserted_private_reason(self):
         line = (

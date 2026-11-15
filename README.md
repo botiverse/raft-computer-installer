@@ -136,6 +136,33 @@ under K's lock and only while K's transaction is at rest on the source
 version, and reports the upgrade failed with nothing changed. An operation
 left open at the handover or later stays unresolved for recovery.
 
+Before anything is stopped, a downloaded candidate (and, after a fresh install
+or repair publishes it, the installed copy) must answer `--version` with its
+own version within 120 s. That first run of a new ~150 MB file goes through
+the operating system's scan (macOS Gatekeeper/XProtect, Windows Defender),
+which can take tens of seconds on a busy machine; a binary that has run
+before gets 20 s. For a first run the bound covers starting the process too
+(a start still pending at the deadline is abandoned), and a check whose
+process outlives its kill is reported as timed out instead of waited for.
+Routine commands keep their budget from the moment the process has started. A check that runs out of time fails with `candidate_check_timed_out`, a
+candidate that reports another version or fails to run with
+`candidate_check_failed`; both changed nothing.
+
+A request refused before it starts an operation of its own (held, declined,
+downgrade, release not resolved) while an earlier installation is still
+unresolved, and before it attempted any recovery itself, fails with
+`earlier_recovery_pending`: nothing was changed, the earlier installation's
+records are left for the repair, and the refusal's own code stays in
+`detail.requestCode`. A request that did attempt recovery (resumed the earlier
+operation, ran K's recovery, or is the supervisor's next worker after a failed
+settlement) or started its own repair stays `unresolved`
+(`recovery_unresolved`), so the supervisor and the entry script keep retrying.
+
+Receipts carry `detail.phasesMs`, a JSON object of wall-clock milliseconds per
+phase: `prepare`, `download`, `candidate_check` and `handover` (K's stop,
+replace, start and read-back) for an upgrade; `prepare`, `candidate_check`,
+`stop`, `swap`, `verify` and `start` for an install or repair.
+
 ### Service managers
 
 A service the product runs under a service manager is that manager's to stop

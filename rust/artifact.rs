@@ -624,7 +624,11 @@ pub struct PreparedArtifact {
     pub sidecar_quarantine: Option<PathBuf>,
 }
 
-pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
+pub async fn acquire(
+    cfg: &Config,
+    manifest: &Manifest,
+    phases: &crate::report::PhaseLog,
+) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     let scratch = cfg.scratch();
     ensure_dir(&scratch)?;
@@ -649,10 +653,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
             false,
         )?;
     }
-    let evidence = computer::self_report(&path, cfg).await?;
-    if evidence.version != manifest.version {
-        return Err(invalid("candidate self-report version mismatch"));
-    }
+    self_check(&path, cfg, &manifest.version, phases).await?;
     Ok(PreparedArtifact {
         _directory: directory,
         path,
@@ -664,7 +665,11 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
 /// Repair prepares a complete candidate independently of a damaged sidecar
 /// cache. Only after download and self-check succeed may the old cache move
 /// aside; product data and the installed binary remain untouched here.
-pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
+pub async fn acquire_repair(
+    cfg: &Config,
+    manifest: &Manifest,
+    phases: &crate::report::PhaseLog,
+) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
     let downloader = crate::source::downloader()?;
@@ -695,9 +700,7 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
         }
         None => None,
     };
-    if computer::self_report(&path, cfg).await?.version != manifest.version {
-        return Err(invalid("candidate self-report version mismatch"));
-    }
+    self_check(&path, cfg, &manifest.version, phases).await?;
     let record = SidecarRecord {
         format_version: 1,
         version: manifest.version.clone(),
@@ -759,7 +762,12 @@ pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<Prepare
 }
 
 /// K calls this on its staged incoming binary before it writes handover intent.
-pub async fn check_candidate(cfg: &Config, path: &Path, release: &Release) -> Result<()> {
+pub async fn check_candidate(
+    cfg: &Config,
+    path: &Path,
+    release: &Release,
+    phases: &crate::report::PhaseLog,
+) -> Result<()> {
     let bytes = fs::read(path)?;
     check_platform(&bytes)?;
     // Keep product sidecars out of K's incoming/slot layout. Execute an exact
@@ -778,10 +786,63 @@ pub async fn check_candidate(cfg: &Config, path: &Path, release: &Release) -> Re
             false,
         )?;
     }
-    if computer::self_report(&candidate, cfg).await?.version != release.version {
-        return Err(invalid("candidate self-report version mismatch"));
+    self_check(&candidate, cfg, &release.version, phases).await
+}
+
+/// Error prefixes of a candidate that failed its first check, kept in the
+/// receipt's diagnostic (K records an upgrade's candidate error as text) and
+/// read back by `candidate_check_failure`.
+pub const CANDIDATE_CHECK_TIMED_OUT: &str = "CANDIDATE_CHECK_TIMED_OUT";
+pub const CANDIDATE_CHECK_FAILED: &str = "CANDIDATE_CHECK_FAILED";
+
+/// The first execution of a just-written candidate: `--version` must name
+/// the selected version within `computer::FIRST_RUN_BUDGET`. Timed as the
+/// `candidate_check` phase.
+pub(crate) async fn self_check(
+    path: &Path,
+    cfg: &Config,
+    expected: &str,
+    phases: &crate::report::PhaseLog,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let report = computer::first_run_report(path, cfg).await;
+    phases.add("candidate_check", started.elapsed());
+    candidate_check_result(report, expected)
+}
+
+/// A candidate's `--version` result, in the words `candidate_check_failure`
+/// reads back.
+fn candidate_check_result(
+    report: Result<k_carrier::state::Evidence>,
+    expected: &str,
+) -> Result<()> {
+    match report {
+        Ok(evidence) if evidence.version == expected => Ok(()),
+        Ok(evidence) => Err(invalid(format!(
+            "{CANDIDATE_CHECK_FAILED}: candidate self-report version mismatch: it reported {} instead of {expected}",
+            evidence.version
+        ))),
+        Err(error) if computer::timed_out(&error) => {
+            Err(invalid(format!("{CANDIDATE_CHECK_TIMED_OUT}: {error}")))
+        }
+        Err(crate::Error::Invalid(message)) => {
+            Err(invalid(format!("{CANDIDATE_CHECK_FAILED}: {message}")))
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+/// The receipt code of a candidate check failure named in `message` (an
+/// error's text, or a diagnostic that carries it), if it is one.
+pub fn candidate_check_failure(message: &str) -> Option<crate::report::FailureCode> {
+    use crate::report::FailureCode;
+    if message.contains(CANDIDATE_CHECK_TIMED_OUT) {
+        Some(FailureCode::CandidateCheckTimedOut)
+    } else if message.contains(CANDIDATE_CHECK_FAILED) {
+        Some(FailureCode::CandidateCheckFailed)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1258,5 +1319,80 @@ mod retry_tests {
                 .overall_ms,
             policy.budgets(large).unwrap().overall_ms
         );
+    }
+}
+
+#[cfg(test)]
+mod candidate_check_tests {
+    use super::*;
+    use crate::report::FailureCode;
+    use k_carrier::state::Evidence;
+
+    fn evidence(version: &str) -> Result<Evidence> {
+        Ok(Evidence {
+            version: version.into(),
+            pid: 42,
+            start_id: "cold-42".into(),
+        })
+    }
+
+    fn code(result: Result<()>) -> Option<FailureCode> {
+        candidate_check_failure(&result.unwrap_err().to_string())
+    }
+
+    #[test]
+    fn a_candidate_that_reports_the_selected_version_passes() {
+        candidate_check_result(evidence("1.25.3"), "1.25.3").unwrap();
+    }
+
+    #[test]
+    fn a_candidate_check_names_why_it_failed() {
+        let timed_out = invalid(format!("{} after 120 s", computer::COMMAND_TIMED_OUT));
+        assert_eq!(
+            code(candidate_check_result(Err(timed_out), "1.25.3")),
+            Some(FailureCode::CandidateCheckTimedOut)
+        );
+        let lingering = invalid(format!(
+            "{} after 120 s; it had not exited 5 s after it was killed",
+            computer::COMMAND_TIMED_OUT
+        ));
+        assert_eq!(
+            code(candidate_check_result(Err(lingering), "1.25.3")),
+            Some(FailureCode::CandidateCheckTimedOut)
+        );
+        let mismatch = candidate_check_result(evidence("1.25.2"), "1.25.3");
+        assert_eq!(
+            mismatch.as_ref().unwrap_err().to_string(),
+            "CANDIDATE_CHECK_FAILED: candidate self-report version mismatch: it reported 1.25.2 instead of 1.25.3"
+        );
+        assert_eq!(code(mismatch), Some(FailureCode::CandidateCheckFailed));
+        assert_eq!(
+            code(candidate_check_result(
+                Err(invalid("product self-report failed")),
+                "1.25.3"
+            )),
+            Some(FailureCode::CandidateCheckFailed)
+        );
+        // Not the candidate's answer (a local I/O error): no candidate code.
+        let io = std::io::Error::other("disk full");
+        assert_eq!(code(candidate_check_result(Err(io.into()), "1.25.3")), None);
+    }
+
+    /// K keeps the hook's error as the operation reason; the installer reads
+    /// it back from `detail.diagnostic`, also after an unresolved run
+    /// prefixed it.
+    #[test]
+    fn the_code_survives_the_diagnostic_text() {
+        assert_eq!(
+            candidate_check_failure(
+                "upgrade still requires recovery: CANDIDATE_CHECK_TIMED_OUT: product command timed out after 120 s"
+            ),
+            Some(FailureCode::CandidateCheckTimedOut)
+        );
+        assert_eq!(
+            candidate_check_failure("CANDIDATE_PREPARATION_TIMEOUT"),
+            None
+        );
+        assert_eq!(candidate_check_failure("artifact download timed out"), None);
     }
 }

@@ -1,4 +1,5 @@
 import faulthandler
+import hashlib
 import json
 import os
 import sys
@@ -17,7 +18,8 @@ from harness import DIST, SUFFIX, TARGET, WINDOWS, Machine, ReleaseServer, excha
 from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
-    "caller_not_computer", "candidate_start_failed", "downgrade_not_allowed",
+    "caller_not_computer", "candidate_check_failed", "candidate_check_timed_out",
+    "candidate_start_failed", "downgrade_not_allowed", "earlier_recovery_pending",
     "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
@@ -621,8 +623,13 @@ class InstallerContract(unittest.TestCase):
         failed = machine.json(["upgrade", "--version", "1.3.0"], expected=1)
         self.assertEqual(failed["receipt"]["outcome"], "failed")
         self.assert_failure_contract(failed)
-        self.assertEqual(failed["code"], "install_failed")
+        # 1.3.0 reports 9.9.9: its first check failed, before anything changed.
+        self.assertEqual(failed["code"], "candidate_check_failed")
         self.assertIn("diagnostic", failed["receipt"]["detail"])
+        phases = json.loads(failed["receipt"]["detail"]["phasesMs"])
+        self.assertIn("candidate_check", phases)
+        self.assertNotIn("handover", phases)
+        self.assertTrue(all(isinstance(ms, int) and ms >= 0 for ms in phases.values()), phases)
         line = failed["line"]
         self.assertIn("Run the same install command again", line)
         self.assertNotIn("installer", line.lower())
@@ -836,6 +843,54 @@ class InstallerContract(unittest.TestCase):
         self.server.wrong_hash.clear()
         machine.json(["repair", "--version", "1.1.0"])
         self.assertEqual(machine.live()["version"], "1.1.0")
+
+    def test_refusal_behind_an_unresolved_installation_fails_with_its_own_code(self):
+        # A request that stops before it starts anything (here its release
+        # cannot be resolved) while an earlier installation is unresolved:
+        # it changed nothing, so it fails with earlier_recovery_pending
+        # instead of reading as unresolved itself.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.1.0"])
+        before = machine.login_start()
+        old_binary = machine.binary.read_bytes()
+        (machine.k / "operation.json").write_text("broken")
+        refused = machine.json(["upgrade", "--version", "9.9.9"], expected=1)
+        self.assert_failure_contract(refused)
+        self.assertEqual(refused["code"], "earlier_recovery_pending")
+        self.assertEqual(refused["receipt"]["outcome"], "failed")
+        self.assertEqual(refused["receipt"]["detail"]["requestCode"], "release_resolution_failed")
+        self.assertIn("returned HTTP 404", refused["line"])
+        self.assertNotIn("An earlier installation could not be recovered", refused["reason"])
+        self.assertEqual(machine.binary.read_bytes(), old_binary)
+        self.assertEqual(machine.live(), before)
+        # The earlier installation still needs its repair, which still works.
+        machine.json(["status"], expected=3)
+        machine.json(["repair", "--version", "1.1.0"])
+        self.assertEqual(machine.live()["version"], "1.1.0")
+
+    def test_refusal_after_this_requests_own_recovery_attempt_stays_unresolved(self):
+        # The supervisor's next worker after a failed settlement (its
+        # settlement record exists) has already attempted recovery: a refusal
+        # there stays unresolved (exit 3), so the supervisor keeps going.
+        machine = self.machine()
+        machine.json(["install", "--version", "1.1.0"])
+        before = machine.login_start()
+        (machine.k / "operation.json").write_text("broken")
+        ident = "settlement-retry"
+        operation = machine.state / "operations" / hashlib.sha256(ident.encode()).hexdigest()
+        operation.mkdir(parents=True)
+        (operation / "settlement-failed.json").write_text(json.dumps({
+            "protocolVersion": 1, "id": ident, "command": "upgrade", "version": "9.9.9",
+            "channel": None, "yes": True, "allowDowngrade": False, "presence": "unattended",
+            "approvedBy": "unattended invocation", "recoveryOnly": False,
+        }))
+        result = machine.json(["upgrade", "--version", "9.9.9"], expected=3,
+            extra={"RAFT_COMPUTER_OPERATION_ID": ident})
+        self.assert_failure_contract(result)
+        self.assertEqual(result["code"], "recovery_unresolved")
+        self.assertEqual(result["receipt"]["outcome"], "unresolved")
+        self.assertEqual(result["receipt"]["detail"]["requestCode"], "release_resolution_failed")
+        self.assertEqual(machine.live(), before)
 
     def test_installer_metadata_damage_is_reported_then_cleaned_after_repair(self):
         for damaged in ("active", "plan", "receipt"):

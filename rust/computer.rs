@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, ffi::OsString, fs, path::Path, process::Stdio, 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -161,12 +161,75 @@ async fn bounded_read(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Vec
     }
 }
 
+/// The error text of a product command that did not finish within its
+/// budget, at the start of every such error (see `timed_out`).
+pub const COMMAND_TIMED_OUT: &str = "product command timed out";
+
+/// How long a killed command may take to be observed exiting.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// A `--version` check of a binary that has run on this machine before.
+pub const SELF_REPORT_BUDGET: Duration = Duration::from_secs(20);
+
+/// A `--version` check of a file this run has just written: the first
+/// execution of a new ~150 MB executable goes through the operating system's
+/// malware and signature assessment (macOS Gatekeeper/XProtect, Windows
+/// Defender), which on a busy machine took longer than 20 s. Callers must
+/// leave room for it in any enclosing deadline (runner.rs, supervisor.rs).
+pub const FIRST_RUN_BUDGET: Duration = Duration::from_secs(120);
+
+/// How a product command is bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// A routine command (status, start, stop, `--version` of a binary that
+    /// has run here before): the budget starts once the process has started,
+    /// as it always has, and a command that outlives its kill may still act
+    /// on the installation, so that result is uncertain.
+    Routine,
+    /// The first run of a file this run has just written, in a temporary
+    /// home. Starting it counts against the budget: a first exec can wait in
+    /// the kernel for the operating system's scan, and a start that blocked
+    /// this task would also block every deadline above it, so a start still
+    /// pending at the deadline is abandoned. Every way it runs out of time
+    /// is a timeout (`timed_out`), never an uncertain result: it has no
+    /// installation of its own to change.
+    FirstRun,
+}
+
+pub fn timed_out(error: &Error) -> bool {
+    matches!(error, Error::Invalid(message) if message.starts_with(COMMAND_TIMED_OUT))
+}
+
 pub async fn run(
     binary: &Path,
     args: &[&str],
     environment: &BTreeMap<OsString, OsString>,
     budget: Duration,
 ) -> Result<CommandResult> {
+    run_bounded(binary, args, environment, budget, Policy::Routine).await
+}
+
+pub async fn run_bounded(
+    binary: &Path,
+    args: &[&str],
+    environment: &BTreeMap<OsString, OsString>,
+    budget: Duration,
+    policy: Policy,
+) -> Result<CommandResult> {
+    run_with(
+        command(binary, args, environment),
+        Bounds {
+            budget,
+            policy,
+            kill_wait: KILL_WAIT,
+            kill: true,
+        },
+        |mut command| command.spawn(),
+    )
+    .await
+}
+
+fn command(binary: &Path, args: &[&str], environment: &BTreeMap<OsString, OsString>) -> Command {
     let mut command = Command::new(binary);
     command
         .args(args)
@@ -181,9 +244,44 @@ pub async fn run(
     }
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW; setup uses the retained console instead.
-    let mut child = command
-        .spawn()
-        .map_err(|_| invalid("product command could not start"))?;
+    command
+}
+
+struct Bounds {
+    budget: Duration,
+    policy: Policy,
+    kill_wait: Duration,
+    /// Always true outside tests, which use false to reach the branch of a
+    /// process that does not exit after its kill.
+    kill: bool,
+}
+
+async fn run_with(
+    command: Command,
+    bounds: Bounds,
+    spawn: impl FnOnce(Command) -> std::io::Result<tokio::process::Child> + Send + 'static,
+) -> Result<CommandResult> {
+    let budget = bounds.budget.as_secs();
+    let timeout_error =
+        |detail: &str| invalid(format!("{COMMAND_TIMED_OUT} after {budget} s{detail}"));
+    let (mut child, deadline) = match bounds.policy {
+        Policy::Routine => {
+            let child = spawn(command).map_err(|_| invalid("product command could not start"))?;
+            (child, Instant::now() + bounds.budget)
+        }
+        Policy::FirstRun => {
+            let deadline = Instant::now() + bounds.budget;
+            // Abandoned at the deadline: if the start completes later, its
+            // child is dropped with the task's output and killed
+            // (`kill_on_drop`) before it can run for long.
+            let spawned = tokio::task::spawn_blocking(move || spawn(command));
+            match timeout_at(deadline, spawned).await {
+                Ok(Ok(Ok(child))) => (child, deadline),
+                Ok(_) => return Err(invalid("product command could not start")),
+                Err(_) => return Err(timeout_error("; its start had not returned")),
+            }
+        }
+    };
     let pid = child
         .id()
         .ok_or_else(|| invalid("product command has no process identity"))?;
@@ -195,53 +293,81 @@ pub async fn run(
         .stderr
         .take()
         .ok_or_else(|| invalid("product stderr unavailable"))?;
-    let result = timeout(budget, async {
+    let result = timeout_at(deadline, async {
         tokio::try_join!(child.wait(), bounded_read(stdout), bounded_read(stderr))
     })
     .await;
-    match result {
-        Ok(Ok((status, stdout, stderr))) => Ok(CommandResult {
-            success: status.success(),
-            stdout,
-            stderr,
-            exit_code: status.code(),
-            pid,
-        }),
-        failure => {
-            // Wait for the bounded controller process before returning. The K
-            // host fence also accounts for controllers after a worker crash.
-            let _ = child.start_kill();
-            if !matches!(
-                timeout(Duration::from_secs(5), child.wait()).await,
-                Ok(Ok(_))
-            ) {
-                return Err(crate::Error::Uncertain(
-                    "product command could not be reaped".into(),
-                ));
-            }
-            Err(invalid(if failure.is_err() {
-                "product command timed out"
+    let failure = match result {
+        Ok(Ok((status, stdout, stderr))) => {
+            return Ok(CommandResult {
+                success: status.success(),
+                stdout,
+                stderr,
+                exit_code: status.code(),
+                pid,
+            });
+        }
+        Ok(Err(_)) => "product command output could not be read",
+        Err(_) => COMMAND_TIMED_OUT,
+    };
+    // Wait, bounded, for the killed process before returning. The K host
+    // fence also accounts for controllers after a worker crash.
+    if bounds.kill {
+        let _ = child.start_kill();
+    }
+    let exited = matches!(timeout(bounds.kill_wait, child.wait()).await, Ok(Ok(_)));
+    let timed_out = failure == COMMAND_TIMED_OUT;
+    match (exited, bounds.policy) {
+        (true, _) if timed_out => Err(timeout_error("")),
+        (true, _) => Err(invalid(failure)),
+        (false, Policy::Routine) => Err(Error::Uncertain(
+            "product command could not be reaped".into(),
+        )),
+        // A first run never turns uncertain. Its process is left to its kill
+        // (on Windows its temporary home cannot be removed while it runs;
+        // the directory is left behind, best effort).
+        (false, Policy::FirstRun) => {
+            let lingering = format!(
+                "; it had not exited {} s after it was killed",
+                bounds.kill_wait.as_secs()
+            );
+            Err(if timed_out {
+                timeout_error(&lingering)
             } else {
-                "product command output could not be read"
-            }))
+                invalid(format!("{failure}{lingering}"))
+            })
         }
     }
 }
 
+/// `--version` of a binary that has run here before, in a temporary home.
 pub async fn self_report(binary: &Path, cfg: &Config) -> Result<Evidence> {
+    report_version(binary, cfg, SELF_REPORT_BUDGET, Policy::Routine).await
+}
+
+/// `--version` of a file this run has just written: a downloaded candidate
+/// before anything is stopped, or the program a fresh install or repair has
+/// just published (FIRST_RUN_BUDGET, Policy::FirstRun). In its temporary
+/// home it has nothing to change, so a run that outlives its budget and then
+/// its kill is a timeout, not an uncertain effect; what the caller had
+/// already changed before the check is the caller's to report.
+pub async fn first_run_report(binary: &Path, cfg: &Config) -> Result<Evidence> {
+    report_version(binary, cfg, FIRST_RUN_BUDGET, Policy::FirstRun).await
+}
+
+async fn report_version(
+    binary: &Path,
+    cfg: &Config,
+    budget: Duration,
+    policy: Policy,
+) -> Result<Evidence> {
     let home = tempfile::Builder::new()
         .prefix("raft-installer-probe-")
         .tempdir()?;
     let mut environment = cfg.environment();
     environment.insert("RAFT_HOME".into(), home.path().as_os_str().to_owned());
     environment.insert("SLOCK_HOME".into(), home.path().as_os_str().to_owned());
-    let result = run(
-        binary,
-        &["--version"],
-        &environment,
-        Duration::from_secs(20),
-    )
-    .await?;
+    let result = run_bounded(binary, &["--version"], &environment, budget, policy).await?;
     if !result.success {
         return Err(invalid("product self-report failed"));
     }
@@ -687,5 +813,208 @@ mod installer_lifecycle_env_tests {
                 .contains_key(std::ffi::OsStr::new(INSTALLER_LIFECYCLE_ENV)),
             "only the product helper carries it"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_run_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    pub(crate) fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("product");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn bounds(budget: Duration, policy: Policy) -> Bounds {
+        Bounds {
+            budget,
+            policy,
+            kill_wait: KILL_WAIT,
+            kill: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_past_its_budget_is_killed_and_reported_as_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "sleep 30");
+        for policy in [Policy::Routine, Policy::FirstRun] {
+            let started = std::time::Instant::now();
+            let error = run_bounded(
+                &product,
+                &["--version"],
+                &BTreeMap::new(),
+                Duration::from_millis(300),
+                policy,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(timed_out(&error), "{error}");
+            assert!(!error.is_uncertain());
+            // Killed, not waited out.
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_within_its_budget_reports_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "echo 1.25.3");
+        let result = run_bounded(
+            &product,
+            &["--version"],
+            &BTreeMap::new(),
+            Duration::from_secs(20),
+            Policy::FirstRun,
+        )
+        .await
+        .unwrap();
+        assert!(result.success);
+        assert_eq!(result.stdout, b"1.25.3\n");
+    }
+
+    /// A first run's start that does not return (an exec waiting for the
+    /// operating system's scan) is abandoned at the deadline.
+    #[tokio::test]
+    async fn a_first_run_start_that_does_not_return_is_abandoned_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "echo 1.25.3");
+        let started = std::time::Instant::now();
+        let error = run_with(
+            command(&product, &["--version"], &BTreeMap::new()),
+            bounds(Duration::from_millis(300), Policy::FirstRun),
+            |mut command| {
+                std::thread::sleep(Duration::from_secs(3));
+                command.spawn()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(timed_out(&error), "{error}");
+        assert!(
+            error.to_string().ends_with("its start had not returned"),
+            "{error}"
+        );
+    }
+
+    /// A routine command's start is outside its budget, as before: a slow
+    /// start (a rescan of the installed binary) still lets it answer.
+    #[tokio::test]
+    async fn a_routine_start_does_not_count_against_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "echo 1.25.3");
+        let result = run_with(
+            command(&product, &["--version"], &BTreeMap::new()),
+            bounds(Duration::from_millis(500), Policy::Routine),
+            |mut command| {
+                std::thread::sleep(Duration::from_secs(1));
+                command.spawn()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout, b"1.25.3\n");
+    }
+
+    /// A process still alive after its kill: a first run reports the
+    /// timeout and says so; a routine command stays uncertain.
+    #[tokio::test]
+    async fn a_process_that_outlives_its_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "sleep 30");
+        for policy in [Policy::FirstRun, Policy::Routine] {
+            let error = run_with(
+                command(&product, &["--version"], &BTreeMap::new()),
+                Bounds {
+                    budget: Duration::from_millis(200),
+                    policy,
+                    kill_wait: Duration::from_millis(200),
+                    // Not killed here, so it is still running at the wait.
+                    kill: false,
+                },
+                |mut command| command.spawn(),
+            )
+            .await
+            .err()
+            .unwrap();
+            match policy {
+                Policy::FirstRun => {
+                    assert!(timed_out(&error), "{error}");
+                    assert!(error.to_string().contains("it had not exited"), "{error}");
+                }
+                Policy::Routine => assert!(error.is_uncertain(), "{error}"),
+            }
+        }
+    }
+
+    /// A first run whose output cannot be read and which outlives its kill
+    /// is not uncertain either.
+    #[tokio::test]
+    async fn a_first_run_with_unreadable_output_never_turns_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        // More than the 1 MiB output limit, then stay alive.
+        let product = script(dir.path(), "head -c 2000000 /dev/zero; sleep 30");
+        let error = run_with(
+            command(&product, &["--version"], &BTreeMap::new()),
+            Bounds {
+                budget: Duration::from_secs(20),
+                policy: Policy::FirstRun,
+                kill_wait: Duration::from_millis(200),
+                kill: false,
+            },
+            |mut command| command.spawn(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(!error.is_uncertain(), "{error}");
+        assert!(
+            error.to_string().contains("output could not be read"),
+            "{error}"
+        );
+    }
+
+    /// The first-run budget is what the checks use: a binary that takes 21 s
+    /// to answer fails the routine check and passes the first-run one, the
+    /// candidate check and the check of a published program.
+    #[tokio::test]
+    async fn first_run_checks_wait_past_the_routine_budget() {
+        assert_eq!(SELF_REPORT_BUDGET, Duration::from_secs(20));
+        assert_eq!(FIRST_RUN_BUDGET, Duration::from_secs(120));
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "sleep 21; echo 1.25.3");
+        let mut cfg = Config::load().unwrap();
+        cfg.binary = product.clone();
+        let phases = crate::report::PhaseLog::default();
+        let (routine, first, candidate, published) = tokio::join!(
+            self_report(&product, &cfg),
+            first_run_report(&product, &cfg),
+            crate::artifact::self_check(&product, &cfg, "1.25.3", &phases),
+            crate::operation::published_report(&cfg),
+        );
+        assert!(timed_out(&routine.err().unwrap()));
+        assert_eq!(first.unwrap().version, "1.25.3");
+        candidate.unwrap();
+        assert_eq!(published.unwrap().version, "1.25.3");
+        assert!(phases.total("candidate_check") >= Duration::from_secs(21));
+    }
+
+    #[test]
+    fn only_a_timeout_reads_as_one() {
+        assert!(timed_out(&invalid(format!(
+            "{COMMAND_TIMED_OUT} after 120 s; it had not exited 5 s after it was killed"
+        ))));
+        assert!(!timed_out(&invalid("product self-report failed")));
+        assert!(!timed_out(&Error::Uncertain(COMMAND_TIMED_OUT.into())));
     }
 }

@@ -18,6 +18,13 @@ use tokio::{
     time::timeout,
 };
 
+/// The first worker's deadline: release resolution, downloads, the
+/// candidate's first check and K's transaction (runner::UPGRADE_HOST_BUDGET_MS
+/// bounds the preparation inside it).
+pub const FIRST_ATTEMPT_BUDGET: Duration = Duration::from_secs(1200);
+/// Each recovery worker's deadline.
+pub const RECOVERY_ATTEMPT_BUDGET: Duration = Duration::from_secs(360);
+
 pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     request.validate()?;
     let root = cfg.scratch().join("supervisors");
@@ -75,7 +82,11 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
             .ok_or_else(|| invalid("worker stdout missing"))?;
         // The first operation includes preparation and artifact transfer.
         // Recovery receives a shorter, independent deadline.
-        let budget = Duration::from_secs(if attempt == 0 { 1200 } else { 360 });
+        let budget = if attempt == 0 {
+            FIRST_ATTEMPT_BUDGET
+        } else {
+            RECOVERY_ATTEMPT_BUDGET
+        };
         let result = timeout(budget, async {
             input.write_all(&serde_json::to_vec(&next)?).await?;
             input.shutdown().await?;
