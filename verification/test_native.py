@@ -892,6 +892,95 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result["receipt"]["detail"]["requestCode"], "release_resolution_failed")
         self.assertEqual(machine.live(), before)
 
+    def interrupt_at_published_check(self, machine, args, version):
+        # Kill the supervisor and then its worker while the worker waits for
+        # the published program's first `--version`, so nothing recovers it.
+        gate = machine.home / "published.gate"
+        extra = {"RAFT_COMPUTER_OPERATION_ID": "interrupted", "RCI_FIXTURE_PUBLISHED_GATE": str(gate),
+            "RCI_FIXTURE_PUBLISHED_PATH": str(machine.binary), "RCI_FIXTURE_PUBLISHED_VERSION": version}
+        supervisor = subprocess.Popen(machine.command([*args, "--json"]), env=machine.env(extra),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for(gate.exists)
+            worker = json.loads((machine.state / "gate/upgrade.lock").read_text())["pid"]
+            self.assertNotIn(worker, (os.getpid(), supervisor.pid, 0, 1))
+            for pid in (supervisor.pid, worker):
+                if WINDOWS:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=True, capture_output=True)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+        finally:
+            gate.with_suffix(".release").touch()
+            if supervisor.poll() is None:
+                supervisor.kill()
+            supervisor.communicate(timeout=20)
+
+    def assert_refusal_stays_unresolved(self, machine):
+        # Exit 3 lets the supervisor go on to its next worker, whose reply is
+        # the one returned; the refusing worker's own receipt is on disk.
+        result = machine.json(["upgrade", "--version", "9.9.9"], expected=3,
+            extra={"RAFT_COMPUTER_OPERATION_ID": "refused"})
+        self.assert_failure_contract(result)
+        self.assertEqual(result["code"], "recovery_unresolved")
+        refused = machine.receipt("refused")
+        self.assertEqual(refused["outcome"], "unresolved")
+        self.assertEqual(refused["code"], "recovery_unresolved")
+        self.assertEqual(refused["detail"]["requestCode"], "release_resolution_failed")
+
+    def test_refusal_after_resuming_an_earlier_operation_stays_unresolved(self):
+        # This request resumes an interrupted install, which finishes; the K
+        # record it does not use is unreadable, so the installation is still
+        # unresolved when the request's own release cannot be resolved. It
+        # attempted recovery, so it stays unresolved (exit 3) instead of
+        # failing with earlier_recovery_pending.
+        machine = self.machine()
+        self.interrupt_at_published_check(machine, ["install", "--version", "1.1.0"], "1.1.0")
+        (machine.k / "operation.json").write_text("broken")
+        self.assert_refusal_stays_unresolved(machine)
+        self.assertEqual(machine.receipt("interrupted")["outcome"], "installed")
+        self.assertEqual(machine.self_version(), "1.1.0")
+
+    def test_refusal_after_settling_k_stays_unresolved(self):
+        # An upgrade interrupted inside K's handover, whose installer record is
+        # unreadable: this request's settlement runs K's recovery (rolling the
+        # upgrade back), so its refusal stays unresolved (exit 3).
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        self.interrupt_at_published_check(machine, ["upgrade", "--version", "1.1.0"], "1.1.0")
+        self.assertIsNone(json.loads((machine.k / "operation.json").read_text())["outcome"])
+        (machine.state / "active.json").write_text("unreadable")
+        self.assert_refusal_stays_unresolved(machine)
+        self.assertIsNotNone(json.loads((machine.k / "operation.json").read_text())["outcome"])
+        self.assertEqual(machine.self_version(), "1.0.0")
+
+    def test_fresh_install_gives_the_published_program_more_than_20_s(self):
+        # The published program's first `--version` answers after 21 s: past
+        # the routine 20 s budget, within the first-run one. With 20 s the
+        # check times out and the supervisor's next worker repeats it after the
+        # release, so the install would still succeed: the measured verify
+        # phase is what shows one check lasted that long and passed.
+        machine = self.machine()
+        gate = machine.home / "published.gate"
+        extra = {"RCI_FIXTURE_PUBLISHED_GATE": str(gate), "RCI_FIXTURE_PUBLISHED_PATH": str(machine.binary),
+            "RCI_FIXTURE_PUBLISHED_VERSION": "1.1.0"}
+        install = subprocess.Popen(machine.command(["install", "--version", "1.1.0", "--json"]),
+            env=machine.env(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for(gate.exists)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                install.wait(timeout=21)
+            gate.with_suffix(".release").touch()
+            stdout, stderr = install.communicate(timeout=60)
+        finally:
+            gate.with_suffix(".release").touch()
+            if install.poll() is None:
+                install.kill()
+                install.communicate(timeout=20)
+        self.assertEqual(install.returncode, 0, stdout + stderr)
+        receipt = json.loads(stdout)["receipt"]
+        self.assertGreaterEqual(json.loads(receipt["detail"]["phasesMs"])["verify"], 21000)
+        self.assertEqual(machine.self_version(), "1.1.0")
+
     def test_installer_metadata_damage_is_reported_then_cleaned_after_repair(self):
         for damaged in ("active", "plan", "receipt"):
             with self.subTest(damaged=damaged):
