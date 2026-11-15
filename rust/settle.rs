@@ -4,6 +4,17 @@
 //! own, or is given up on by its supervisor still leaves one. Create-only
 //! (`report::create`): an existing receipt is never replaced, so an id that
 //! leaked from an old run cannot overwrite that run's result.
+//!
+//! One launch per id: the server sends a web upgrade's request once, and a
+//! retry is a new request with a new id. So a run that finds no plan for its
+//! id and is refused (for example `operation_busy`, because another
+//! installation holds the gate) is the only run of that request, and its
+//! held or failed receipt is that request's answer. If the same id were ever
+//! launched twice at once, the second run could settle it as busy while the
+//! first was still resolving the release (its plan not saved yet), and the
+//! first could then not write its own result. Nothing launches an id twice
+//! today; a redelivery would have to keep the id's run alone (or this rule
+//! would have to learn who holds the gate).
 use crate::{
     config::Config,
     operation::{self, Record},
@@ -29,7 +40,16 @@ pub enum Claim {
 /// The line of a request given up on after its operation started.
 pub const UNRESOLVED_LINE: &str =
     "The installation could not be completed or recovered. Run the same install command again.";
-pub const UNRESOLVED_REASON: &str = "The installation could not be completed or recovered.";
+/// What a Computer that relays only the reason (1.0.68) and the server read
+/// as an unresolved receipt that a later run may still continue: the request
+/// stays open until its deadline (a late success can still win) instead of
+/// being failed at once. See report::EARLIER_RECOVERY_PENDING_REASON, which
+/// must not contain it.
+pub const HELD_OPEN_TEXT: &str = "An earlier installation could not be recovered";
+/// The reason of every unresolved receipt written here whose own reason does
+/// not say that already (that one is kept in `detail.requestReason`). The
+/// installation that stopped is, to the next run, the earlier one.
+pub const UNRESOLVED_REASON: &str = "The installation stopped before it finished. An earlier installation could not be recovered yet.";
 
 /// Started by the running service for a web upgrade: the service labels it
 /// `remote:<its id>`. Only such a request gets a held or failed receipt from
@@ -128,6 +148,15 @@ pub(crate) fn settlement(
         }
         _ => return None,
     };
+    if receipt.outcome == Outcome::Unresolved
+        && receipt
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.contains(HELD_OPEN_TEXT))
+        && let Some(reason) = receipt.reason.replace(UNRESOLVED_REASON.into())
+    {
+        receipt.detail.insert("requestReason".into(), reason);
+    }
     if let Some(diagnostic) = &reply.diagnostic {
         receipt
             .detail
@@ -277,11 +306,61 @@ mod tests {
         assert_eq!(receipt.outcome, Outcome::Unresolved);
         assert_eq!(receipt.exit_code, 3);
         assert_eq!(receipt.code, Some(FailureCode::RecoveryUnresolved));
+        assert_eq!(receipt.reason.as_deref(), Some(UNRESOLVED_REASON));
         assert_eq!(receipt.target_version.as_deref(), Some("1.25.3"));
         assert_eq!(receipt.from_version.as_deref(), Some("1.0.68"));
         assert_eq!(
             receipt.detail.get("requestCode").map(String::as_str),
             Some("escape_failed")
+        );
+    }
+
+    /// Computer 1.0.68 relays only the reason; the server holds a request open
+    /// as unresolved only when the reason says HELD_OPEN_TEXT.
+    #[test]
+    fn every_unresolved_receipt_written_here_reads_as_unresolved_by_its_text() {
+        assert!(UNRESOLVED_REASON.contains(HELD_OPEN_TEXT));
+        assert!(!report::EARLIER_RECOVERY_PENDING_REASON.contains(HELD_OPEN_TEXT));
+        for reason in [
+            "The installation could not be completed or recovered.",
+            "The previous installation step has not exited.",
+            "Recovery is blocked by another installation still running.",
+            "The installation could not finish.",
+        ] {
+            let given_up = Reply::failure(
+                "w1",
+                3,
+                "Run the same install command again.",
+                FailureCode::RecoveryUnresolved,
+                reason,
+            );
+            let receipt = settlement(&web("w1"), &given_up, Claim::Own, Record::None).unwrap();
+            assert_eq!(receipt.reason.as_deref(), Some(UNRESOLVED_REASON));
+            assert_eq!(
+                receipt.detail.get("requestReason").map(String::as_str),
+                Some(reason)
+            );
+            assert_eq!(receipt.line, "Run the same install command again.");
+        }
+        // A reason that says it already is kept as it is.
+        let earlier = Reply::failure(
+            "w1",
+            3,
+            "An earlier installation could not be recovered yet. Run the same install command again.",
+            FailureCode::RecoveryUnresolved,
+            "An earlier installation could not be recovered yet.",
+        );
+        let receipt = settlement(&web("w1"), &earlier, Claim::Own, Record::None).unwrap();
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some("An earlier installation could not be recovered yet.")
+        );
+        assert!(!receipt.detail.contains_key("requestReason"));
+        // Held and failed receipts keep their own reason.
+        let held = settlement(&web("w1"), &held("w1"), Claim::Own, Record::None).unwrap();
+        assert_eq!(
+            held.reason.as_deref(),
+            Some("The upgrade was started from inside Raft Computer.")
         );
     }
 

@@ -93,7 +93,10 @@ anything starts, an error, an answer no worker wrote down and a supervisor that
 gives up are written as one too (`rust/settle.rs`, `detail.settledBy`
 `fallback`). These are create-only: an existing receipt is never replaced. A
 request whose operation already started is written as `unresolved` under that
-operation's identity, so its own later run can still finish it. A `remote:`
+operation's identity, so its own later run can still finish it; its reason
+says "An earlier installation could not be recovered" (the original reason is
+`detail.requestReason`), which is what keeps the request open when a Computer
+relays only the reason. A `remote:`
 label that did not come from the service (a leaked one) gets no receipt; a
 refusal that cannot otherwise prove the request is its own writes one only for
 an id nothing was ever started for.
@@ -191,9 +194,12 @@ and start, never `raft-computer stop`/`start` beside it:
   `systemdKillMode` in the receipt); otherwise (`control-group`, `mixed`, or
   unreadable) it is held, with systemd-run's error as the receipt's
   `detail.diagnostic`. The original run waits for the copy (at most the
-  supervisor's budgets plus 300 s, holding no lock); it is stopped with the
-  unit once the copy stops it. If the copy ends without a receipt, the original
-  writes one (`escape_failed`, or `unresolved` once an operation started).
+  supervisor's budgets plus 300 s, holding no lock). In a unit that stops its
+  whole control group (`KillMode=control-group` or `mixed`) it is stopped with
+  the unit once the copy stops it; under `process` or `none` it keeps waiting
+  until the copy exits, then reads the copy's receipt. If the copy ends without
+  a receipt, the original writes one (`escape_failed`, or `unresolved` once an
+  operation started).
 - **Raft Desktop's registration** (`rust/host_supervisor.rs`): format 2 of
   `<RAFT_HOME>/computer/host-lifecycle-owner.json` names a launchd agent, a
   systemd `--user` unit or a Windows logon task. Stop disables it first, so
