@@ -153,6 +153,7 @@ pub enum FailureCode {
     CandidateStartFailed,
     DowngradeNotAllowed,
     EarlierRecoveryPending,
+    EscapeFailed,
     InstallFailed,
     InstallationDeclined,
     InstallationDirNotWritable,
@@ -171,13 +172,14 @@ pub enum FailureCode {
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::CallerNotComputer,
         Self::CandidateCheckFailed,
         Self::CandidateCheckTimedOut,
         Self::CandidateStartFailed,
         Self::DowngradeNotAllowed,
         Self::EarlierRecoveryPending,
+        Self::EscapeFailed,
         Self::InstallFailed,
         Self::InstallationDeclined,
         Self::InstallationDirNotWritable,
@@ -203,6 +205,7 @@ impl FailureCode {
             Self::CandidateStartFailed => "candidate_start_failed",
             Self::DowngradeNotAllowed => "downgrade_not_allowed",
             Self::EarlierRecoveryPending => "earlier_recovery_pending",
+            Self::EscapeFailed => "escape_failed",
             Self::InstallFailed => "install_failed",
             Self::InstallationDeclined => "installation_declined",
             Self::InstallationDirNotWritable => "installation_dir_not_writable",
@@ -257,6 +260,34 @@ pub struct Receipt {
 }
 
 impl Receipt {
+    /// This request's receipt, before its outcome's fields are filled in.
+    pub fn new(
+        request: &crate::request::Request,
+        target: Option<String>,
+        from: Option<String>,
+        outcome: Outcome,
+        line: String,
+    ) -> Self {
+        Self {
+            protocol: "raft-computer-installer/v3".into(),
+            installer_version: env!("CARGO_PKG_VERSION").into(),
+            id: request.id.clone(),
+            operation: request.command.clone(),
+            presence: request.presence,
+            target_version: target,
+            from_version: from,
+            approved_by: Some(request.approved_by.clone()),
+            outcome,
+            exit_code: outcome.exit_code(),
+            reason: None,
+            code: None,
+            line,
+            next_step: None,
+            finished_at_ms: 0,
+            detail: BTreeMap::new(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.protocol != "raft-computer-installer/v3"
             || self.installer_version.is_empty()
@@ -348,7 +379,13 @@ impl Receipt {
         // immutable; an unresolved receipt may be replaced only by the same
         // request's successful continuation, after disk recovery proves it.
         if let Some(old) = read(cfg, &self.id)? {
-            if old.target_version != self.target_version || old.operation != self.operation {
+            // An unresolved receipt written before the release was resolved
+            // (settle.rs: a `--channel` request given up on) names no target;
+            // the same request's continuation may still settle it.
+            let target_unknown = old.outcome == Outcome::Unresolved && old.target_version.is_none();
+            if (!target_unknown && old.target_version != self.target_version)
+                || old.operation != self.operation
+            {
                 return Err(invalid("request identity conflict"));
             }
             if old.outcome != Outcome::Unresolved {
@@ -361,6 +398,56 @@ impl Receipt {
         write_json(&path, &self)?;
         Ok(self)
     }
+}
+
+/// Writes `receipt` only if this request has none yet: never replaces one,
+/// whatever it says (a finished request's result, a running one's
+/// continuation, or an unreadable file). The file appears complete or not at
+/// all. Returns the receipt when this call wrote it. For a request that would
+/// otherwise end without a durable result (settle.rs); an operation writes
+/// its own through `Receipt::finish`.
+pub fn create(cfg: &Config, mut receipt: Receipt) -> Result<Option<Receipt>> {
+    use std::io::Write;
+    receipt.finished_at_ms = now_ms();
+    receipt.validate()?;
+    let path = cfg.receipt_path(&receipt.id);
+    if k_carrier::storage::exists(&path)? {
+        return Ok(None);
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("receipt path has no parent"))?;
+    // Root in another user's home (refused up front, failure::root_refusal)
+    // creates no folder there; a file it adds goes to the folder's owner.
+    #[cfg(unix)]
+    let owner = if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(directory) {
+            Ok(meta) => Some((meta.uid(), meta.gid())),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
+    k_carrier::storage::ensure_dir(directory)?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".settle-")
+        .tempfile_in(directory)?;
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::fchown(file.as_file(), Some(uid), Some(gid))?;
+    }
+    file.write_all(&serde_json::to_vec(&receipt)?)?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(&path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    k_carrier::storage::sync_dir(directory)?;
+    Ok(Some(receipt))
 }
 
 pub fn read(cfg: &Config, id: &str) -> Result<Option<Receipt>> {
@@ -390,14 +477,15 @@ mod failure_code_tests {
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 21);
+        assert_eq!(values.len(), 22);
         assert_eq!(values[0], "\"caller_not_computer\"");
         assert_eq!(values[1], "\"candidate_check_failed\"");
         assert_eq!(values[2], "\"candidate_check_timed_out\"");
         assert_eq!(values[5], "\"earlier_recovery_pending\"");
-        assert_eq!(values[18], "\"result_unreadable\"");
-        assert_eq!(values[19], "\"running_as_root\"");
-        assert_eq!(values[20], "\"unexpected_error\"");
+        assert_eq!(values[6], "\"escape_failed\"");
+        assert_eq!(values[19], "\"result_unreadable\"");
+        assert_eq!(values[20], "\"running_as_root\"");
+        assert_eq!(values[21], "\"unexpected_error\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),

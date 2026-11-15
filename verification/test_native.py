@@ -19,7 +19,7 @@ from test_no_installer_wording import runtime_offenders
 
 FAILURE_CODES = {
     "caller_not_computer", "candidate_check_failed", "candidate_check_timed_out",
-    "candidate_start_failed", "downgrade_not_allowed", "earlier_recovery_pending",
+    "candidate_start_failed", "downgrade_not_allowed", "earlier_recovery_pending", "escape_failed",
     "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",
@@ -388,6 +388,7 @@ class InstallerContract(unittest.TestCase):
         self.assertIn("env -u RAFT_COMPUTER_OPERATION_ID -u RAFT_COMPUTER_APPROVED_BY", held["line"])
         self.assertEqual(machine.self_version(), "1.0.0")
         self.assertEqual(self.server.requests, [])
+        self.assertFalse((machine.state / "receipts" / (sha(b"finished-web-upgrade") + ".json")).exists())
         # Without them the same command upgrades; an operation id alone is
         # only an id (replay), not an approval.
         upgraded = machine.json(["upgrade", "--version", "1.1.0"], extra={"RAFT_COMPUTER_OPERATION_ID": "my-own-id"})
@@ -419,9 +420,153 @@ class InstallerContract(unittest.TestCase):
             self.assertEqual(machine.self_version(), "1.0.0")
             self.assertFalse((machine.state / "active.json").exists())
             self.assertEqual(self.server.requests, [])
+            # Not a web upgrade's run: a leaked id's request is never
+            # settled from here (it has its own result, or its run is still
+            # working on it).
+            self.assertFalse((machine.state / "receipts" / (sha(b"finished-web-upgrade") + ".json")).exists())
         finally:
             machine.close()
             self.server.machines.remove(machine)
+
+    def web_service(self):
+        """An installed, running Computer that can start web upgrades."""
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.product(["login"])
+        start = subprocess.run([str(machine.binary), "start"],
+            env=machine.env({"RCI_FIXTURE_INSTALLER": str(self.server.installer)}),
+            text=True, capture_output=True, timeout=20)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        self.assertIsNotNone(wait_for(machine.live))
+        return machine
+
+    def web_upgrade(self, machine, request_id, action="upgrade", **fields):
+        """Starts a web upgrade the way the service does, waits for its run to
+        exit, and returns its receipt (None when it left none)."""
+        identity = machine.home / "fixture-remote-installer.json"
+        identity.unlink(missing_ok=True)
+        path = machine.state / "receipts" / (sha(request_id.encode()) + ".json")
+        exchange(machine.home, action, id=request_id, **fields)
+        wait_for(identity.exists, timeout=30)
+        settled = subprocess.run([str(machine.binary), "__wait-remote-installer"],
+            env=machine.env(), text=True, capture_output=True, timeout=70)
+        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
+        if not path.exists():
+            return None
+        receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["protocol"], "raft-computer-installer/v3")
+        self.assertEqual(receipt["id"], request_id)
+        self.assertEqual(receipt["operation"], "upgrade")
+        self.assertEqual(receipt["approvedBy"], "remote:" + request_id)
+        self.assertEqual(receipt["targetVersion"], "1.1.0")
+        self.assertEqual(runtime_offenders(receipt["line"]), [])
+        if receipt["exitCode"] != 0:
+            self.assertIn(receipt["code"], FAILURE_CODES)
+            self.assertEqual(runtime_offenders(receipt["reason"]), [])
+            self.assertNotIn(receipt["code"], receipt["line"])
+        return receipt
+
+    def assert_untouched(self, machine, before):
+        self.assertEqual(machine.live(), before)
+        self.assertEqual(machine.self_version(), "1.0.0")
+        self.assertFalse((machine.state / "active.json").exists())
+
+    def test_a_web_upgrade_refused_inside_another_computer_leaves_a_receipt(self):
+        # The service that starts it runs below another Computer: refused,
+        # and the web upgrade waiting for the answer gets it as its receipt
+        # instead of waiting out its deadline.
+        machine = self.web_service()
+        before = machine.live()
+        receipt = self.web_upgrade(machine, "nested-web", "nested-web-upgrade")
+        self.assertEqual(receipt["outcome"], "held")
+        self.assertEqual(receipt["exitCode"], 2)
+        self.assertEqual(receipt["code"], "installation_held")
+        self.assertEqual(receipt["reason"], "The upgrade was started from inside Raft Computer.")
+        self.assertIn("is an ancestor", receipt["detail"]["diagnostic"])
+        self.assert_untouched(machine, before)
+
+    def test_an_early_refusal_never_settles_an_id_something_was_started_for(self):
+        # The same shape as a CLI from before the caller declaration run by
+        # an agent with a leaked id: that id's own run may still be working
+        # (it saved its plan before it started the service that leaked it).
+        machine = self.web_service()
+        before = machine.live()
+        started = machine.state / "operations" / sha(b"in-flight-web")
+        started.mkdir(parents=True)
+        self.assertIsNone(self.web_upgrade(machine, "in-flight-web", "nested-web-upgrade"))
+        self.assert_untouched(machine, before)
+
+    @unittest.skipIf(WINDOWS or os.geteuid() == 0, "Unix permissions; root bypasses them")
+    def test_a_web_upgrade_refused_up_front_leaves_a_receipt_and_never_replaces_one(self):
+        machine = self.web_service()
+        before = machine.live()
+        claims = machine.state / "gate" / "upgrade.lock.claims"
+        claims.chmod(0o555)
+        self.addCleanup(claims.chmod, 0o755)
+        receipt = self.web_upgrade(machine, "unwritable-web")
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertEqual(receipt["exitCode"], 1)
+        self.assertEqual(receipt["code"], "installation_dir_not_writable")
+        self.assertIn("permission denied", receipt["reason"])
+        self.assertIn("chmod -R u+w ~/computer", receipt["nextStep"])
+        # Create-only: an id that already has a result keeps it, whatever
+        # this run would have said.
+        path = machine.state / "receipts" / (sha(b"finished-web") + ".json")
+        finished = dict(receipt, id="finished-web", approvedBy="remote:finished-web", outcome="promoted",
+            exitCode=0, line="Upgraded to 1.1.0.", nextStep=None, detail={})
+        del finished["reason"], finished["code"]
+        path.write_text(json.dumps(finished))
+        written = path.read_bytes()
+        self.assertEqual(self.web_upgrade(machine, "finished-web")["outcome"], "promoted")
+        self.assertEqual(path.read_bytes(), written)
+        self.assert_untouched(machine, before)
+
+    def test_a_web_upgrade_that_fails_with_an_error_leaves_a_receipt(self):
+        # An error that reached main() used to leave only a private
+        # diagnostic record.
+        if WINDOWS:
+            self.skipTest("a directory in place of a file fails differently on Windows")
+        machine = self.web_service()
+        before = machine.live()
+        durable = machine.state / "bin" / "raft-computer-installer"
+        durable.unlink()
+        durable.mkdir()
+        receipt = self.web_upgrade(machine, "error-web")
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertEqual(receipt["code"], "unexpected_error")
+        self.assertEqual(receipt["reason"], "The installation could not finish.")
+        self.assertTrue(receipt["detail"]["diagnostic"].strip())
+        self.assertEqual(len(list((machine.state / "diagnostics").glob("cli-*.json"))), 1)
+        self.assert_untouched(machine, before)
+
+    def test_a_web_upgrade_given_up_on_by_its_supervisor_leaves_a_receipt(self):
+        # Every worker timed out (a fixture-only budget of 1 ms): none wrote a
+        # receipt, so the supervisor's own unresolved answer becomes it.
+        machine = self.web_service()
+        receipt = self.web_upgrade(machine, "given-up-web", env={"RCI_FIXTURE_ATTEMPT_BUDGET_MS": "1"})
+        self.assertEqual(receipt["outcome"], "unresolved")
+        self.assertEqual(receipt["exitCode"], 3)
+        self.assertEqual(receipt["code"], "recovery_unresolved")
+        self.assertEqual(receipt["reason"], "The installation could not be completed or recovered.")
+        self.assertEqual(machine.self_version(), "1.0.0")
+
+    def test_a_web_upgrade_refused_while_another_runs_leaves_a_receipt(self):
+        machine = self.web_service()
+        gate = machine.home / "stop-gate.json"
+        local = subprocess.Popen([str(self.server.installer), "upgrade", "--version", "1.1.0", "--json"],
+            env=machine.env({"RCI_FIXTURE_STOP_GATE": str(gate)}),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for(gate.exists, timeout=90)
+            receipt = self.web_upgrade(machine, "busy-web")
+            self.assertEqual(receipt["outcome"], "held")
+            self.assertEqual(receipt["code"], "operation_busy")
+            self.assertEqual(receipt["reason"], "Another installation is running on this machine.")
+        finally:
+            gate.with_suffix(".release").touch()
+            stdout, stderr = local.communicate(timeout=150)
+        self.assertEqual(local.returncode, 0, stdout + stderr)
+        self.assertEqual(json.loads(stdout)["receipt"]["outcome"], "promoted")
 
     def test_old_noninteractive_cli_is_rejected_without_stopping_it(self):
         machine = self.machine()

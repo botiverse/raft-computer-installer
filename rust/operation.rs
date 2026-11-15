@@ -204,6 +204,43 @@ fn read_plan(cfg: &Config, id: &str) -> Result<Plan> {
     Ok(plan)
 }
 
+/// What this installation holds for one request id besides its receipt.
+pub(crate) enum Record {
+    /// Nothing: no operation was ever started for it here.
+    None,
+    /// Its folder, without a plan of its own (it settled an earlier operation
+    /// first, `settlement-failed.json`): nothing of its own was changed.
+    Started,
+    /// Its plan: the identity a continuation of it finishes with.
+    Planned {
+        request: Box<Request>,
+        target: String,
+        from: Option<String>,
+    },
+    /// A folder or plan that cannot be read.
+    Unreadable,
+}
+
+pub(crate) fn record(cfg: &Config, id: &str) -> Record {
+    match exists(&directory(cfg, id)) {
+        Ok(false) => return Record::None,
+        Ok(true) => {}
+        Err(_) => return Record::Unreadable,
+    }
+    match exists(&plan_path(cfg, id)) {
+        Ok(false) => Record::Started,
+        Ok(true) => match read_plan(cfg, id) {
+            Ok(plan) => Record::Planned {
+                request: Box::new(plan.request),
+                target: plan.manifest.version,
+                from: plan.from_version,
+            },
+            Err(_) => Record::Unreadable,
+        },
+        Err(_) => Record::Unreadable,
+    }
+}
+
 fn active(cfg: &Config) -> Result<Option<Plan>> {
     if !exists(&active_path(cfg))? {
         return Ok(None);
@@ -259,24 +296,7 @@ fn receipt(
     outcome: Outcome,
     line: String,
 ) -> Receipt {
-    Receipt {
-        protocol: "raft-computer-installer/v3".into(),
-        installer_version: env!("CARGO_PKG_VERSION").into(),
-        id: request.id.clone(),
-        operation: request.command.clone(),
-        presence: request.presence,
-        target_version: target,
-        from_version: from,
-        approved_by: Some(request.approved_by.clone()),
-        outcome,
-        exit_code: outcome.exit_code(),
-        reason: None,
-        code: None,
-        line,
-        next_step: None,
-        finished_at_ms: 0,
-        detail: BTreeMap::new(),
-    }
+    Receipt::new(request, target, from, outcome, line)
 }
 
 fn finish(

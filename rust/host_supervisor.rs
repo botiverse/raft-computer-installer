@@ -617,7 +617,7 @@ pub async fn break_away(args: &[String]) -> crate::systemd::Escape {
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) => Escape::Exited(status.code(), String::new()),
         Ok(Err(_)) => Escape::Failed(String::new()),
-        Err(_) => Escape::Running,
+        Err(_) => Escape::Running(None),
     }
 }
 

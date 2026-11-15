@@ -89,6 +89,22 @@ fn gate(variable: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The installer as the running service starts it for a web upgrade.
+fn web_installer(id: &str) -> Result<Command, Box<dyn std::error::Error>> {
+    let mut command =
+        Command::new(env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?);
+    command
+        .args(["upgrade", "--version", "1.1.0", "--json"])
+        .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
+        .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
+        .env("RAFT_COMPUTER_OPERATION_ID", id)
+        .env("RAFT_COMPUTER_APPROVED_BY", format!("remote:{id}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
 fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let state = State {
@@ -137,24 +153,32 @@ fn service(home: &Path, behavior: &Behavior) -> Result<(), Box<dyn std::error::E
             "{}",
             json!({"generation":state.generation,"pid":state.pid,"version":state.version})
         )?;
+        // A web upgrade: `id` and `env` (extra variables) when given.
         if request["action"] == "upgrade" {
-            let child =
-                Command::new(env::var_os("RCI_FIXTURE_INSTALLER").ok_or("installer missing")?)
-                    .args(["upgrade", "--version", "1.1.0", "--json"])
-                    .env_remove("RAFT_COMPUTER_INSTALLER_CALLER")
-                    .env("RAFT_COMPUTER_NON_INTERACTIVE", "1")
-                    .env("RAFT_COMPUTER_OPERATION_ID", "remote-caller-regression")
-                    .env(
-                        "RAFT_COMPUTER_APPROVED_BY",
-                        "remote:remote-caller-regression",
-                    )
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()?;
+            let id = request["id"].as_str().unwrap_or("remote-caller-regression");
+            let mut command = web_installer(id)?;
+            if let Some(extra) = request["env"].as_object() {
+                for (name, value) in extra {
+                    command.env(name, value.as_str().unwrap_or_default());
+                }
+            }
+            let child = command.spawn()?;
             let identity = raft_computer_installer::process::observe(child.id())?
                 .ok_or("remote installer identity unavailable")?;
             write_json(&home.join("fixture-remote-installer.json"), &identity)?;
+        }
+        // A web upgrade started by a Computer process that itself runs below
+        // this service (a Computer started from inside another one).
+        if request["action"] == "nested-web-upgrade" {
+            Command::new(env::current_exe()?)
+                .args([
+                    "__web-installer",
+                    request["id"].as_str().unwrap_or("nested-web-upgrade"),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
         }
         // An agent of this Computer calling the installer directly, from its
         // own shell (not through the CLI, so the installer's immediate parent
@@ -257,6 +281,14 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     );
     ensure_dir(&home)?;
     match args.first().map(String::as_str) {
+        Some("__web-installer") => {
+            let id = args.get(1).ok_or("request id missing")?;
+            let mut child = web_installer(id)?.spawn()?;
+            let identity = raft_computer_installer::process::observe(child.id())?
+                .ok_or("remote installer identity unavailable")?;
+            write_json(&home.join("fixture-remote-installer.json"), &identity)?;
+            child.wait()?;
+        }
         Some("__wait-remote-installer") => {
             let identity =
                 serde_json::from_slice(&fs::read(home.join("fixture-remote-installer.json"))?)?;

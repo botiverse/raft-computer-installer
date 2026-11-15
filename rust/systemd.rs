@@ -239,14 +239,50 @@ pub async fn systemctl(unit: &ServiceUnit, action: &str) -> Result<()> {
 }
 
 pub enum Escape {
-    /// The copy is running in its own scope and carries the operation.
-    Running,
+    /// The copy is running in its own scope and carries the operation; the
+    /// copy itself when it can be awaited (systemd-run execs it in place).
+    Running(Option<Copy>),
     /// `systemd-run` (or the copy) exited within the first seconds, with what
     /// it wrote on stderr (sanitized and bounded; empty when not captured).
     Exited(Option<i32>, String),
     /// Nothing could be started, and why.
     Failed(String),
 }
+
+/// The copy running in its own scope (systemd-run became it), and the
+/// capture of its stderr.
+pub struct Copy {
+    child: tokio::process::Child,
+    capture: Option<std::fs::File>,
+}
+
+impl Copy {
+    /// Wraps a running copy; `capture` is the file its stderr goes to.
+    pub fn new(child: tokio::process::Child, capture: Option<std::fs::File>) -> Self {
+        Self { child, capture }
+    }
+
+    /// Waits up to `limit` for the copy to exit: its status and stderr
+    /// (passed on to this process's own stderr), or None while it still runs
+    /// (it is left running).
+    pub async fn wait(mut self, limit: Duration) -> Option<(Option<i32>, String)> {
+        match tokio::time::timeout(limit, self.child.wait()).await {
+            Ok(Ok(status)) => Some((status.code(), self.capture.map(replay).unwrap_or_default())),
+            Ok(Err(error)) => Some((None, format!("the copy could not be awaited: {error}"))),
+            Err(_) => None,
+        }
+    }
+}
+
+/// How long the run that started an escaped copy waits for it: the copy's
+/// supervisor gives up after its first worker and two recovery workers
+/// (supervisor.rs), and settles the request then; the rest covers what runs
+/// before and between them (systemctl queries, killing a stuck worker).
+pub const COPY_WAIT: Duration = Duration::from_secs(
+    crate::supervisor::FIRST_ATTEMPT_BUDGET.as_secs()
+        + 2 * crate::supervisor::RECOVERY_ATTEMPT_BUDGET.as_secs()
+        + 300,
+);
 
 /// The longest escape note carried to the operation (see `Request`).
 pub const ESCAPE_NOTE_LIMIT: usize = 4096;
@@ -314,7 +350,7 @@ async fn escape_with(user: bool, args: &[String], scratch: &std::path::Path) -> 
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) => Escape::Exited(status.code(), capture.map(replay).unwrap_or_default()),
         Ok(Err(error)) => Escape::Failed(format!("systemd-run could not be awaited: {error}")),
-        Err(_) => Escape::Running,
+        Err(_) => Escape::Running(Some(Copy::new(child, capture))),
     }
 }
 

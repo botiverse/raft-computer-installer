@@ -17,6 +17,7 @@ mod proxy;
 pub mod report;
 pub mod request;
 pub mod runner;
+pub mod settle;
 pub mod shell_path;
 pub mod source;
 pub mod supervisor;

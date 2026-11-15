@@ -25,6 +25,22 @@ pub const FIRST_ATTEMPT_BUDGET: Duration = Duration::from_secs(1200);
 /// Each recovery worker's deadline.
 pub const RECOVERY_ATTEMPT_BUDGET: Duration = Duration::from_secs(360);
 
+fn attempt_budget(attempt: usize) -> Duration {
+    // Verification builds only: the give-up path without waiting 32 minutes.
+    #[cfg(feature = "verification-fixture")]
+    if let Some(ms) = std::env::var("RCI_FIXTURE_ATTEMPT_BUDGET_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    if attempt == 0 {
+        FIRST_ATTEMPT_BUDGET
+    } else {
+        RECOVERY_ATTEMPT_BUDGET
+    }
+}
+
 pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     request.validate()?;
     let root = cfg.scratch().join("supervisors");
@@ -82,11 +98,7 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
             .ok_or_else(|| invalid("worker stdout missing"))?;
         // The first operation includes preparation and artifact transfer.
         // Recovery receives a shorter, independent deadline.
-        let budget = if attempt == 0 {
-            FIRST_ATTEMPT_BUDGET
-        } else {
-            RECOVERY_ATTEMPT_BUDGET
-        };
+        let budget = attempt_budget(attempt);
         let result = timeout(budget, async {
             input.write_all(&serde_json::to_vec(&next)?).await?;
             input.shutdown().await?;
@@ -137,12 +149,17 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
                     Ok(Ok(_))
                 ) {
                     let _retained = directory.keep();
-                    return Ok(Reply::failure(
-                        &request.id,
-                        3,
-                        "The previous installation step has not exited. Recovery must wait for it.",
-                        FailureCode::RecoveryUnresolved,
-                        "The previous installation step has not exited.",
+                    // Killed: it writes nothing more.
+                    return Ok(given_up(
+                        cfg,
+                        request,
+                        Reply::failure(
+                            &request.id,
+                            3,
+                            "The previous installation step has not exited. Recovery must wait for it.",
+                            FailureCode::RecoveryUnresolved,
+                            "The previous installation step has not exited.",
+                        ),
                     ));
                 }
             }
@@ -150,7 +167,21 @@ pub async fn run(cfg: &Config, request: &Request) -> Result<Reply> {
     }
     // Preserve the exact executable and request when automatic recovery stops.
     let _retained = directory.keep();
-    Ok(last)
+    Ok(given_up(cfg, request, last))
+}
+
+/// Automatic recovery stopped, and every worker has exited. A worker that
+/// timed out wrote no receipt, so persist this unresolved answer as one (the
+/// same request's later run may still replace it: `Receipt::finish`).
+/// Create-only: a receipt a worker did write stays.
+fn given_up(cfg: &Config, request: &Request, reply: Reply) -> Reply {
+    if reply.receipt.is_some() {
+        return reply;
+    }
+    match crate::settle::settle(cfg, request, &reply, crate::settle::Claim::Own) {
+        Some(receipt) => Reply::receipt(receipt),
+        None => reply,
+    }
 }
 
 fn remove_finished_supervisors(cfg: &Config, current: &std::path::Path) -> Result<()> {
