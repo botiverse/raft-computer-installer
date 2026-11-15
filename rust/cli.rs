@@ -5,10 +5,11 @@ use crate::{
     presence::Interaction,
     report::FailureCode,
     request::{Reply, Request},
+    settle::{self, Claim},
     source, supervisor, version,
 };
 use k_carrier::error::invalid;
-use std::{env, time::Duration};
+use std::{env, sync::Mutex, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
@@ -19,10 +20,159 @@ pub fn failure_line() -> &'static str {
 }
 
 /// Report an error that reached main(): the cause, one runnable next step,
-/// and with `--json` one reply object on stdout. Returns the exit code.
+/// and with `--json` one reply object on stdout. Returns the exit code. A web
+/// upgrade's request also gets that answer as its receipt (settle.rs).
 pub fn report_top_level_failure(error: &Error) -> u8 {
     let json = env::args().skip(1).any(|arg| arg == "--json");
-    crate::failure::report(error, json)
+    let code = crate::failure::report(error, json);
+    settle_top_level_failure(error);
+    code
+}
+
+/// The request an error reaching main() settles, and how sure this run is
+/// that it is its own (`Claim`). None: nothing to settle, or a request that
+/// is not this run's (a leaked `remote:` label, a declared CLI).
+struct Pending {
+    cfg: Config,
+    request: Request,
+    claim: Claim,
+}
+
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+
+fn pending(cfg: &Config, request: &Request, claim: Option<Claim>) {
+    let mut slot = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = claim
+        .filter(|_| settle::from_web(request))
+        .map(|claim| Pending {
+            cfg: cfg.clone(),
+            request: request.clone(),
+            claim,
+        });
+}
+
+fn pending_claim() -> Option<Claim> {
+    PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|pending| pending.claim)
+}
+
+fn settle_top_level_failure(error: &Error) {
+    let Some(pending) = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let id = &pending.request.id;
+    let blocked = match crate::failure::classify(error) {
+        crate::failure::Cause::PermissionDenied | crate::failure::Cause::ReadOnly => {
+            crate::failure::blocked(&pending.cfg, &pending.request.command)
+        }
+        _ => None,
+    };
+    let answer = crate::failure::answer(error, Some(&pending.cfg), blocked.as_ref());
+    let reply = answer
+        .reply(id)
+        .with_diagnostic(diagnostic::safe_error(error));
+    let reply = if reply.validate(id).is_ok() {
+        reply
+    } else {
+        answer.reply(id)
+    };
+    settle::settle(&pending.cfg, &pending.request, &reply, pending.claim);
+}
+
+/// A web upgrade's request when its arguments could not be read: the id and
+/// label the service set, the command if one was named.
+fn unparsed_request(args: &[String]) -> Option<Request> {
+    let request = Request {
+        protocol_version: 1,
+        id: env::var("RAFT_COMPUTER_OPERATION_ID").ok()?,
+        command: args
+            .first()
+            .filter(|arg| !arg.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| "upgrade".into()),
+        version: None,
+        channel: None,
+        yes: false,
+        allow_downgrade: false,
+        presence: Interaction::detect().presence,
+        approved_by: env::var("RAFT_COMPUTER_APPROVED_BY").ok()?,
+        recovery_only: false,
+        waiting_caller: None,
+        escape_failure: None,
+    };
+    (request.validate().is_ok() && settle::from_web(&request)).then_some(request)
+}
+
+/// Print a reply the way `run` does for an answer of its own.
+fn print_reply(reply: &Reply, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(reply)?);
+    } else {
+        eprintln!("{}", reply.line);
+    }
+    Ok(())
+}
+
+/// The run that started an escaped copy (systemd::escape) stays until the
+/// copy exits: this run is in the service's unit, so it is stopped with the
+/// unit once the copy stops it, and by then the copy owns the result. If the
+/// copy (or systemd-run before it) ends without a receipt, this run writes
+/// one, create-only. It holds no lock while it waits.
+async fn await_escaped_copy(
+    cfg: &Config,
+    request: &Request,
+    json: bool,
+    copy: Box<crate::systemd::Copy>,
+) -> Result<u8> {
+    let exited = copy.wait(crate::systemd::COPY_WAIT).await;
+    if let Ok(Some(receipt)) = crate::report::read(cfg, &request.id) {
+        let reply = Reply::receipt(receipt);
+        if json {
+            println!("{}", serde_json::to_string(&reply)?);
+        } else {
+            println!("{}", reply.line);
+        }
+        return Ok(reply.exit_code);
+    }
+    let (reason, note) = match exited {
+        Some((code, stderr)) => (
+            "The upgrade stopped before it finished, after it moved out of the Raft Computer service.",
+            crate::systemd::escape_note(code, &stderr),
+        ),
+        None => (
+            "The upgrade did not finish in time after it moved out of the Raft Computer service.",
+            format!(
+                "the copy in its own scope still runs after {} s",
+                crate::systemd::COPY_WAIT.as_secs()
+            ),
+        ),
+    };
+    let reply = Reply::failure(
+        &request.id,
+        1,
+        format!("{reason} Run the same install command again."),
+        FailureCode::EscapeFailed,
+        reason,
+    )
+    .with_diagnostic(crate::systemd::clip(note, 2048));
+    // A worker the copy left running still holds the operation gate and
+    // writes this request's own receipt.
+    let settled = match k_carrier::lock::UpgradeLock::acquire(&cfg.installer_dir.join("gate")) {
+        Ok(_gate) => settle::settle(cfg, request, &reply, Claim::Own),
+        Err(_) => None,
+    };
+    let reply = settled.map_or(reply, Reply::receipt);
+    print_reply(&reply, json)?;
+    Ok(reply.exit_code)
 }
 
 const HELP: &str = "Raft Computer installation commands
@@ -216,9 +366,26 @@ pub async fn run() -> Result<u8> {
         }
     }
     let raw_args = args.clone();
-    let mut args = parse(&args)?;
+    let mut args = match parse(&args) {
+        Ok(args) => args,
+        Err(error) => {
+            // Its caller is unknown yet: Claim::Unproven.
+            if let Some(request) = unparsed_request(&raw_args) {
+                pending(&cfg, &request, Some(Claim::Unproven));
+            }
+            return Err(error);
+        }
+    };
+    // An error before the caller is known settles only an id nothing was
+    // started for (Claim::Unproven).
+    pending(&cfg, &args.request, Some(Claim::Unproven));
     if ["install", "upgrade", "repair"].contains(&args.request.command.as_str()) {
         let marker = env::var("RAFT_COMPUTER_INSTALLER_CALLER").ok();
+        if marker.is_some() {
+            // A CLI declaring itself never carries a web upgrade: any
+            // `remote:` label it passes on leaked (refused below).
+            pending(&cfg, &args.request, None);
+        }
         if marker.as_deref().is_some_and(|v| v != "waiting-cli-v1") {
             return Err(invalid("invalid caller declaration"));
         }
@@ -242,6 +409,9 @@ pub async fn run() -> Result<u8> {
                 env::var_os(crate::systemd::ESCAPED_ENV).is_some(),
             )?;
         }
+        // A web upgrade's run: started by a Computer process (the service), no
+        // CLI declaring itself (a `remote:` label is honored only then).
+        let from_service = parent.is_some() && marker.is_none();
         // A command run from inside the Computer (an agent on this computer,
         // through the CLI or by calling this installer directly): stopping the
         // service would kill this installer with it. Refuse before anything is
@@ -268,11 +438,16 @@ pub async fn run() -> Result<u8> {
                 "The upgrade was started from inside Raft Computer.",
             )
             .with_diagnostic(format!("computer process {} is an ancestor", product.pid));
-            if args.json {
-                println!("{}", serde_json::to_string(&reply)?);
-            } else {
-                eprintln!("{}", reply.line);
+            // Started by a Computer process for a web upgrade: that request
+            // waits for this answer. Not proven its own: a CLI from before
+            // the caller declaration (Computer < 1.0.38) run by an agent
+            // with a leaked label looks the same, so only an id nothing was
+            // started for is settled (a run still working on that id saved
+            // its plan before it started the service that leaked it).
+            if from_service {
+                settle::settle(&cfg, &args.request, &reply, Claim::Unproven);
             }
+            print_reply(&reply, args.json)?;
             return Ok(reply.exit_code);
         }
         // A web upgrade's installer is a direct child of the running service,
@@ -280,8 +455,10 @@ pub async fn run() -> Result<u8> {
         // label anywhere else is a leaked one (an old installer passed it to
         // the service and every agent): refuse, and say how to drop it, rather
         // than treat it as an ordinary local upgrade.
-        let from_service = parent.is_some() && marker.is_none();
         if args.request.approved_by.starts_with("remote:") && !from_service {
+            // Never settled: this id and label belong to another run, which
+            // either has its receipt or is still working on it.
+            pending(&cfg, &args.request, None);
             let reply = Reply::failure(
                 &args.request.id,
                 2,
@@ -289,11 +466,7 @@ pub async fn run() -> Result<u8> {
                 FailureCode::InstallationHeld,
                 "A web upgrade's approval was found outside that upgrade.",
             );
-            if args.json {
-                println!("{}", serde_json::to_string(&reply)?);
-            } else {
-                eprintln!("{}", reply.line);
-            }
+            print_reply(&reply, args.json)?;
             return Ok(reply.exit_code);
         }
         if let Some(parent) = parent {
@@ -310,13 +483,15 @@ pub async fn run() -> Result<u8> {
                     FailureCode::CallerNotComputer,
                     "This command is started by Raft Computer, not run by hand.",
                 );
-                if args.json {
-                    println!("{}", serde_json::to_string(&reply)?);
-                } else {
-                    eprintln!("{}", reply.line);
-                }
+                // No `remote:` label: not a web upgrade, nothing to settle.
+                print_reply(&reply, args.json)?;
                 return Ok(reply.exit_code);
             }
+        }
+        // Past the caller checks: a `remote:` label here came from the
+        // service, so the request is this run's own.
+        if from_service {
+            pending(&cfg, &args.request, Some(Claim::Own));
         }
     }
     // Every command writes under the state home first (the supervisor's
@@ -328,6 +503,9 @@ pub async fn run() -> Result<u8> {
     // folders that user could not write afterwards.
     if let Some(answer) = crate::failure::preflight(&cfg, &args.request.command) {
         let reply = answer.reply(&args.request.id);
+        if let Some(claim) = pending_claim() {
+            settle::settle(&cfg, &args.request, &reply, claim);
+        }
         eprintln!("{}", answer.line());
         if args.json {
             println!("{}", serde_json::to_string(&reply)?);
@@ -344,7 +522,19 @@ pub async fn run() -> Result<u8> {
         && crate::systemd::self_inside(&unit)
     {
         match crate::systemd::escape(&unit, &raw_args, &cfg.scratch()).await {
-            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0), _) => {
+            crate::systemd::Escape::Running(copy) => {
+                if !args.json {
+                    println!(
+                        "Continuing the {} outside systemd unit {}.",
+                        args.request.command, unit.name
+                    );
+                }
+                return match copy {
+                    Some(copy) => await_escaped_copy(&cfg, &args.request, args.json, copy).await,
+                    None => Ok(0),
+                };
+            }
+            crate::systemd::Escape::Exited(Some(0), _) => {
                 if !args.json {
                     println!(
                         "Continuing the {} outside systemd unit {}.",
@@ -385,7 +575,7 @@ pub async fn run() -> Result<u8> {
             .is_some()
     {
         match crate::host_supervisor::break_away(&raw_args).await {
-            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0), _) => {
+            crate::systemd::Escape::Running(_) | crate::systemd::Escape::Exited(Some(0), _) => {
                 if !args.json {
                     println!(
                         "Continuing the {} outside the Computer service's job.",
@@ -409,6 +599,16 @@ pub async fn run() -> Result<u8> {
         }
     }
     let reply = supervisor::run(&cfg, &args.request).await?;
+    // An answer no worker wrote down (another installation running, a
+    // worker's error, a recovery worker finding nothing started): a web
+    // upgrade still gets it as its receipt. The supervisor settles one it
+    // gave up on itself.
+    if reply.exit_code != 0
+        && reply.receipt.is_none()
+        && let Some(claim) = pending_claim()
+    {
+        settle::settle(&cfg, &args.request, &reply, claim);
+    }
     if args.json {
         println!("{}", serde_json::to_string(&reply)?);
     } else {
@@ -440,5 +640,147 @@ mod failure_line_tests {
             failure_line(),
             "The installation could not finish. Run the same install command again."
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod escaped_copy_tests {
+    use super::*;
+    use crate::{presence::Presence, report::Outcome};
+    use std::path::Path;
+
+    fn config(home: &Path) -> Config {
+        let state_home = home.join(".raft");
+        Config {
+            user_home: home.to_path_buf(),
+            k_state: state_home.join("computer/k"),
+            installer_dir: state_home.join("computer/installer"),
+            state_home,
+            install_dir: home.join(".local/bin"),
+            binary: home.join(".local/bin/raft-computer"),
+            sidecar: home.join(".local/bin/photon_rs_bg.wasm"),
+            hands_origin: "https://hands.build".into(),
+            hands_app: "raft-computer-cli".into(),
+            waiting_caller: None,
+        }
+    }
+
+    fn web(id: &str) -> Request {
+        Request {
+            protocol_version: 1,
+            id: id.into(),
+            command: "upgrade".into(),
+            version: Some("1.25.3".into()),
+            channel: None,
+            yes: false,
+            allow_downgrade: false,
+            presence: Presence::Unattended,
+            approved_by: format!("remote:{id}"),
+            recovery_only: false,
+            waiting_caller: None,
+            escape_failure: None,
+        }
+    }
+
+    /// Stands in for systemd-run --scope, which execs the copy in place.
+    fn copy(script: &str, home: &Path) -> Box<crate::systemd::Copy> {
+        let capture = tempfile::tempfile_in(home).unwrap();
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stderr(capture.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        Box::new(crate::systemd::Copy::new(child, Some(capture)))
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_fails_without_a_receipt_is_settled_as_escape_failed() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = config(home.path());
+        let request = web("escaped");
+        let code = await_escaped_copy(
+            &cfg,
+            &request,
+            true,
+            copy(
+                "echo 'Failed to start transient scope unit' >&2; exit 3",
+                home.path(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 1);
+        let receipt = crate::report::read(&cfg, "escaped").unwrap().unwrap();
+        assert_eq!(receipt.outcome, Outcome::Failed);
+        assert_eq!(receipt.code, Some(FailureCode::EscapeFailed));
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some(
+                "The upgrade stopped before it finished, after it moved out of the Raft Computer service."
+            )
+        );
+        assert_eq!(receipt.target_version.as_deref(), Some("1.25.3"));
+        let diagnostic = &receipt.detail["diagnostic"];
+        assert!(diagnostic.contains("exited with status 3"), "{diagnostic}");
+        assert!(diagnostic.contains("Failed to start transient scope unit"));
+    }
+
+    #[tokio::test]
+    async fn a_copy_killed_by_a_signal_is_settled_too() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = config(home.path());
+        let code = await_escaped_copy(&cfg, &web("killed"), true, copy("kill -9 $$", home.path()))
+            .await
+            .unwrap();
+        assert_eq!(code, 1);
+        let receipt = crate::report::read(&cfg, "killed").unwrap().unwrap();
+        assert!(receipt.detail["diagnostic"].contains("was killed by a signal"));
+    }
+
+    #[tokio::test]
+    async fn the_copy_s_own_receipt_is_the_answer_and_is_never_replaced() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = config(home.path());
+        let request = web("settled");
+        let held = Reply::failure(
+            "settled",
+            2,
+            "Held.",
+            FailureCode::InstallationHeld,
+            "Held by the copy.",
+        );
+        let own = settle::settle(&cfg, &request, &held, Claim::Own).unwrap();
+        // Exits non-zero after writing it, as a held copy does.
+        let code = await_escaped_copy(&cfg, &request, true, copy("exit 2", home.path()))
+            .await
+            .unwrap();
+        assert_eq!(code, 2);
+        assert_eq!(crate::report::read(&cfg, "settled").unwrap().unwrap(), own);
+    }
+
+    #[tokio::test]
+    async fn a_running_operation_on_the_gate_writes_its_own_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = config(home.path());
+        let gate = k_carrier::lock::UpgradeLock::acquire(&cfg.installer_dir.join("gate")).unwrap();
+        let code = await_escaped_copy(&cfg, &web("busy"), true, copy("exit 1", home.path()))
+            .await
+            .unwrap();
+        assert_eq!(code, 1);
+        assert!(crate::report::read(&cfg, "busy").unwrap().is_none());
+        drop(gate);
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_bounded_and_leaves_the_copy_running() {
+        let home = tempfile::tempdir().unwrap();
+        let waited = copy("sleep 5", home.path())
+            .wait(Duration::from_millis(100))
+            .await;
+        assert!(waited.is_none());
+        let exited = copy("exit 4", home.path())
+            .wait(Duration::from_secs(10))
+            .await;
+        assert_eq!(exited.map(|(code, _)| code), Some(Some(4)));
     }
 }

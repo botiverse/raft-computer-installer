@@ -53,6 +53,7 @@ def assemble(output, require_all=False):
         binary = output / relative
         if not binary.is_file():
             continue
+        assert_no_fixture_hooks(binary)
         found.add(target)
         inventory[relative] = identity(binary)
         # One self-supervising executable per platform; no runner sidecar.
@@ -115,11 +116,12 @@ def build(output, fixtures=False):
         if not launcher.is_file() or launcher.stat().st_size == 0:
             raise ValueError("the Windows launcher was not built")
         environment["RAFT_COMPUTER_LAUNCHER_EXE"] = str(launcher)
-    command = ["cargo", "build", "--locked", "--release", "--bin", "raft-computer-installer"]
-    if triple:
-        command += ["--target", triple]
-    if fixtures:
-        command += ["--features", "verification-fixture", "--bin", "raft-computer-fixture"]
+    target_args = ["--target", triple] if triple else []
+    # The published installer is built on its own, never with the
+    # verification-fixture feature: features apply to the whole package in
+    # one cargo invocation, so building the fixture alongside it would
+    # compile any fixture-only code into the shipped binary too.
+    command = ["cargo", "build", "--locked", "--release", "--bin", "raft-computer-installer", *target_args]
     subprocess.run(command, cwd=ROOT, check=True, env=environment)
     name = "raft-computer-installer" + (".exe" if os.name == "nt" else "")
     binary = output / "native" / target / name
@@ -128,14 +130,27 @@ def build(output, fixtures=False):
     binary.chmod(0o755)
     if triple:
         assert_portable_linux(binary)
+    assert_no_fixture_hooks(binary)
     sign(binary)
     if fixtures:
+        subprocess.run(["cargo", "build", "--locked", "--release", "--features", "verification-fixture",
+            "--bin", "raft-computer-fixture", *target_args], cwd=ROOT, check=True, env=environment)
         name = "raft-computer-fixture" + (".exe" if os.name == "nt" else "")
         fixture = output / "fixtures" / name
         fixture.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built / name, fixture)
         fixture.chmod(0o755)
     return assemble(output)
+
+
+# Every test-only variable the native fixture reads starts with this prefix.
+FIXTURE_MARKER = b"RCI_FIXTURE"
+
+
+def assert_no_fixture_hooks(binary):
+    """A published installer reads no test-only variable."""
+    if FIXTURE_MARKER in Path(binary).read_bytes():
+        raise ValueError(f"installer contains a test-only hook ({FIXTURE_MARKER.decode()}): {binary}")
 
 
 if __name__ == "__main__":

@@ -136,14 +136,14 @@ def remove_tree(path, timeout=30):
             delay = min(delay * 2, 2.0)
 
 
-def exchange(home, action="probe"):
+def exchange(home, action="probe", **fields):
     try:
         record = json.loads((home / "fixture-service.json").read_text())
         host, port = record["address"].rsplit(":", 1)
         if host != "127.0.0.1":
             raise AssertionError("fixture address is not loopback")
         with socket.create_connection((host, int(port)), timeout=2) as stream:
-            stream.sendall(json.dumps({"action": action, "token": record["token"]}).encode() + b"\n")
+            stream.sendall(json.dumps({**fields, "action": action, "token": record["token"]}).encode() + b"\n")
             line = stream.makefile("rb").readline(4097)
         result = json.loads(line)
         if result["generation"] != record["generation"]:
