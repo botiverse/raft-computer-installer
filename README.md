@@ -143,6 +143,16 @@ cross-release URLs, or hash/size mismatches stop installation before service cha
 and published beside its matching binary, including during rollback. Product
 bytes run from the installation directory, outside K's slots.
 
+A download that receives no data for 30 s is stalled and its attempt ends.
+The installer's own downloads (a fresh install's or repair's Raft Computer,
+the support file) retry up to five times, each attempt resuming from the
+partial file with a Range request; all attempts and the pauses between them
+end within 10 minutes, so a slow transfer that keeps receiving data may use
+all of it. An upgrade's candidate is fetched by K in one attempt with the same
+stall timeout and 10-minute bound, which leave room in the first worker's
+20 minutes for the candidate check and the handover. A download that ends
+stalled fails with `download_stalled`; nothing was changed.
+
 K downloads, verifies and stages an upgrade's candidate before it hands over.
 When K stops there without recording an outcome (a failed candidate download),
 nothing was stopped or replaced: the installer settles K's operation as failed,

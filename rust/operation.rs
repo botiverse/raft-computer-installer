@@ -418,6 +418,10 @@ pub(crate) async fn published_report(cfg: &Config) -> Result<k_carrier::state::E
 
 /// The line and reason of a candidate that failed its first check, before
 /// anything was stopped or replaced.
+/// The reason of a download that ended because no data arrived (its line
+/// names the file and the URL).
+const DOWNLOAD_STALLED_REASON: &str = "The Raft Computer download stopped receiving data. Check this computer's internet connection and try again.";
+
 fn candidate_check_copy(code: FailureCode, target: &str) -> (String, String) {
     if code == FailureCode::CandidateCheckTimedOut {
         (
@@ -869,19 +873,11 @@ async fn settle_upgrade(
         ),
         // K fails an operation only before the handover (the candidate
         // could not be fetched, verified or prepared): nothing was changed.
-        _ => match recorded_cause(&plan.detail).and_then(artifact::candidate_check_failure) {
-            Some(code) => {
-                let (line, reason) = candidate_check_copy(code, target);
-                (line, Some((code, reason)))
-            }
-            None => (
-                failed_before_handover_line(target, &plan.manifest.release, &plan.detail),
-                Some((
-                    FailureCode::InstallFailed,
-                    format!("Raft Computer could not be upgraded to {target}."),
-                )),
-            ),
-        },
+        _ => {
+            let (line, failure) =
+                failed_before_handover(target, &plan.manifest.release, &plan.detail);
+            (line, Some(failure))
+        }
     };
     finish(cfg, plan, outcome, failure, line)
 }
@@ -1233,6 +1229,35 @@ async fn settle_before_handover(
     Ok(Some(settled))
 }
 
+/// The line, code and reason of an upgrade K failed before the handover,
+/// from the cause recorded in `detail.diagnostic`.
+fn failed_before_handover(
+    target: &str,
+    release: &Release,
+    detail: &BTreeMap<String, String>,
+) -> (String, (FailureCode, String)) {
+    let cause = recorded_cause(detail);
+    if let Some(code) = cause.and_then(artifact::candidate_check_failure) {
+        let (line, reason) = candidate_check_copy(code, target);
+        return (line, (code, reason));
+    }
+    let line = failed_before_handover_line(target, release, detail);
+    if cause.is_some_and(artifact::download_stalled) {
+        (
+            line,
+            (FailureCode::DownloadStalled, DOWNLOAD_STALLED_REASON.into()),
+        )
+    } else {
+        (
+            line,
+            (
+                FailureCode::InstallFailed,
+                format!("Raft Computer could not be upgraded to {target}."),
+            ),
+        )
+    }
+}
+
 /// The line for an upgrade K failed: why, when it was the download, and
 /// that nothing was changed.
 fn failed_before_handover_line(
@@ -1305,6 +1330,9 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
             let candidate = untouched
                 .then(|| artifact::candidate_check_failure(&error.to_string()))
                 .flatten();
+            let stalled = untouched
+                && artifact::is_download_failure(&error)
+                && artifact::download_stalled(&error.to_string());
             let (line, reason) = if let Some(code) = candidate {
                 candidate_check_copy(code, &plan.manifest.version)
             } else if untouched && artifact::is_download_failure(&error) {
@@ -1312,7 +1340,11 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                     bounded_line(format!(
                         "{error}. Nothing was changed. Run the same install command again."
                     )),
-                    "The installation could not finish.".into(),
+                    if stalled {
+                        DOWNLOAD_STALLED_REASON.into()
+                    } else {
+                        "The installation could not finish.".into()
+                    },
                 )
             } else if untouched {
                 (
@@ -1339,6 +1371,8 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                 Some((
                     if let Some(code) = candidate {
                         code
+                    } else if stalled {
+                        FailureCode::DownloadStalled
                     } else if untouched {
                         FailureCode::InstallFailed
                     } else {
@@ -2394,13 +2428,24 @@ mod before_handover_tests {
 
     #[test]
     fn a_download_failure_names_its_cause_and_that_nothing_changed() {
-        let timed_out = "Could not download Raft Computer from https://hands.example/dl/raft-computer-cli/releases/1/linux-x64: the download timed out. Nothing was changed. Run the same install command again.";
-        for diagnostic in [
-            "DOWNLOAD_FAILED: overall timeout",
-            "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout",
+        let from = "Could not download Raft Computer from https://hands.example/dl/raft-computer-cli/releases/1/linux-x64";
+        let rest = "Nothing was changed. Run the same install command again.";
+        for (diagnostic, cause) in [
+            (
+                "DOWNLOAD_FAILED: overall timeout",
+                "the download did not finish within 10 minutes",
+            ),
+            (
+                "DOWNLOAD_FAILED: response timeout",
+                "the download timed out",
+            ),
+            (
+                "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout",
+                "the download stopped receiving data for 30 s; check this computer's internet connection",
+            ),
         ] {
             let line = failed_before_handover_line("1.1.0", &release(), &detail(diagnostic));
-            assert_eq!(line, timed_out);
+            assert_eq!(line, format!("{from}: {cause}. {rest}"));
         }
         let generic =
             "Could not upgrade to 1.1.0. Nothing was changed. Run the same install command again.";
@@ -2408,6 +2453,68 @@ mod before_handover_tests {
         assert_eq!(line, generic);
         let line = failed_before_handover_line("1.1.0", &release(), &BTreeMap::new());
         assert_eq!(line, generic);
+    }
+
+    /// 11-15: a candidate download that stops receiving data fails as
+    /// download_stalled, with product-language copy and a valid receipt.
+    #[test]
+    fn a_stalled_candidate_download_fails_as_download_stalled() {
+        for diagnostic in [
+            "DOWNLOAD_FAILED: idle timeout",
+            "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout",
+        ] {
+            let (line, (code, reason)) =
+                failed_before_handover("1.1.0", &release(), &detail(diagnostic));
+            assert_eq!(code, FailureCode::DownloadStalled);
+            assert_eq!(reason, DOWNLOAD_STALLED_REASON);
+            assert!(line.contains("stopped receiving data"), "{line}");
+            assert!(line.contains("Nothing was changed."), "{line}");
+            for text in [&line, &reason] {
+                assert!(!text.to_lowercase().contains("installer"), "{text}");
+                assert!(!text.contains(code.as_str()), "{text}");
+            }
+            let request = Request {
+                protocol_version: 1,
+                id: "request".into(),
+                command: "upgrade".into(),
+                version: Some("1.1.0".into()),
+                channel: None,
+                yes: true,
+                allow_downgrade: false,
+                presence: Presence::Unattended,
+                approved_by: "remote:request".into(),
+                recovery_only: false,
+                waiting_caller: None,
+                escape_failure: None,
+            };
+            let mut result = receipt(
+                &request,
+                Some("1.1.0".into()),
+                Some("1.0.0".into()),
+                Outcome::Failed,
+                line,
+            );
+            result.code = Some(code);
+            result.reason = Some(reason);
+            result.validate().unwrap();
+        }
+        for (diagnostic, code) in [
+            (
+                "DOWNLOAD_FAILED: overall timeout",
+                FailureCode::InstallFailed,
+            ),
+            (
+                "DOWNLOAD_FAILED: HTTP 503 Service Unavailable",
+                FailureCode::InstallFailed,
+            ),
+            (
+                "CANDIDATE_CHECK_TIMED_OUT: product command timed out after 120 s",
+                FailureCode::CandidateCheckTimedOut,
+            ),
+        ] {
+            let (_, (found, _)) = failed_before_handover("1.1.0", &release(), &detail(diagnostic));
+            assert_eq!(found, code, "{diagnostic}");
+        }
     }
 }
 

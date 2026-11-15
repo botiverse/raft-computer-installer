@@ -52,9 +52,11 @@ pub const UPGRADE_HOST_BUDGET_MS: u64 = 300_000;
 
 /// `release` is the one this runner may download (an upgrade's frozen
 /// selection). Its candidate is then fetched with the installer's downloader
-/// (its roots, proxy settings and minimum attempt budget) instead of K's
-/// default one; K still makes a single attempt. A recovery runner downloads
-/// nothing and keeps K's default.
+/// (its roots, proxy settings, stall timeout and download deadline) instead
+/// of K's default one; K still makes a single attempt, which a stall ends
+/// after `artifact::STALL_TIMEOUT`. The download is not inside the host
+/// budget (that bounds the preparation after it); the first worker's budget
+/// covers both. A recovery runner downloads nothing and keeps K's default.
 pub fn create(
     cfg: Config,
     source: Arc<dyn ReleaseSource>,
@@ -64,8 +66,8 @@ pub fn create(
 ) -> Result<Runner> {
     let controller = controller(&cfg)?;
     let mut runner = Runner::new(FileStore::new(&cfg.k_state), Arc::new(controller), source)?;
-    if let Some(release) = release {
-        runner.downloader = crate::artifact::release_downloader(release)?;
+    if release.is_some() {
+        runner.downloader = crate::artifact::release_downloader()?;
         runner.host_budget_ms = UPGRADE_HOST_BUDGET_MS;
     }
     runner.policy = Policy::Confirm;
@@ -139,16 +141,19 @@ mod tests {
             PhaseLog::default(),
         )
         .unwrap();
-        let expected = crate::artifact::release_downloader(&candidate)
-            .unwrap()
-            .policy
-            .budgets(size)
-            .unwrap();
         let budgets = runner.downloader.policy.budgets(size).unwrap();
-        assert_eq!(budgets.overall_ms, expected.overall_ms);
-        assert!(budgets.overall_ms >= 120_000, "{budgets:?}");
+        let deadline = crate::artifact::DOWNLOAD_DEADLINE.as_millis() as u64;
+        let stall = crate::artifact::STALL_TIMEOUT.as_millis() as u64;
+        assert_eq!(budgets.overall_ms, deadline, "{budgets:?}");
+        assert_eq!(budgets.idle_ms, stall, "{budgets:?}");
         // K's default would give this transfer well under a minute.
         assert!(TransferPolicy::default().budgets(size).unwrap().overall_ms < 60_000);
+        // 11-15: K's default gave the ~53 MB candidate ~14 minutes; it now
+        // gets the deadline whatever its size.
+        for size in [53 * 1000 * 1000, 150 * 1000 * 1000] {
+            let budgets = runner.downloader.policy.budgets(size).unwrap();
+            assert_eq!(budgets.overall_ms, deadline, "{size}");
+        }
         // A recovery runner downloads nothing and keeps K's default.
         let recovery = create(
             cfg,
@@ -200,6 +205,21 @@ mod tests {
         assert!(
             crate::supervisor::FIRST_ATTEMPT_BUDGET
                 >= std::time::Duration::from_millis(UPGRADE_HOST_BUDGET_MS) * 3,
+        );
+        // The candidate's download, its preparation and the handover (K's
+        // host calls, 120 s each, for the stop and the start) fit the first
+        // worker, which fits the Computer's 30-minute watch with a recovery
+        // worker after it.
+        let handover = std::time::Duration::from_secs(2 * 120);
+        assert!(
+            crate::supervisor::FIRST_ATTEMPT_BUDGET
+                >= crate::artifact::DOWNLOAD_DEADLINE
+                    + std::time::Duration::from_millis(UPGRADE_HOST_BUDGET_MS)
+                    + handover
+        );
+        assert!(
+            crate::supervisor::FIRST_ATTEMPT_BUDGET + crate::supervisor::RECOVERY_ATTEMPT_BUDGET
+                <= std::time::Duration::from_secs(30 * 60)
         );
     }
 

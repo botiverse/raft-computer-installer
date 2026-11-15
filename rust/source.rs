@@ -220,7 +220,10 @@ pub fn downloader() -> Result<k_carrier::artifact::Downloader> {
     .map_err(invalid)?;
     Ok(k_carrier::artifact::Downloader {
         client,
-        policy: Default::default(),
+        policy: k_carrier::artifact::TransferPolicy {
+            idle_ms: u64::try_from(crate::artifact::STALL_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            ..Default::default()
+        },
     })
 }
 
