@@ -136,6 +136,29 @@ under K's lock and only while K's transaction is at rest on the source
 version, and reports the upgrade failed with nothing changed. An operation
 left open at the handover or later stays unresolved for recovery.
 
+Before anything is stopped, a downloaded candidate (and, after a fresh install
+or repair publishes it, the installed copy) must answer `--version` with its
+own version within 120 s. That first run of a new ~150 MB file goes through
+the operating system's scan (macOS Gatekeeper/XProtect, Windows Defender),
+which can take tens of seconds on a busy machine; a binary that has run
+before gets 20 s. The bound covers starting the process too, and a check
+whose process outlives its kill is reported as timed out instead of waited
+for. A check that runs out of time fails with `candidate_check_timed_out`, a
+candidate that reports another version or fails to run with
+`candidate_check_failed`; both changed nothing.
+
+A request refused before it starts an operation of its own (held, declined,
+downgrade, release not resolved) while an earlier installation is still
+unresolved fails with `earlier_recovery_pending`: nothing was changed, the
+earlier installation's records are left for the repair, and the refusal's own
+code stays in `detail.requestCode`. A request that started its own repair of
+that installation and did not finish stays `unresolved` (`recovery_unresolved`).
+
+Receipts carry `detail.phasesMs`, a JSON object of wall-clock milliseconds per
+phase: `prepare`, `download`, `candidate_check` and `handover` (K's stop,
+replace, start and read-back) for an upgrade; `prepare`, `candidate_check`,
+`stop`, `swap`, `verify` and `start` for an install or repair.
+
 ### Service managers
 
 A service the product runs under a service manager is that manager's to stop

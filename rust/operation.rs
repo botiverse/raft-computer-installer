@@ -29,6 +29,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 /// A request id from a finished operation is refused. The usual cause is a
@@ -334,9 +335,15 @@ async fn settle_k(cfg: &Config) -> Result<()> {
     if let OperationRead::Observed { operation } = FileStore::new(&cfg.k_state).read_operation()
         && operation.outcome.is_none()
     {
-        runner::create(cfg.clone(), Arc::new(OfflineSource), false, None)?
-            .recover(None)
-            .await?;
+        runner::create(
+            cfg.clone(),
+            Arc::new(OfflineSource),
+            false,
+            None,
+            report::PhaseLog::default(),
+        )?
+        .recover(None)
+        .await?;
     }
     Ok(())
 }
@@ -379,6 +386,26 @@ fn recovery_hint_copy(previous_version: Option<&str>, running: Option<bool>) -> 
                 .into(),
             "Raft Computer's current status couldn't be confirmed.".into(),
         ),
+    }
+}
+
+/// The line and reason of a candidate that failed its first check, before
+/// anything was stopped or replaced.
+fn candidate_check_copy(code: FailureCode, target: &str) -> (String, String) {
+    if code == FailureCode::CandidateCheckTimedOut {
+        (
+            format!(
+                "The new Raft Computer {target} did not answer its first check in time, often because the operating system is still scanning the newly downloaded file. Nothing was changed. Run the same install command again."
+            ),
+            "The new Raft Computer version did not answer its first check in time; this is often the operating system scanning a newly downloaded file. Try again.".into(),
+        )
+    } else {
+        (
+            format!(
+                "The downloaded Raft Computer {target} failed its first check. Nothing was changed. Run the same install command again."
+            ),
+            "The downloaded Raft Computer version failed its first check.".into(),
+        )
     }
 }
 
@@ -553,6 +580,8 @@ fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Repl
 }
 
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
+    let preparing = Instant::now();
+    let prepares = matches!(plan.phase, Phase::Preparing | Phase::Ready);
     if plan.phase == Phase::Preparing {
         if recovery {
             return finish(
@@ -585,15 +614,38 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if plan.kind == Kind::Adopt {
             FileStore::new(&cfg.k_state).bootstrap_locked(from, &cfg.binary)?;
         }
+        if prepares {
+            report::add_phase(&mut plan.detail, "prepare", preparing.elapsed());
+        }
         transition(cfg, plan, Phase::Upgrading)?;
     }
     let store = FileStore::new(&cfg.k_state);
+    let phases = report::PhaseLog::default();
     let runner = runner::create(
         cfg.clone(),
         Arc::new(FrozenSource(plan.manifest.clone())),
         plan.request.allow_downgrade,
         Some(&plan.manifest.release),
+        phases.clone(),
     )?;
+    let response = execute_upgrade(cfg, plan, &store, &runner, recovery).await;
+    phases.drain_into(&mut plan.detail);
+    let response = match response? {
+        Ok(response) => response,
+        Err(reply) => return Ok(reply),
+    };
+    settle_upgrade(cfg, plan, response).await
+}
+
+/// K's part of an upgrade: the transaction, or the recovery of one this
+/// request left open. `Err(reply)` is a receipt this request already settled.
+async fn execute_upgrade(
+    cfg: &Config,
+    plan: &mut Plan,
+    store: &FileStore,
+    runner: &k_carrier::runner::Runner,
+    recovery: bool,
+) -> Result<std::result::Result<protocol::Response, Reply>> {
     let response = if recovery {
         match store.read_operation() {
             OperationRead::Observed { operation }
@@ -638,7 +690,8 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                             .into(),
                     )),
                     "Installation was interrupted before the upgrade transaction started. Run the same install command again.",
-                );
+                )
+                .map(Err);
             }
         }
     } else {
@@ -651,6 +704,14 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             })
             .await?
     };
+    Ok(Ok(response))
+}
+
+async fn settle_upgrade(
+    cfg: &Config,
+    plan: &mut Plan,
+    response: protocol::Response,
+) -> Result<Reply> {
     if response.exit_code == 2 && response.result == "busy" {
         return finish(
             cfg,
@@ -781,13 +842,19 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         ),
         // K fails an operation only before the handover (the candidate
         // could not be fetched, verified or prepared): nothing was changed.
-        _ => (
-            failed_before_handover_line(target, &plan.manifest.release, &plan.detail),
-            Some((
-                FailureCode::InstallFailed,
-                format!("Raft Computer could not be upgraded to {target}."),
-            )),
-        ),
+        _ => match recorded_cause(&plan.detail).and_then(artifact::candidate_check_failure) {
+            Some(code) => {
+                let (line, reason) = candidate_check_copy(code, target);
+                (line, Some((code, reason)))
+            }
+            None => (
+                failed_before_handover_line(target, &plan.manifest.release, &plan.detail),
+                Some((
+                    FailureCode::InstallFailed,
+                    format!("Raft Computer could not be upgraded to {target}."),
+                )),
+            ),
+        },
     };
     finish(cfg, plan, outcome, failure, line)
 }
@@ -806,11 +873,20 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 "Installation was interrupted before changing installed files. Run the same install command again.",
             );
         }
+        let started = Instant::now();
+        let phases = report::PhaseLog::default();
         let candidate = if plan.kind == Kind::Repair {
-            artifact::acquire_repair(cfg, &plan.manifest).await?
+            artifact::acquire_repair(cfg, &plan.manifest, &phases).await
         } else {
-            artifact::acquire(cfg, &plan.manifest).await?
+            artifact::acquire(cfg, &plan.manifest, &phases).await
         };
+        // Download, verification and staging; the check is its own phase.
+        let prepare = started
+            .elapsed()
+            .saturating_sub(phases.total("candidate_check"));
+        phases.add("prepare", prepare);
+        phases.drain_into(&mut plan.detail);
+        let candidate = candidate?;
         if let Some(path) = &candidate.sidecar_quarantine {
             plan.detail.insert(
                 "sidecarQuarantine".into(),
@@ -863,6 +939,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         )?;
     }
     if plan.phase == Phase::Stopping {
+        let started = Instant::now();
         // The K writer lock is held while the old controller and product effects
         // are fenced and the product is stopped. It is reacquired by quarantine.
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
@@ -904,8 +981,15 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         }
         plan.detail
             .insert("forcedStops".into(), serde_json::to_string(&forced)?);
+        report::add_phase(&mut plan.detail, "stop", started.elapsed());
         transition(cfg, plan, Phase::Quarantining)?;
     }
+    // Quarantine, seeding and publication replace the installed program.
+    let swapping = Instant::now();
+    let swaps = matches!(
+        plan.phase,
+        Phase::Quarantining | Phase::Seeding | Phase::Publishing
+    );
     if plan.phase == Phase::Quarantining {
         let destination = cfg
             .installer_dir
@@ -954,10 +1038,18 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             ));
         }
         host::publish(cfg, Slot::Stable)?;
+        if swaps {
+            report::add_phase(&mut plan.detail, "swap", swapping.elapsed());
+        }
         transition(cfg, plan, Phase::Verifying)?;
     }
     if plan.phase == Phase::Verifying {
-        if computer::self_report(&cfg.binary, cfg).await?.version != plan.manifest.version {
+        let started = Instant::now();
+        // The published program is a new file too: its first run gets the
+        // same allowance as the candidate's.
+        let report = computer::first_run_report(&cfg.binary, cfg).await;
+        report::add_phase(&mut plan.detail, "verify", started.elapsed());
+        if report?.version != plan.manifest.version {
             return Err(Error::Uncertain(
                 "published program did not report the selected version".into(),
             ));
@@ -980,6 +1072,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Starting)?;
     }
     if plan.phase == Phase::Starting {
+        let started = Instant::now();
         if plan.running == Some(true) || plan.setup_succeeded {
             let evidence = match host::live_evidence(cfg).await {
                 Ok(evidence) => evidence,
@@ -1025,6 +1118,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 }
             }
         }
+        report::add_phase(&mut plan.detail, "start", started.elapsed());
         let outcome = if plan.kind == Kind::Repair {
             Outcome::Repaired
         } else {
@@ -1181,7 +1275,12 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                 plan.detail.insert("warning".into(), warning);
             }
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
-            let (line, reason) = if untouched && artifact::is_download_failure(&error) {
+            let candidate = untouched
+                .then(|| artifact::candidate_check_failure(&error.to_string()))
+                .flatten();
+            let (line, reason) = if let Some(code) = candidate {
+                candidate_check_copy(code, &plan.manifest.version)
+            } else if untouched && artifact::is_download_failure(&error) {
                 (
                     bounded_line(format!(
                         "{error}. Nothing was changed. Run the same install command again."
@@ -1211,7 +1310,9 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                     Outcome::Unresolved
                 },
                 Some((
-                    if untouched {
+                    if let Some(code) = candidate {
+                        code
+                    } else if untouched {
                         FailureCode::InstallFailed
                     } else {
                         FailureCode::RecoveryUnresolved
@@ -1236,7 +1337,9 @@ fn reject(
     let mut result = receipt(request, target, from, Outcome::Held, line.into());
     result.code = Some(failure.0);
     result.reason = Some(failure.1);
-    result.preserve_unresolved(unresolved);
+    // Refused before an operation of its own started: an earlier unresolved
+    // installation makes this `earlier_recovery_pending`, not unresolved.
+    result.refuse_for_earlier_recovery(unresolved);
     Ok(Reply::receipt(result.finish(cfg)?))
 }
 
@@ -1537,7 +1640,7 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
                 None => error.to_string(),
             };
             result.detail.insert("diagnostic".into(), diagnostic);
-            result.preserve_unresolved(unresolved);
+            result.refuse_for_earlier_recovery(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));
         }
     };
@@ -1632,6 +1735,75 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         },
     )?;
     resume(cfg, &mut plan, false).await
+}
+
+#[cfg(test)]
+mod candidate_check_copy_tests {
+    use super::*;
+
+    #[test]
+    fn a_candidate_check_failure_says_what_happened() {
+        let (line, reason) = candidate_check_copy(FailureCode::CandidateCheckTimedOut, "1.25.3");
+        assert_eq!(
+            reason,
+            "The new Raft Computer version did not answer its first check in time; this is often the operating system scanning a newly downloaded file. Try again."
+        );
+        assert_eq!(
+            line,
+            "The new Raft Computer 1.25.3 did not answer its first check in time, often because the operating system is still scanning the newly downloaded file. Nothing was changed. Run the same install command again."
+        );
+        let (line, reason) = candidate_check_copy(FailureCode::CandidateCheckFailed, "1.25.3");
+        assert_eq!(
+            reason,
+            "The downloaded Raft Computer version failed its first check."
+        );
+        assert!(line.contains("Nothing was changed."));
+    }
+
+    /// The receipt an upgrade K failed in candidate preparation now carries:
+    /// valid, with the specific code, and no code text in its line.
+    #[test]
+    fn a_failed_candidate_check_makes_a_valid_receipt() {
+        for code in [
+            FailureCode::CandidateCheckTimedOut,
+            FailureCode::CandidateCheckFailed,
+        ] {
+            let (line, reason) = candidate_check_copy(code, "1.25.3");
+            let request = Request {
+                protocol_version: 1,
+                id: "request".into(),
+                command: "upgrade".into(),
+                version: Some("1.25.3".into()),
+                channel: None,
+                yes: true,
+                allow_downgrade: false,
+                presence: Presence::Unattended,
+                approved_by: "remote:request".into(),
+                recovery_only: false,
+                waiting_caller: None,
+                escape_failure: None,
+            };
+            let mut result = receipt(
+                &request,
+                Some("1.25.3".into()),
+                Some("1.25.2".into()),
+                Outcome::Failed,
+                line,
+            );
+            result.code = Some(code);
+            result.reason = Some(reason);
+            report::add_phase(
+                &mut result.detail,
+                "candidate_check",
+                std::time::Duration::from_secs(120),
+            );
+            result.validate().unwrap();
+            let reply = Reply::receipt(result);
+            reply.validate("request").unwrap();
+            assert_eq!(reply.exit_code, 1);
+            assert_eq!(reply.code, Some(code));
+        }
+    }
 }
 
 #[cfg(test)]

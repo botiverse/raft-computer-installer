@@ -287,8 +287,9 @@ pub async fn prepare(
     cfg: &Config,
     path: &std::path::Path,
     release: &k_carrier::artifact::Release,
+    phases: &crate::report::PhaseLog,
 ) -> Result<()> {
-    artifact::check_candidate(cfg, path, release).await?;
+    artifact::check_candidate(cfg, path, release, phases).await?;
     let operation = operation(cfg)?;
     if operation.target_version != release.version || operation.outcome.is_some() {
         return Err(invalid("candidate preparation transaction mismatch"));

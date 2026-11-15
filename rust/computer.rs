@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, ffi::OsString, fs, path::Path, process::Stdio, 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -161,12 +161,58 @@ async fn bounded_read(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Vec
     }
 }
 
+/// The error text of a product command that did not finish within its
+/// budget, at the start of every such error (see `timed_out`).
+pub const COMMAND_TIMED_OUT: &str = "product command timed out";
+
+/// How long a killed command may take to be observed exiting.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// A `--version` check of a binary that has run on this machine before.
+pub const SELF_REPORT_BUDGET: Duration = Duration::from_secs(20);
+
+/// A `--version` check of a file this run has just written: the first
+/// execution of a new ~150 MB executable goes through the operating system's
+/// malware and signature assessment (macOS Gatekeeper/XProtect, Windows
+/// Defender), which on a busy machine took longer than 20 s. Callers must
+/// leave room for it in any enclosing deadline (runner.rs, supervisor.rs).
+pub const FIRST_RUN_BUDGET: Duration = Duration::from_secs(120);
+
+/// What a command that outlives its budget, and then its kill, means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lingering {
+    /// It may still act on the installation: the result is uncertain.
+    Uncertain,
+    /// It cannot (a read-only check in its own temporary home): the timeout
+    /// is reported as a timeout, naming that the process had not exited.
+    TimedOut,
+}
+
+pub fn timed_out(error: &Error) -> bool {
+    matches!(error, Error::Invalid(message) if message.starts_with(COMMAND_TIMED_OUT))
+}
+
 pub async fn run(
     binary: &Path,
     args: &[&str],
     environment: &BTreeMap<OsString, OsString>,
     budget: Duration,
 ) -> Result<CommandResult> {
+    run_bounded(binary, args, environment, budget, Lingering::Uncertain).await
+}
+
+/// Runs a product command within `budget`, from before the process is
+/// created until its output is read. Starting it counts: an executable's
+/// first exec can wait in the kernel for the operating system's scan, and a
+/// start that blocked this task would also block every deadline above it.
+pub async fn run_bounded(
+    binary: &Path,
+    args: &[&str],
+    environment: &BTreeMap<OsString, OsString>,
+    budget: Duration,
+    lingering: Lingering,
+) -> Result<CommandResult> {
+    let deadline = Instant::now() + budget;
     let mut command = Command::new(binary);
     command
         .args(args)
@@ -181,9 +227,24 @@ pub async fn run(
     }
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW; setup uses the retained console instead.
-    let mut child = command
-        .spawn()
-        .map_err(|_| invalid("product command could not start"))?;
+    // A start still pending at the deadline is abandoned: its child, if the
+    // start completes later, is dropped and killed (`kill_on_drop`).
+    let spawned = tokio::task::spawn_blocking(move || command.spawn());
+    let mut child = match timeout_at(deadline, spawned).await {
+        Ok(Ok(Ok(child))) => child,
+        Ok(_) => return Err(invalid("product command could not start")),
+        Err(_) => {
+            return Err(match lingering {
+                Lingering::Uncertain => {
+                    Error::Uncertain("product command start did not return".into())
+                }
+                Lingering::TimedOut => invalid(format!(
+                    "{COMMAND_TIMED_OUT} after {} s; its start had not returned",
+                    budget.as_secs()
+                )),
+            });
+        }
+    };
     let pid = child
         .id()
         .ok_or_else(|| invalid("product command has no process identity"))?;
@@ -195,7 +256,7 @@ pub async fn run(
         .stderr
         .take()
         .ok_or_else(|| invalid("product stderr unavailable"))?;
-    let result = timeout(budget, async {
+    let result = timeout_at(deadline, async {
         tokio::try_join!(child.wait(), bounded_read(stdout), bounded_read(stderr))
     })
     .await;
@@ -208,40 +269,61 @@ pub async fn run(
             pid,
         }),
         failure => {
-            // Wait for the bounded controller process before returning. The K
+            // Wait, bounded, for the killed process before returning. The K
             // host fence also accounts for controllers after a worker crash.
             let _ = child.start_kill();
-            if !matches!(
-                timeout(Duration::from_secs(5), child.wait()).await,
-                Ok(Ok(_))
-            ) {
-                return Err(crate::Error::Uncertain(
-                    "product command could not be reaped".into(),
-                ));
+            let exited = matches!(timeout(KILL_WAIT, child.wait()).await, Ok(Ok(_)));
+            if failure.is_ok() {
+                return Err(if exited {
+                    invalid("product command output could not be read")
+                } else {
+                    Error::Uncertain("product command could not be reaped".into())
+                });
             }
-            Err(invalid(if failure.is_err() {
-                "product command timed out"
-            } else {
-                "product command output could not be read"
-            }))
+            match (exited, lingering) {
+                (true, _) => Err(invalid(format!(
+                    "{COMMAND_TIMED_OUT} after {} s",
+                    budget.as_secs()
+                ))),
+                (false, Lingering::Uncertain) => Err(Error::Uncertain(
+                    "product command could not be reaped".into(),
+                )),
+                (false, Lingering::TimedOut) => Err(invalid(format!(
+                    "{COMMAND_TIMED_OUT} after {} s; it had not exited {} s after it was killed",
+                    budget.as_secs(),
+                    KILL_WAIT.as_secs()
+                ))),
+            }
         }
     }
 }
 
+/// `--version` of a binary that has run here before, in a temporary home.
 pub async fn self_report(binary: &Path, cfg: &Config) -> Result<Evidence> {
+    report_version(binary, cfg, SELF_REPORT_BUDGET, Lingering::Uncertain).await
+}
+
+/// `--version` of a file this run has just written (FIRST_RUN_BUDGET). A run
+/// that outlives its budget and then its kill is reported as a timeout, not
+/// an uncertain effect: in its temporary home it has nothing to change, and
+/// nothing has been stopped or replaced yet when the check runs.
+pub async fn first_run_report(binary: &Path, cfg: &Config) -> Result<Evidence> {
+    report_version(binary, cfg, FIRST_RUN_BUDGET, Lingering::TimedOut).await
+}
+
+async fn report_version(
+    binary: &Path,
+    cfg: &Config,
+    budget: Duration,
+    lingering: Lingering,
+) -> Result<Evidence> {
     let home = tempfile::Builder::new()
         .prefix("raft-installer-probe-")
         .tempdir()?;
     let mut environment = cfg.environment();
     environment.insert("RAFT_HOME".into(), home.path().as_os_str().to_owned());
     environment.insert("SLOCK_HOME".into(), home.path().as_os_str().to_owned());
-    let result = run(
-        binary,
-        &["--version"],
-        &environment,
-        Duration::from_secs(20),
-    )
-    .await?;
+    let result = run_bounded(binary, &["--version"], &environment, budget, lingering).await?;
     if !result.success {
         return Err(invalid("product self-report failed"));
     }
@@ -687,5 +769,76 @@ mod installer_lifecycle_env_tests {
                 .contains_key(std::ffi::OsStr::new(INSTALLER_LIFECYCLE_ENV)),
             "only the product helper carries it"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_run_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("product");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_command_past_its_budget_is_killed_and_reported_as_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "sleep 30");
+        for lingering in [Lingering::Uncertain, Lingering::TimedOut] {
+            let started = std::time::Instant::now();
+            let error = run_bounded(
+                &product,
+                &["--version"],
+                &BTreeMap::new(),
+                Duration::from_millis(300),
+                lingering,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(timed_out(&error), "{error}");
+            assert!(!error.is_uncertain());
+            assert!(error.to_string().starts_with(COMMAND_TIMED_OUT), "{error}");
+            // Killed, not waited out.
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_within_its_budget_reports_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let product = script(dir.path(), "echo 1.25.3");
+        let result = run_bounded(
+            &product,
+            &["--version"],
+            &BTreeMap::new(),
+            Duration::from_secs(20),
+            Lingering::TimedOut,
+        )
+        .await
+        .unwrap();
+        assert!(result.success);
+        assert_eq!(result.stdout, b"1.25.3\n");
+    }
+
+    #[test]
+    fn only_a_timeout_reads_as_one() {
+        assert!(timed_out(&invalid(format!(
+            "{COMMAND_TIMED_OUT} after 120 s; it had not exited 5 s after it was killed"
+        ))));
+        assert!(!timed_out(&invalid("product self-report failed")));
+        assert!(!timed_out(&Error::Uncertain(COMMAND_TIMED_OUT.into())));
+    }
+
+    /// The first run of a new file gets the longer allowance; a binary that
+    /// has run before keeps the short one.
+    #[test]
+    fn first_runs_get_the_longer_budget() {
+        assert_eq!(SELF_REPORT_BUDGET, Duration::from_secs(20));
+        assert_eq!(FIRST_RUN_BUDGET, Duration::from_secs(120));
     }
 }
