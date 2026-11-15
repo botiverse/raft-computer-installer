@@ -18,6 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::time::Instant;
 
 const PROGRESS_BAR_WIDTH: u64 = 30;
 /// A download failure is user-facing and starts with this text, so the
@@ -53,10 +54,7 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
                 if detail == STALLED_DETAIL {
                     stalled_cause()
                 } else if detail == "overall timeout" {
-                    format!(
-                        "the download did not finish within {} minutes",
-                        DOWNLOAD_DEADLINE.as_secs() / 60
-                    )
+                    "the connection was too slow to finish the download in time".into()
                 } else if detail.ends_with("timeout") {
                     "the download timed out".into()
                 } else if let Some(status) = detail.strip_prefix("HTTP ") {
@@ -97,22 +95,25 @@ const DOWNLOAD_RETRY_DELAYS: [Duration; 4] = [
 ];
 
 /// A transfer that receives no byte for this long is stalled, and its
-/// attempt ends (K's idle timeout, between two body chunks). 30 s: by then
-/// TCP has backed off through about five retransmissions, so the connection
-/// is gone rather than slow, and a CDN does not pause a body it is sending
-/// that long. Five stalled attempts and their pauses end within 4 minutes.
+/// attempt ends: K's idle timeout between two body chunks, whose default
+/// this already was, now named and set explicitly. 30 s: by then TCP has
+/// backed off through about five retransmissions, so the connection is gone
+/// rather than slow, and a CDN does not pause a body it is sending that long.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Every attempt of one download, the pauses between them included, ends
-/// this long after the first began. An attempt is bounded by what is left of
-/// it, not by K's size-based budget (the transfer size over 64 KiB/s plus
-/// 30 s: ~14 minutes for the Computer's gzip, 30 for an uncompressed one), so
-/// a slow transfer that keeps receiving data may use all of it and a stalled
-/// one is retried instead. 10 minutes: an upgrade's first worker
-/// (supervisor::FIRST_ATTEMPT_BUDGET, 20 minutes) must still fit K's
-/// preparation (runner::UPGRADE_HOST_BUDGET_MS, 5 minutes) and the handover
-/// after the download, inside the Computer's 30-minute watch.
+/// The installer's own downloads for one request (a fresh install's or
+/// repair's support file and Raft Computer; an upgrade's support file):
+/// every attempt and the pauses between them end this long after the first
+/// began. They were unbounded (five attempts of K's size-based budget, ~14
+/// minutes each for the Computer's gzip). An upgrade's candidate is not
+/// bounded by this: K fetches it in one attempt with K's size-based budget
+/// (`release_downloader`).
 pub const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(600);
+
+/// When the installer's downloads for a request that starts them now end.
+pub fn download_deadline() -> Instant {
+    Instant::now() + DOWNLOAD_DEADLINE
+}
 
 /// K's error for a stalled attempt.
 const STALLED_DETAIL: &str = "idle timeout";
@@ -140,6 +141,33 @@ fn attempt_policy(policy: TransferPolicy, remaining: Duration) -> TransferPolicy
     TransferPolicy {
         minimum_bytes_per_second: 1,
         maximum_overall_ms: remaining.max(policy.response_ms),
+        ..policy
+    }
+}
+
+/// The least overall time an upgrade candidate's single attempt gets. K
+/// budgets a transfer at its size over 64 KiB/s plus the 30 s first-response
+/// allowance, so a small file on a slow link (#proj-raft-computer:#49)
+/// failed after well under a minute, every time.
+const MINIMUM_ATTEMPT_MS: u64 = 120_000;
+
+/// K's policy exposes no minimum overall budget, so the floor is reached by
+/// lowering the required rate for a small transfer until its size takes at
+/// least the floor minus the first-response allowance. Large transfers,
+/// whose own budget exceeds the floor, keep K's size-based budget (~14
+/// minutes for the Computer's ~53 MB gzip).
+fn with_minimum_attempt(policy: TransferPolicy, size: u64) -> TransferPolicy {
+    let body_ms = MINIMUM_ATTEMPT_MS.saturating_sub(policy.response_ms);
+    if body_ms == 0 {
+        return policy;
+    }
+    // Rounded down, so size / rate is never shorter than body_ms.
+    let rate = u64::try_from(u128::from(size) * 1000 / u128::from(body_ms))
+        .unwrap_or(u64::MAX)
+        .max(1);
+    TransferPolicy {
+        minimum_bytes_per_second: policy.minimum_bytes_per_second.min(rate),
+        maximum_overall_ms: policy.maximum_overall_ms.max(MINIMUM_ATTEMPT_MS),
         ..policy
     }
 }
@@ -217,6 +245,7 @@ async fn download(
     release: &Release,
     resume_dir: &Path,
     label: &'static str,
+    ends: Instant,
 ) -> Result<Vec<u8>> {
     download_with_retries(
         downloader,
@@ -224,7 +253,7 @@ async fn download(
         resume_dir,
         label,
         &DOWNLOAD_RETRY_DELAYS,
-        DOWNLOAD_DEADLINE,
+        ends,
     )
     .await
 }
@@ -240,13 +269,14 @@ fn transfer_url(release: &Release) -> &str {
 }
 
 /// The installer's downloader for an upgrade's candidate: the installer's
-/// roots, proxy settings and stall timeout (`source::downloader`), and
-/// `DOWNLOAD_DEADLINE` for its transfer. K's runner downloads the candidate
-/// with this, not with K's own `Downloader::new()`, in a single attempt.
-pub fn release_downloader() -> Result<Downloader> {
+/// roots, proxy settings and stall timeout (`source::downloader`), and K's
+/// size-based budget with at least `MINIMUM_ATTEMPT_MS` for its transfer.
+/// K's runner downloads the candidate with this, not with K's own
+/// `Downloader::new()`, in a single attempt.
+pub fn release_downloader(release: &Release) -> Result<Downloader> {
     let downloader = crate::source::downloader()?;
     Ok(Downloader {
-        policy: attempt_policy(downloader.policy, DOWNLOAD_DEADLINE),
+        policy: with_minimum_attempt(downloader.policy, transfer_size(release)),
         ..downloader
     })
 }
@@ -257,9 +287,8 @@ async fn download_with_retries(
     resume_dir: &Path,
     label: &'static str,
     delays: &[Duration],
-    deadline: Duration,
+    ends: Instant,
 ) -> Result<Vec<u8>> {
-    let started = tokio::time::Instant::now();
     let partial = partial_path(resume_dir, transfer_url(release));
     let mut delays = delays.iter();
     let mut restarted_after_forbidden = false;
@@ -269,7 +298,7 @@ async fn download_with_retries(
             client: downloader.client.clone(),
             policy: attempt_policy(
                 downloader.policy,
-                deadline.saturating_sub(started.elapsed()),
+                ends.saturating_duration_since(Instant::now()),
             ),
         };
         let error = match attempt
@@ -289,8 +318,7 @@ async fn download_with_retries(
         }
         // Another attempt only while it would still have time to be answered.
         let delay = delays.next().filter(|delay| {
-            started.elapsed() + **delay + Duration::from_millis(downloader.policy.response_ms)
-                <= deadline
+            Instant::now() + **delay + Duration::from_millis(downloader.policy.response_ms) <= ends
         });
         match delay {
             Some(delay) if restart => {
@@ -613,7 +641,13 @@ pub fn adopt_installed_sidecar(cfg: &Config, version: &str) -> Result<()> {
     )
 }
 
-pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option<PathBuf>> {
+/// `ends`: when the request's downloads end (`download_deadline`), shared
+/// with the Raft Computer download after it on a fresh install.
+pub async fn acquire_sidecar(
+    cfg: &Config,
+    manifest: &Manifest,
+    ends: Instant,
+) -> Result<Option<PathBuf>> {
     let dir = cfg.sidecar_dir(&manifest.version)?;
     ensure_dir(&dir)?;
     let record = SidecarRecord {
@@ -646,6 +680,7 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
                     release,
                     &dir,
                     "Raft Computer support file",
+                    ends,
                 )
                 .await?;
                 write_durable(&path, &bytes, false)?;
@@ -675,12 +710,15 @@ pub async fn acquire(
     version::exact(&manifest.version)?;
     let scratch = cfg.scratch();
     ensure_dir(&scratch)?;
-    let sidecar = acquire_sidecar(cfg, manifest).await?;
+    // One deadline for both downloads: they share the first worker.
+    let ends = download_deadline();
+    let sidecar = acquire_sidecar(cfg, manifest, ends).await?;
     let bytes = download(
         &crate::source::downloader()?,
         &manifest.release,
         &scratch,
         "Raft Computer",
+        ends,
     )
     .await?;
     check_platform(&bytes)?;
@@ -716,11 +754,13 @@ pub async fn acquire_repair(
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
     let downloader = crate::source::downloader()?;
+    let ends = download_deadline();
     let bytes = download(
         &downloader,
         &manifest.release,
         &cfg.scratch(),
         "Raft Computer",
+        ends,
     )
     .await?;
     check_platform(&bytes)?;
@@ -736,6 +776,7 @@ pub async fn acquire_repair(
                 release,
                 &cfg.scratch(),
                 "Raft Computer support file",
+                ends,
             )
             .await?;
             write_durable(&directory.path().join(SIDECAR_NAME), &bytes, false)?;
@@ -941,6 +982,12 @@ mod retry_tests {
         /// Answer as `Serve`, send `n` bytes of the body, then keep the
         /// connection open and send nothing more.
         StallAfter(usize),
+        /// As `Trickle` for `pieces` pieces, then as `StallAfter`.
+        TrickleThenStall {
+            piece: usize,
+            pause_ms: u64,
+            pieces: usize,
+        },
     }
 
     struct Server {
@@ -999,6 +1046,18 @@ mod retry_tests {
                                     break;
                                 }
                             }
+                        }
+                        Reply::TrickleThenStall {
+                            piece,
+                            pause_ms,
+                            pieces,
+                        } => {
+                            let rest = head(&mut stream, &request, &body);
+                            for part in rest.chunks(piece).take(pieces) {
+                                std::thread::sleep(Duration::from_millis(pause_ms));
+                                let _ = stream.write_all(part).and_then(|()| stream.flush());
+                            }
+                            held.push(stream);
                         }
                         Reply::StallAfter(n) => {
                             let rest = head(&mut stream, &request, &body);
@@ -1114,7 +1173,7 @@ mod retry_tests {
             dir,
             "Raft Computer support file",
             &NO_WAIT,
-            deadline,
+            Instant::now() + deadline,
         )
         .await
     }
@@ -1208,9 +1267,8 @@ mod retry_tests {
         let retry = [Duration::from_millis(10)];
         let label = "Raft Computer";
         let downloader = downloader();
-        let deadline = DOWNLOAD_DEADLINE;
-        let fetched =
-            download_with_retries(&downloader, &release, dir.path(), label, &retry, deadline);
+        let ends = download_deadline();
+        let fetched = download_with_retries(&downloader, &release, dir.path(), label, &retry, ends);
         let error = fetched.await.unwrap_err();
         assert!(error.to_string().contains("HTTP 416"), "{error}");
         assert_eq!(server.requests().len(), 2);
@@ -1486,10 +1544,48 @@ mod retry_tests {
         assert!(
             error
                 .to_string()
-                .ends_with("the download did not finish within 10 minutes"),
+                .ends_with("the connection was too slow to finish the download in time"),
             "{error}"
         );
         assert_eq!(server.requests().len(), 1);
+    }
+
+    /// A retry gets what is left of the deadline, not a new one: the first
+    /// attempt runs ~2.5 s (2 s of data, then a stall), the second trickles
+    /// past the deadline and ends at it (4 s), not 4 s after it began.
+    #[tokio::test]
+    async fn a_retry_gets_only_the_time_left() {
+        let body = body();
+        let script = vec![
+            Reply::TrickleThenStall {
+                piece: 1024,
+                pause_ms: 200,
+                pieces: 10,
+            },
+            Reply::Trickle {
+                piece: 1024,
+                pause_ms: 100,
+            },
+        ];
+        let server = Server::start(body.clone(), script);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_secs(4);
+        let error = fetch_within(&server, &body, dir.path(), deadline)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(3900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(5500), "{elapsed:?}");
+        assert!(
+            error
+                .to_string()
+                .ends_with("the connection was too slow to finish the download in time"),
+            "{error}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].contains("range: bytes=10240-"), "{requests:?}");
     }
 
     /// An attempt is bounded by what is left of the deadline, whatever the

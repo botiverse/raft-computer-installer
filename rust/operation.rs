@@ -416,12 +416,12 @@ pub(crate) async fn published_report(cfg: &Config) -> Result<k_carrier::state::E
     computer::first_run_report(&cfg.binary, cfg).await
 }
 
-/// The line and reason of a candidate that failed its first check, before
-/// anything was stopped or replaced.
 /// The reason of a download that ended because no data arrived (its line
 /// names the file and the URL).
 const DOWNLOAD_STALLED_REASON: &str = "The Raft Computer download stopped receiving data. Check this computer's internet connection and try again.";
 
+/// The line and reason of a candidate that failed its first check, before
+/// anything was stopped or replaced.
 fn candidate_check_copy(code: FailureCode, target: &str) -> (String, String) {
     if code == FailureCode::CandidateCheckTimedOut {
         (
@@ -626,7 +626,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 "Installation was interrupted before the upgrade started. Run the same install command again.",
             );
         }
-        artifact::acquire_sidecar(cfg, &plan.manifest).await?;
+        artifact::acquire_sidecar(cfg, &plan.manifest, artifact::download_deadline()).await?;
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
@@ -1327,38 +1327,16 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                 plan.detail.insert("warning".into(), warning);
             }
             let untouched = plan.phase == Phase::Preparing && !error.is_uncertain();
-            let candidate = untouched
-                .then(|| artifact::candidate_check_failure(&error.to_string()))
-                .flatten();
-            let stalled = untouched
-                && artifact::is_download_failure(&error)
-                && artifact::download_stalled(&error.to_string());
-            let (line, reason) = if let Some(code) = candidate {
-                candidate_check_copy(code, &plan.manifest.version)
-            } else if untouched && artifact::is_download_failure(&error) {
-                (
-                    bounded_line(format!(
-                        "{error}. Nothing was changed. Run the same install command again."
-                    )),
-                    if stalled {
-                        DOWNLOAD_STALLED_REASON.into()
-                    } else {
-                        "The installation could not finish.".into()
-                    },
-                )
-            } else if untouched {
-                (
-                    "The installation could not finish. Nothing was changed. Run the same install command again."
-                        .into(),
-                    "The installation could not finish.".into(),
-                )
+            let (line, failure) = if untouched {
+                failed_untouched(&error, &plan.manifest.version)
             } else {
-                recovery_hint_copy(
+                let (line, reason) = recovery_hint_copy(
                     plan.from_version.as_deref(),
                     plan.from_version
                         .as_ref()
                         .and_then(|_| host::read(cfg).ok().map(|state| state.running)),
-                )
+                );
+                (line, (FailureCode::RecoveryUnresolved, reason))
             };
             finish(
                 cfg,
@@ -1368,21 +1346,47 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
                 } else {
                     Outcome::Unresolved
                 },
-                Some((
-                    if let Some(code) = candidate {
-                        code
-                    } else if stalled {
-                        FailureCode::DownloadStalled
-                    } else if untouched {
-                        FailureCode::InstallFailed
-                    } else {
-                        FailureCode::RecoveryUnresolved
-                    },
-                    reason,
-                )),
+                Some(failure),
                 line,
             )
         }
+    }
+}
+
+/// The line, code and reason of a run that failed before it changed
+/// anything (an install's or repair's download or candidate check).
+fn failed_untouched(error: &Error, target: &str) -> (String, (FailureCode, String)) {
+    let text = error.to_string();
+    if let Some(code) = artifact::candidate_check_failure(&text) {
+        let (line, reason) = candidate_check_copy(code, target);
+        return (line, (code, reason));
+    }
+    if !artifact::is_download_failure(error) {
+        return (
+            "The installation could not finish. Nothing was changed. Run the same install command again."
+                .into(),
+            (
+                FailureCode::InstallFailed,
+                "The installation could not finish.".into(),
+            ),
+        );
+    }
+    let line = bounded_line(format!(
+        "{text}. Nothing was changed. Run the same install command again."
+    ));
+    if artifact::download_stalled(&text) {
+        (
+            line,
+            (FailureCode::DownloadStalled, DOWNLOAD_STALLED_REASON.into()),
+        )
+    } else {
+        (
+            line,
+            (
+                FailureCode::InstallFailed,
+                "The installation could not finish.".into(),
+            ),
+        )
     }
 }
 
@@ -2433,7 +2437,7 @@ mod before_handover_tests {
         for (diagnostic, cause) in [
             (
                 "DOWNLOAD_FAILED: overall timeout",
-                "the download did not finish within 10 minutes",
+                "the connection was too slow to finish the download in time",
             ),
             (
                 "DOWNLOAD_FAILED: response timeout",
@@ -2453,6 +2457,47 @@ mod before_handover_tests {
         assert_eq!(line, generic);
         let line = failed_before_handover_line("1.1.0", &release(), &BTreeMap::new());
         assert_eq!(line, generic);
+    }
+
+    /// A fresh install's or repair's download that ended stalled after its
+    /// retries fails as download_stalled; other failures keep their codes.
+    #[test]
+    fn a_stalled_install_download_fails_as_download_stalled() {
+        let release = release();
+        let stalled = artifact::named_download_failure(
+            "Raft Computer",
+            &release,
+            "DOWNLOAD_FAILED: idle timeout",
+        )
+        .unwrap();
+        let (line, (code, reason)) = failed_untouched(&invalid(stalled.clone()), "1.1.0");
+        assert_eq!(code, FailureCode::DownloadStalled);
+        assert_eq!(reason, DOWNLOAD_STALLED_REASON);
+        assert_eq!(
+            line,
+            format!("{stalled}. Nothing was changed. Run the same install command again.")
+        );
+        let slow = artifact::named_download_failure(
+            "Raft Computer",
+            &release,
+            "DOWNLOAD_FAILED: overall timeout",
+        )
+        .unwrap();
+        let (line, (code, reason)) = failed_untouched(&invalid(slow), "1.1.0");
+        assert_eq!(code, FailureCode::InstallFailed);
+        assert_eq!(reason, "The installation could not finish.");
+        assert!(line.contains("too slow"), "{line}");
+        let (_, (code, _)) = failed_untouched(
+            &invalid("CANDIDATE_CHECK_TIMED_OUT: product command timed out after 120 s"),
+            "1.1.0",
+        );
+        assert_eq!(code, FailureCode::CandidateCheckTimedOut);
+        let (line, (code, _)) = failed_untouched(&invalid("disk full"), "1.1.0");
+        assert_eq!(code, FailureCode::InstallFailed);
+        assert!(
+            line.starts_with("The installation could not finish."),
+            "{line}"
+        );
     }
 
     /// 11-15: a candidate download that stops receiving data fails as
