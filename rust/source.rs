@@ -242,6 +242,56 @@ pub(crate) fn certificate_rejected(error: &reqwest::Error) -> bool {
     false
 }
 
+/// Prefix of the error for a release lookup that never got an answer from
+/// Hands; the operation names Hands as unreachable instead of blaming the
+/// release (1.25.7 web upgrades: 4 of 4 "release could not be resolved" were
+/// timeouts or failed connections to hands.build).
+const UNREACHABLE: &str = "could not reach ";
+
+/// Hands gave no answer at all: a timeout, a refused or failed connection,
+/// a rejected certificate.
+pub fn is_unreachable(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Invalid(message) if message.starts_with(UNREACHABLE))
+}
+
+/// Pauses before the second and the third attempt of the release lookup.
+/// The download already retries; the lookup before it was a single attempt,
+/// so one dropped connection failed the whole upgrade.
+const LOOKUP_RETRY_PAUSES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Worth another attempt: no connection, or no answer in time. A rejected
+/// certificate is the network's policy and answers the same way again.
+fn transient(error: &reqwest::Error) -> bool {
+    (error.is_timeout() || error.is_connect()) && !certificate_rejected(error)
+}
+
+/// Sends `GET url`, again after each of `pauses` while the failure is
+/// transient. The error says how many attempts were made when more than one.
+async fn send_with_retry(
+    client: &Client,
+    url: &Url,
+    pauses: &[Duration],
+) -> Result<reqwest::Response> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.get(url.clone()).send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => match pauses.get(attempts - 1) {
+                Some(pause) if transient(&error) => tokio::time::sleep(*pause).await,
+                _ => {
+                    let error = unreachable(url, &error);
+                    return Err(if attempts > 1 {
+                        invalid(format!("{error} ({attempts} attempts)"))
+                    } else {
+                        error
+                    });
+                }
+            },
+        }
+    }
+}
+
 fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
     let cause = if error.is_timeout() {
         "the request timed out"
@@ -254,7 +304,7 @@ fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
     } else {
         "the request failed"
     };
-    invalid(format!("could not reach {}: {cause}", shown_url(url)))
+    invalid(format!("{UNREACHABLE}{}: {cause}", shown_url(url)))
 }
 
 impl Source {
@@ -308,12 +358,7 @@ impl Source {
     async fn json<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
         // The deadline covers the complete body, and chunk accounting also
         // bounds responses that omit or lie about Content-Length.
-        let mut response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|error| unreachable(&url, &error))?;
+        let mut response = send_with_retry(&self.client, &url, &LOOKUP_RETRY_PAUSES).await?;
         let status = response.status().as_u16();
         let final_url = response.url().clone();
         if response.status().is_redirection() {
@@ -601,5 +646,88 @@ mod roots_tests {
     fn a_failing_bundled_build_still_fails() {
         let result = build_with_roots(|_| Err::<Client, _>("broken"));
         assert!(matches!(result, Err("broken")));
+    }
+}
+
+#[cfg(test)]
+mod lookup_retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Bound but not listening: connections are refused, and the port stays
+    /// ours, so a test running in parallel cannot start a server on it.
+    fn refusing_socket() -> (socket2::Socket, Url) {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/updates/check")).unwrap();
+        (socket, url)
+    }
+
+    fn client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_lookup_is_tried_three_times_and_names_hands_unreachable() {
+        let (_socket, url) = refusing_socket();
+        let pauses = [Duration::ZERO, Duration::ZERO];
+        let error = send_with_retry(&client(), &url, &pauses).await.unwrap_err();
+        assert!(is_unreachable(&error), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("could not reach {url}: the connection failed (3 attempts)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_attempt_does_not_count_attempts() {
+        let (_socket, url) = refusing_socket();
+        let error = send_with_retry(&client(), &url, &[]).await.unwrap_err();
+        assert!(is_unreachable(&error));
+        assert_eq!(
+            error.to_string(),
+            format!("could not reach {url}: the connection failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_is_refused_once_succeeds_on_the_next_attempt() {
+        let (socket, url) = refusing_socket();
+        // The first attempt is refused; the server starts listening during the
+        // pause, so the second attempt gets the answer.
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            socket.listen(1).unwrap();
+            let listener: std::net::TcpListener = socket.into();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let pauses = [Duration::from_millis(500), Duration::from_millis(500)];
+        let response = send_with_retry(&client(), &url, &pauses).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn other_lookup_failures_are_not_called_unreachable() {
+        assert!(!is_unreachable(&invalid(
+            "release source returned HTTP 404"
+        )));
+        assert!(is_unreachable(&invalid(
+            "could not reach https://hands.build/x: the request timed out"
+        )));
     }
 }

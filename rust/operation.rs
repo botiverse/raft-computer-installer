@@ -1718,6 +1718,10 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             // elsewhere, so that cause names what to allow instead.
             let line = if source::is_network_redirect(&error) {
                 format!("Could not resolve the requested release. {error}")
+            } else if source::is_unreachable(&error) {
+                format!(
+                    "Could not check for the release: {error}. Nothing was changed. Check this computer's internet connection, then run the same install command again."
+                )
             } else {
                 format!(
                     "Could not resolve the requested release ({error}). Run the same install command again."
@@ -1733,6 +1737,8 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             result.code = Some(FailureCode::ReleaseResolutionFailed);
             result.reason = Some(if source::is_network_redirect(&error) {
                 "The network redirected the release request to another host.".into()
+            } else if source::is_unreachable(&error) {
+                "The release server could not be reached.".into()
             } else {
                 "The requested Raft Computer release could not be resolved.".into()
             });
