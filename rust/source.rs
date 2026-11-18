@@ -681,22 +681,28 @@ mod lookup_retry_tests {
         let (_socket, url) = refusing_socket();
         let pauses = [Duration::ZERO, Duration::ZERO];
         let error = send_with_retry(&client(), &url, &pauses).await.unwrap_err();
-        assert!(is_unreachable(&error), "{error}");
-        assert_eq!(
-            error.to_string(),
-            format!("could not reach {url}: the connection failed (3 attempts)")
+        // Linux refuses the connection; macOS lets it time out. Either is
+        // "no answer", retried, and named the same way.
+        let message = error.to_string();
+        assert!(is_unreachable(&error), "{message}");
+        assert!(
+            message.starts_with(&format!("could not reach {url}: ")),
+            "{message}"
         );
+        assert!(message.ends_with(" (3 attempts)"), "{message}");
     }
 
     #[tokio::test]
     async fn a_single_attempt_does_not_count_attempts() {
         let (_socket, url) = refusing_socket();
         let error = send_with_retry(&client(), &url, &[]).await.unwrap_err();
-        assert!(is_unreachable(&error));
-        assert_eq!(
-            error.to_string(),
-            format!("could not reach {url}: the connection failed")
+        let message = error.to_string();
+        assert!(is_unreachable(&error), "{message}");
+        assert!(
+            message.starts_with(&format!("could not reach {url}: ")),
+            "{message}"
         );
+        assert!(!message.contains("attempts"), "{message}");
     }
 
     #[tokio::test]
