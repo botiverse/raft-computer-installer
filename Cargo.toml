@@ -1,6 +1,6 @@
 [package]
 name = "raft-computer-installer"
-version = "0.4.3"
+version = "0.4.4-rc.1"
 edition = "2024"
 rust-version = "1.89"
 publish = false
@@ -25,7 +25,7 @@ required-features = ["verification-fixture"]
 verification-fixture = []
 
 [dependencies]
-k-carrier = "=0.3.5"
+k-carrier = "=0.3.6"
 async-trait = "0.1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
