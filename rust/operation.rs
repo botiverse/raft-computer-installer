@@ -627,6 +627,15 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             );
         }
         if already_installed(cfg, plan).await? {
+            // Refused as after a download: the target does not suit Raft
+            // Desktop's registration. Refusals that protect a stop do not
+            // apply, since nothing is stopped.
+            let registration = crate::host_supervisor::resolve(cfg).await;
+            if let Some(refusal) =
+                crate::host_supervisor::target_refusal(cfg, &registration, &plan.manifest.version)?
+            {
+                return refuse_supervised(cfg, plan, refusal);
+            }
             return finish_up_to_date(cfg, plan).await;
         }
         artifact::acquire_sidecar(cfg, &plan.manifest, artifact::download_deadline()).await?;
@@ -674,10 +683,11 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
 /// Whether an upgrade has nothing to do, decided before any download: K
 /// compares versions only after fetching the candidate. Only a plain upgrade
 /// of a complete installation qualifies: the installed version is the
-/// selected one, its sidecar matches its saved identity, and K is at rest
-/// with no open operation and that version as stable. Anything else (an
-/// adoption, a downgrade, a missing source version, a busy K) takes the
-/// usual path, which downloads first.
+/// selected one, its sidecar matches its saved identity and the release's,
+/// and K is at rest with that version as stable, consistent with its last
+/// operation. Anything else (an adoption, a downgrade, a missing source
+/// version, a busy or inconsistent K) takes the usual path, which downloads
+/// first and reports what is wrong.
 async fn already_installed(cfg: &Config, plan: &Plan) -> Result<bool> {
     let Some(from) = plan.from_version.as_deref() else {
         return Ok(false);
@@ -685,40 +695,77 @@ async fn already_installed(cfg: &Config, plan: &Plan) -> Result<bool> {
     if plan.kind != Kind::Upgrade || from != plan.manifest.version {
         return Ok(false);
     }
+    // Sidecar files are adopted under the K lock (`adopt_installed_sidecar`).
+    let Ok(_lock) = UpgradeLock::acquire(&cfg.k_state) else {
+        return Ok(false);
+    };
     // A missing record is accepted by the check for legacy installations;
     // here it means the installation is not known to be complete.
-    if artifact::saved_sidecar(cfg, from).is_err()
+    let Ok(saved) = artifact::saved_sidecar_identity(cfg, from) else {
+        return Ok(false);
+    };
+    let release = plan.manifest.sidecar.as_ref();
+    let same_sidecar = match (&saved, release) {
+        (None, None) => true,
+        (Some(saved), Some(release)) => {
+            saved.sha256 == release.sha256 && saved.size == release.size
+        }
+        _ => false,
+    };
+    if !same_sidecar
+        || artifact::saved_sidecar(cfg, from).is_err()
         || artifact::check_installed_sidecar(cfg, from).is_err()
     {
         return Ok(false);
     }
-    let Ok(_lock) = UpgradeLock::acquire(&cfg.k_state) else {
-        return Ok(false);
-    };
     let store = FileStore::new(&cfg.k_state);
-    match store.read_operation() {
-        OperationRead::Genesis => {}
-        OperationRead::Observed { operation } if operation.outcome.is_some() => {}
-        _ => return Ok(false),
-    }
+    // K's own rule for a settled operation (its recovery fails one that
+    // disagrees as SETTLED_OPERATION_STATE_MISMATCH).
+    let expected = match store.read_operation() {
+        OperationRead::Genesis => from.to_owned(),
+        OperationRead::Observed { operation } => match operation.outcome {
+            Some(k_carrier::state::Outcome::Promoted) => operation.target_version,
+            Some(_) => operation.from_version,
+            None => return Ok(false),
+        },
+        OperationRead::Unreadable { .. } => return Ok(false),
+    };
+    // The phase is the last journal entry's.
     let Ok(state) = store.transaction_state().await else {
         return Ok(false);
     };
-    Ok(state.phase().at_rest() && state.stable() == from)
+    Ok(state.phase().at_rest() && state.stable() == from && state.stable() == expected)
 }
 
 /// The up-to-date receipt of `already_installed`, with the running
 /// service's version read back as `settle_upgrade` does.
 async fn finish_up_to_date(cfg: &Config, plan: &mut Plan) -> Result<Reply> {
-    let running = host::answer(cfg).await?.running;
-    if running && host::live_evidence(cfg).await?.version != plan.manifest.version {
+    let live = if host::answer(cfg).await?.running {
+        Some(host::live_evidence(cfg).await?.version)
+    } else {
+        None
+    };
+    finish_up_to_date_with(cfg, plan, live)
+}
+
+/// `live` is the running service's attested version, None when stopped.
+fn finish_up_to_date_with(cfg: &Config, plan: &mut Plan, live: Option<String>) -> Result<Reply> {
+    if live
+        .as_ref()
+        .is_some_and(|version| *version != plan.manifest.version)
+    {
         return Err(Error::Uncertain(
             "running version does not match installed release".into(),
         ));
     }
     plan.detail.insert(
         "readback".into(),
-        if running { "service" } else { "candidate" }.into(),
+        if live.is_some() {
+            "service"
+        } else {
+            "candidate"
+        }
+        .into(),
     );
     let line = format!("{} is already installed.", plan.manifest.version);
     finish(cfg, plan, Outcome::UpToDate, None, line)
@@ -2905,5 +2952,164 @@ mod already_installed_tests {
             .persist_operation(&open_operation())
             .unwrap();
         assert!(!already_installed(&cfg, &plan).await.unwrap(), "open");
+    }
+
+    /// K's rule for a settled operation: stable is a promotion's target,
+    /// otherwise its source version.
+    #[tokio::test]
+    async fn k_disagreeing_with_its_last_operation_downloads_first() {
+        let server = Server::start();
+        let plan = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        let settled = |from: &str, target: &str, outcome| KOperation {
+            from_version: from.into(),
+            target_version: target.into(),
+            previous_stable_version: from.into(),
+            phase: OperationPhase::Promoted,
+            outcome: Some(outcome),
+            ..open_operation()
+        };
+        use k_carrier::state::Outcome as K;
+        for (operation, qualifies) in [
+            // Stable is 1.1.0 in every case.
+            (settled("1.0.0", "1.2.0", K::Promoted), false),
+            (settled("1.0.0", "1.1.0", K::RolledBack), false),
+            (settled("1.0.0", "1.1.0", K::Promoted), true),
+            (settled("1.1.0", "1.2.0", K::RolledBack), true),
+            (settled("1.1.0", "1.1.0", K::UpToDate), true),
+        ] {
+            let (_dir, cfg) = machine("1.1.0");
+            FileStore::new(&cfg.k_state)
+                .persist_operation(&operation)
+                .unwrap();
+            assert_eq!(
+                already_installed(&cfg, &plan).await.unwrap(),
+                qualifies,
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_unlike_the_release_downloads_first() {
+        let server = Server::start();
+        // A record of no sidecar against a release that has one.
+        let (_dir, cfg) = machine("1.1.0");
+        fs::remove_file(&cfg.sidecar).unwrap();
+        fs::remove_dir_all(cfg.sidecar_dir("1.1.0").unwrap()).unwrap();
+        artifact::adopt_installed_sidecar(&cfg, "1.1.0").unwrap();
+        assert_eq!(
+            artifact::saved_sidecar_identity(&cfg, "1.1.0").unwrap(),
+            None
+        );
+        let mut with_none = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        assert!(!already_installed(&cfg, &with_none).await.unwrap());
+        with_none.manifest.sidecar = None;
+        assert!(
+            already_installed(&cfg, &with_none).await.unwrap(),
+            "both absent"
+        );
+        // A sidecar republished with another hash, or size.
+        let (_dir, cfg) = machine("1.1.0");
+        let mut republished = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        republished.manifest.sidecar.as_mut().unwrap().sha256 = "1".repeat(64);
+        assert!(
+            !already_installed(&cfg, &republished).await.unwrap(),
+            "hash"
+        );
+        let mut resized = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        resized.manifest.sidecar.as_mut().unwrap().size += 1;
+        assert!(!already_installed(&cfg, &resized).await.unwrap(), "size");
+    }
+
+    #[tokio::test]
+    async fn a_k_lock_held_elsewhere_downloads_first() {
+        let (_dir, cfg) = machine("1.1.0");
+        let server = Server::start();
+        let plan = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        let held = UpgradeLock::acquire(&cfg.k_state).unwrap();
+        assert!(!already_installed(&cfg, &plan).await.unwrap());
+        drop(held);
+        assert!(already_installed(&cfg, &plan).await.unwrap());
+    }
+
+    #[test]
+    fn a_running_service_on_another_version_is_uncertain() {
+        let (_dir, cfg) = machine("1.1.0");
+        let server = Server::start();
+        let mut stale = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        save(&cfg, &stale).unwrap();
+        let error = finish_up_to_date_with(&cfg, &mut stale, Some("1.0.0".into())).unwrap_err();
+        assert!(error.is_uncertain(), "{error}");
+        assert!(!exists(&cfg.receipt_path("request")).unwrap(), "no receipt");
+
+        let mut running = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        let receipt = finish_up_to_date_with(&cfg, &mut running, Some("1.1.0".into()))
+            .unwrap()
+            .receipt
+            .unwrap();
+        assert_eq!(receipt.outcome, Outcome::UpToDate);
+        assert_eq!(receipt.line, "1.1.0 is already installed. It is running.");
+        assert_eq!(
+            receipt.detail.get("readback").map(String::as_str),
+            Some("service")
+        );
+    }
+
+    /// Raft Desktop's registration, with its definition file present.
+    #[cfg(target_os = "linux")]
+    fn register(cfg: &Config, binary: &Path, minimum: &str) {
+        let definition = cfg
+            .state_home
+            .join("config/systemd/user/raft-desktop-computer.service");
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        fs::write(&definition, b"[Service]\n").unwrap();
+        let record = serde_json::json!({
+            "formatVersion": 2, "owner": "app",
+            "supervisor": {
+                "kind": "systemd-user", "name": "raft-desktop-computer.service",
+                "definitionPath": definition, "binaryPath": binary,
+                "launcherPath": null, "registeredBy": "desktop",
+                "registeredAt": "t", "minComputerVersion": minimum
+            }
+        });
+        let path = crate::host_supervisor::registration_path(cfg);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, record.to_string()).unwrap();
+    }
+
+    /// The refusals about the target still come back as after a download,
+    /// and still without one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_target_raft_desktop_refuses_is_still_refused() {
+        let server = Server::start();
+        for (binary, minimum, code) in [
+            (
+                Some("/elsewhere/raft-computer"),
+                "1.0.0",
+                FailureCode::InstallationPathMismatch,
+            ),
+            (None, "1.2.0", FailureCode::InstallationHeld),
+        ] {
+            let (_dir, cfg) = machine("1.1.0");
+            let binary = binary.map_or(cfg.binary.clone(), PathBuf::from);
+            register(&cfg, &binary, minimum);
+            let mut plan = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+            save(&cfg, &plan).unwrap();
+            let reply = upgrade(&cfg, &mut plan, false).await.unwrap();
+            reply.validate("request").unwrap();
+            let receipt = reply.receipt.unwrap();
+            assert_eq!(receipt.outcome, Outcome::Held, "{minimum}");
+            assert_eq!(receipt.code, Some(code), "{minimum}");
+            assert_eq!(plan.phase, Phase::Preparing);
+        }
+        // A registration that allows it: up to date.
+        let (_dir, cfg) = machine("1.1.0");
+        register(&cfg, &cfg.binary, "1.1.0");
+        let mut plan = plan(&server, Kind::Upgrade, Some("1.1.0"), "1.1.0");
+        save(&cfg, &plan).unwrap();
+        let reply = upgrade(&cfg, &mut plan, false).await.unwrap();
+        assert_eq!(reply.receipt.unwrap().outcome, Outcome::UpToDate);
+        assert_eq!(server.connections(), 0, "no network call");
     }
 }

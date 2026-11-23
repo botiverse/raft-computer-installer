@@ -559,13 +559,20 @@ fn verify(bytes: &[u8], identity: &SidecarIdentity) -> Result<()> {
     Ok(())
 }
 
-pub fn saved_sidecar(cfg: &Config, version: &str) -> Result<Option<PathBuf>> {
+/// The sidecar identity recorded for `version` (None: the release has
+/// none), without reading the saved bytes.
+pub fn saved_sidecar_identity(cfg: &Config, version: &str) -> Result<Option<SidecarIdentity>> {
     let dir = cfg.sidecar_dir(version)?;
     let record: SidecarRecord = serde_json::from_slice(&fs::read(dir.join("identity.json"))?)?;
     if record.format_version != 1 || record.version != version {
         return Err(invalid("invalid sidecar record"));
     }
-    match record.sidecar {
+    Ok(record.sidecar)
+}
+
+pub fn saved_sidecar(cfg: &Config, version: &str) -> Result<Option<PathBuf>> {
+    let dir = cfg.sidecar_dir(version)?;
+    match saved_sidecar_identity(cfg, version)? {
         Some(identity) => {
             let path = dir.join(SIDECAR_NAME);
             verify(&fs::read(&path)?, &identity)?;

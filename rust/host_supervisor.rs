@@ -564,6 +564,23 @@ pub fn refusal_with_code(
     Ok(None)
 }
 
+/// The refusals of `refusal_with_code` that concern the target itself, not
+/// stopping the service: a registered native supervisor that runs another
+/// binary path, or needs a newer Computer than `target`. An unknown or
+/// non-native registration is not one of them (None).
+pub fn target_refusal(
+    cfg: &Config,
+    registration: &Registration,
+    target: &str,
+) -> Result<Option<(crate::report::FailureCode, String)>> {
+    match registration {
+        Registration::Registered(supervisor) if Kind::native() == Some(supervisor.kind) => {
+            refusal_with_code(cfg, registration, target)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Set on the copy that broke away from the Windows job, so it never tries again.
 pub const BROKE_AWAY_ENV: &str = "RAFT_COMPUTER_INSTALLER_BROKE_AWAY";
 
