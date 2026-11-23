@@ -853,8 +853,13 @@ class InstallerContract(unittest.TestCase):
         machine = self.machine()
         machine.json(["install", "--version", "1.1.0"])
         before = machine.login_start()
+        seen = len(self.server.requests)
         reply = machine.json(["upgrade", "--version", "1.1.0"])
         self.assertEqual(reply["receipt"]["outcome"], "up-to-date")
+        self.assertEqual(reply["receipt"]["line"], "1.1.0 is already installed. It is running.")
+        self.assertEqual(reply["receipt"]["detail"]["readback"], "service")
+        # Decided before any download: only the release lookup was made.
+        self.assertFalse(any("/dl/" in path for path in self.server.requests[seen:]), self.server.requests[seen:])
         machine.json(["upgrade", "--version", "1.0.0"], expected=2)
         self.assertEqual(machine.live(), before)
         machine.json(["upgrade", "--version", "1.0.0", "--allow-downgrade"])
