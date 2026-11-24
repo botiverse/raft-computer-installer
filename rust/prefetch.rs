@@ -209,6 +209,78 @@ mod tests {
         assert!(!cfg.k_state.join("incoming/.prefetch.tmp").exists());
     }
 
+    /// A gzip member holding `data` in one stored (uncompressed) deflate
+    /// block, so the test needs no compressor.
+    fn stored_gzip(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= 0xffff);
+        let crc = data.iter().fold(!0u32, |mut crc, byte| {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+            crc
+        });
+        let len = data.len() as u16;
+        let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 1];
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        out.extend_from_slice(&(!crc).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// End to end with K's own downloader: the placed (hard-linked or
+    /// copied) package is taken as the complete partial file, checked, and
+    /// decoded with no request: the URL refuses connections and no transfer
+    /// is reported.
+    #[tokio::test]
+    async fn k_uses_the_placed_package_without_a_request() {
+        use std::sync::{Arc, Mutex};
+        let raw = b"raft computer binary".repeat(100);
+        let gz = stored_gzip(&raw);
+        // Bound but never listening: any request would be refused.
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let address = socket.local_addr().unwrap().as_socket().unwrap();
+        let (_dir, cfg) = cfg();
+        let mut m = manifest("1.2.3", &gz);
+        m.release.sha256 = sha256(&raw);
+        m.release.size = raw.len() as u64;
+        if let Some(gzip) = &mut m.release.gzip {
+            gzip.url = format!("http://{address}/computer.gz");
+        }
+        write_cached(&cfg, &m, &gz);
+        assert!(place(&cfg, &m).unwrap());
+
+        let reports = Arc::new(Mutex::new(0));
+        let seen = reports.clone();
+        let downloader = k_carrier::artifact::Downloader {
+            report: Some(Arc::new(move |_: &k_carrier::artifact::TransferReport| {
+                *seen.lock().unwrap() += 1
+            })),
+            ..crate::source::downloader().unwrap()
+        };
+        let bytes = downloader
+            .download(&m.release, Some(&cfg.k_state.join("incoming")), None)
+            .await
+            .unwrap();
+        assert_eq!(bytes, raw);
+        assert_eq!(*reports.lock().unwrap(), 0, "no request was sent");
+    }
+
     #[test]
     fn a_missing_package_is_not_placed() {
         let (_dir, cfg) = cfg();
