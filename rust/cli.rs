@@ -300,6 +300,8 @@ async fn worker(cfg: &Config) -> Result<u8> {
             let diagnostic = diagnostic::safe_error(&error);
             let code = if unresolved {
                 FailureCode::RecoveryUnresolved
+            } else if crate::failure::classify(&error) == crate::failure::Cause::DiskFull {
+                FailureCode::DiskFull
             } else {
                 FailureCode::InstallFailed
             };

@@ -532,9 +532,9 @@ dependencies = [
 
 [[package]]
 name = "k-carrier"
-version = "0.3.6"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce37cabfee77141addabc72d009597617ec69f137cf8edb0e602e32741dc6838"
+checksum = "99f1da6e3d59e6a364f95b8dc55a6f2a94749eb039490275660744308fd3dbae"
 dependencies = [
  "async-trait",
  "base64",

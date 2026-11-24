@@ -187,6 +187,42 @@ operation, ran K's recovery, or is the supervisor's next worker after a failed
 settlement) or started its own repair stays `unresolved`
 (`recovery_unresolved`), so the supervisor and the entry script keep retrying.
 
+An upgrade uses a package the Computer service prefetched while the machine
+was idle (#140). The service downloads, verifies and executes nothing else: it
+writes `<RAFT_HOME>/computer/installer/prefetch/<version>/<sha256>`, where
+`<sha256>` is the digest of the bytes the release transfers (its gzip when it
+has one), writing temporary files inside the version directory and renaming
+them into place. A prefetched support file goes to
+`sidecars/<version>/photon_rs_bg.wasm` only (never `identity.json`, which the
+installer writes once it has checked the file against the manifest), so a bad
+or torn file is just downloaded again. Once nothing refuses the upgrade,
+under K's lock, a cached file whose size and sha256 match the manifest just
+fetched from Hands is linked (or copied) to K's partial file, and K uses it without a
+request only after its own size and sha256 check (then the decoded binary's).
+A missing, mismatching or unusable cache only means the package is downloaded
+as before; the version is checked with the strict parser `upgrade --version`
+uses before it becomes a path. The receipt says where things came from:
+`detail.candidateSource` (`prefetch` or `network`; `network` also when K
+rejected the cache and downloaded), `detail.sidecarSource` (`cache` or
+`network`) and `detail.prefetchError` when the cache could not be read.
+
+A failed write because the disk or the user's quota is full (ENOSPC, EDQUOT,
+or Windows' disk-full errors), whether in the installer's preparation or in
+K's download, staging or candidate preparation, fails with `disk_full`
+("This computer is out of disk space. Free up some space, then try again.
+Nothing was changed.") instead of `install_failed`.
+
+Every download that sent a request records its last transfer in the receipt:
+`detail.candidateDownload` (Raft Computer's package) and
+`detail.sidecarDownload` (its support file), one line each, such as
+`cf-ray 8f1c2a3b4d5e6f70-SJC, HTTP 200, 1048576 bytes received, 30012 ms`.
+`no response` means no HTTP response arrived and `no cf-ray` that the response
+had none. Status and `cf-ray` are those of the final response after any
+redirects (the object store's, for a release URL that redirects there); the
+bytes are those of that response's body, not counting a resumed prefix; the
+time runs from sending the request to its end. On a failed download it is the
+failed attempt.
+
 Receipts carry `detail.phasesMs`, a JSON object of wall-clock milliseconds per
 phase: `prepare`, `download`, `candidate_check` and `handover` (K's stop,
 replace, start and read-back) for an upgrade; `prepare`, `candidate_check`,
@@ -246,8 +282,10 @@ receipts, cached sidecars and recovery files under `<RAFT_HOME>/computer/install
 Repair temporarily retains recovery inputs under `quarantine/` while the result
 is unresolved. After verification and a durable final receipt, the installer
 removes obsolete recovery payloads, downloads and sidecars, retaining only the
-current sidecar and small receipts. Interrupted cleanup resumes on the next
-command. Computer user data and credentials are preserved. Installations owned
+current sidecar (and a newer one whose package is also prefetched for the next
+upgrade) and small receipts. It also removes prefetched packages not newer than the installed
+version. Cleanup runs only while it holds the installer gate, so it never races an
+upgrade. Interrupted cleanup resumes on the next command. Computer user data and credentials are preserved. Installations owned
 by another package manager are held.
 
 ## Develop

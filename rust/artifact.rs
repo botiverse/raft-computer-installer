@@ -3,6 +3,7 @@
 use crate::{
     Result, computer,
     config::{BIN_NAME, Config, SIDECAR_NAME, platform},
+    report::{CANDIDATE_DOWNLOAD_KEY, PhaseLog, SIDECAR_DOWNLOAD_KEY},
     source::Manifest,
     version,
 };
@@ -268,6 +269,15 @@ fn transfer_url(release: &Release) -> &str {
     release.gzip.as_ref().map_or(&release.url, |gzip| &gzip.url)
 }
 
+/// The installer's downloader (`source::downloader`), whose transfers are
+/// reported to `phases` under `key`.
+fn reporting_downloader(phases: &PhaseLog, key: &'static str) -> Result<Downloader> {
+    Ok(Downloader {
+        report: Some(phases.transfer_sink(key)),
+        ..crate::source::downloader()?
+    })
+}
+
 /// The installer's downloader for an upgrade's candidate: the installer's
 /// roots, proxy settings and stall timeout (`source::downloader`), and K's
 /// size-based budget with at least `MINIMUM_ATTEMPT_MS` for its transfer.
@@ -300,6 +310,7 @@ async fn download_with_retries(
                 downloader.policy,
                 ends.saturating_duration_since(Instant::now()),
             ),
+            report: downloader.report.clone(),
         };
         let error = match attempt
             .download(release, Some(resume_dir), Some(download_progress(label)))
@@ -650,10 +661,12 @@ pub fn adopt_installed_sidecar(cfg: &Config, version: &str) -> Result<()> {
 
 /// `ends`: when the request's downloads end (`download_deadline`), shared
 /// with the Raft Computer download after it on a fresh install.
+/// A download's last transfer goes to `phases` (`SIDECAR_DOWNLOAD_KEY`).
 pub async fn acquire_sidecar(
     cfg: &Config,
     manifest: &Manifest,
     ends: Instant,
+    phases: &PhaseLog,
 ) -> Result<Option<PathBuf>> {
     let dir = cfg.sidecar_dir(&manifest.version)?;
     ensure_dir(&dir)?;
@@ -683,7 +696,7 @@ pub async fn acquire_sidecar(
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
                 let bytes = download(
-                    &crate::source::downloader()?,
+                    &reporting_downloader(phases, SIDECAR_DOWNLOAD_KEY)?,
                     release,
                     &dir,
                     "Raft Computer support file",
@@ -719,9 +732,9 @@ pub async fn acquire(
     ensure_dir(&scratch)?;
     // One deadline for both downloads: they share the first worker.
     let ends = download_deadline();
-    let sidecar = acquire_sidecar(cfg, manifest, ends).await?;
+    let sidecar = acquire_sidecar(cfg, manifest, ends, phases).await?;
     let bytes = download(
-        &crate::source::downloader()?,
+        &reporting_downloader(phases, CANDIDATE_DOWNLOAD_KEY)?,
         &manifest.release,
         &scratch,
         "Raft Computer",
@@ -760,10 +773,9 @@ pub async fn acquire_repair(
 ) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
-    let downloader = crate::source::downloader()?;
     let ends = download_deadline();
     let bytes = download(
-        &downloader,
+        &reporting_downloader(phases, CANDIDATE_DOWNLOAD_KEY)?,
         &manifest.release,
         &cfg.scratch(),
         "Raft Computer",
@@ -779,7 +791,7 @@ pub async fn acquire_repair(
     let sidecar = match &manifest.sidecar {
         Some(release) => {
             let bytes = download(
-                &downloader,
+                &reporting_downloader(phases, SIDECAR_DOWNLOAD_KEY)?,
                 release,
                 &cfg.scratch(),
                 "Raft Computer support file",
@@ -1156,6 +1168,7 @@ mod retry_tests {
                 idle_ms: 500,
                 ..TransferPolicy::default()
             },
+            report: None,
         }
     }
 
@@ -1386,6 +1399,40 @@ mod retry_tests {
         let error = fetch(&server, &body, dir.path()).await.unwrap_err();
         assert!(error.to_string().contains("HTTP 404"), "{error}");
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_attempt_reports_its_transfer_and_the_failed_one_is_kept() {
+        let body = body();
+        let server = Server::start(
+            body.clone(),
+            vec![Reply::StallAfter(1000), Reply::Status(404)],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let phases = PhaseLog::default();
+        let downloader = Downloader {
+            report: Some(phases.transfer_sink(SIDECAR_DOWNLOAD_KEY)),
+            ..downloader()
+        };
+        let error = download_with_retries(
+            &downloader,
+            &release(&server.url, &body),
+            dir.path(),
+            "Raft Computer support file",
+            &NO_WAIT,
+            Instant::now() + DOWNLOAD_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("HTTP 404"), "{error}");
+        let mut detail = std::collections::BTreeMap::new();
+        phases.drain_into(&mut detail);
+        let line = &detail[SIDECAR_DOWNLOAD_KEY];
+        assert!(
+            line.starts_with("no cf-ray, HTTP 404, ") && line.ends_with(" ms"),
+            "{line}"
+        );
+        assert!(!detail.contains_key(CANDIDATE_DOWNLOAD_KEY));
     }
 
     #[tokio::test]
