@@ -224,6 +224,7 @@ pub fn downloader() -> Result<k_carrier::artifact::Downloader> {
             idle_ms: u64::try_from(crate::artifact::STALL_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             ..Default::default()
         },
+        report: None,
     })
 }
 

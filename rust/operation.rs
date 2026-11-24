@@ -4,7 +4,9 @@
 use crate::{
     Error, Result, artifact, computer,
     config::Config,
-    host,
+    diagnostic,
+    failure::{self, DISK_FULL_REASON},
+    host, prefetch,
     presence::{Interaction, Presence},
     report::{self, FailureCode, Outcome, Receipt},
     request::{Reply, Request},
@@ -613,6 +615,7 @@ fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Repl
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     let preparing = Instant::now();
     let prepares = matches!(plan.phase, Phase::Preparing | Phase::Ready);
+    let phases = report::PhaseLog::default();
     if plan.phase == Phase::Preparing {
         if recovery {
             return finish(
@@ -638,7 +641,18 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             }
             return finish_up_to_date(cfg, plan).await;
         }
-        artifact::acquire_sidecar(cfg, &plan.manifest, artifact::download_deadline()).await?;
+        let sidecar =
+            artifact::acquire_sidecar(cfg, &plan.manifest, artifact::download_deadline(), &phases)
+                .await;
+        phases.drain_into(&mut plan.detail);
+        if sidecar?.is_some() {
+            let source = if plan.detail.contains_key(report::SIDECAR_DOWNLOAD_KEY) {
+                "network"
+            } else {
+                "cache"
+            };
+            plan.detail.insert("sidecarSource".into(), source.into());
+        }
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
@@ -657,13 +671,15 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if plan.kind == Kind::Adopt {
             FileStore::new(&cfg.k_state).bootstrap_locked(from, &cfg.binary)?;
         }
+        // Only now that nothing refuses the upgrade, so a refusal leaves the
+        // prefetched package for the next attempt.
+        use_prefetched(cfg, plan);
         if prepares {
             report::add_phase(&mut plan.detail, "prepare", preparing.elapsed());
         }
         transition(cfg, plan, Phase::Upgrading)?;
     }
     let store = FileStore::new(&cfg.k_state);
-    let phases = report::PhaseLog::default();
     let runner = runner::create(
         cfg.clone(),
         Arc::new(FrozenSource(plan.manifest.clone())),
@@ -673,11 +689,40 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
     )?;
     let response = execute_upgrade(cfg, plan, &store, &runner, recovery).await;
     phases.drain_into(&mut plan.detail);
+    // K refused the prefetched package (its digest check failed) and
+    // downloaded the candidate itself.
+    if plan.detail.contains_key(report::CANDIDATE_DOWNLOAD_KEY) {
+        plan.detail
+            .insert(prefetch::SOURCE_KEY.into(), prefetch::FROM_NETWORK.into());
+    }
     let response = match response? {
         Ok(response) => response,
         Err(reply) => return Ok(reply),
     };
     settle_upgrade(cfg, plan, response).await
+}
+
+/// Hands the package prefetched for this upgrade to K (`prefetch::place`;
+/// the caller holds K's lock) and records where the candidate comes from.
+/// Any problem with the cache only means the package is downloaded as
+/// before: it is recorded in `detail.prefetchError` and never fails the
+/// upgrade.
+fn use_prefetched(cfg: &Config, plan: &mut Plan) {
+    let placed = match prefetch::place(cfg, &plan.manifest) {
+        Ok(placed) => placed,
+        Err(error) => {
+            plan.detail
+                .insert("prefetchError".into(), diagnostic::safe_error(&error));
+            false
+        }
+    };
+    let source = if placed {
+        prefetch::FROM_PREFETCH
+    } else {
+        prefetch::FROM_NETWORK
+    };
+    plan.detail
+        .insert(prefetch::SOURCE_KEY.into(), source.into());
 }
 
 /// Whether an upgrade has nothing to do, decided before any download: K
@@ -1344,6 +1389,9 @@ fn failed_before_handover(
         let (line, reason) = candidate_check_copy(code, target);
         return (line, (code, reason));
     }
+    if cause.is_some_and(failure::disk_full_text) {
+        return disk_full_copy(&format!("Could not upgrade to {target}"));
+    }
     let line = failed_before_handover_line(target, release, detail);
     if cause.is_some_and(artifact::download_stalled) {
         (
@@ -1460,6 +1508,9 @@ async fn resume(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> 
 /// anything (an install's or repair's download or candidate check).
 fn failed_untouched(error: &Error, target: &str) -> (String, (FailureCode, String)) {
     let text = error.to_string();
+    if failure::classify(error) == failure::Cause::DiskFull || failure::disk_full_text(&text) {
+        return disk_full_copy("The installation could not finish");
+    }
     if let Some(code) = artifact::candidate_check_failure(&text) {
         let (line, reason) = candidate_check_copy(code, target);
         return (line, (code, reason));
@@ -1491,6 +1542,17 @@ fn failed_untouched(error: &Error, target: &str) -> (String, (FailureCode, Strin
             ),
         )
     }
+}
+
+/// The line, code and reason of a run that stopped, before changing
+/// anything, because the disk (or the user's quota) is full.
+fn disk_full_copy(what: &str) -> (String, (FailureCode, String)) {
+    (
+        bounded_line(format!(
+            "{what}: this computer is out of disk space. Nothing was changed. Free up some space, then run the same install command again."
+        )),
+        (FailureCode::DiskFull, DISK_FULL_REASON.into()),
+    )
 }
 
 /// An earlier installation's state as a refusal finds it.
@@ -2670,6 +2732,42 @@ mod before_handover_tests {
             assert_eq!(found, code, "{diagnostic}");
         }
     }
+
+    /// A full disk fails as disk_full, whether the installer's own write
+    /// failed (an I/O error) or K's did (its recorded text).
+    #[test]
+    fn a_full_disk_fails_as_disk_full_with_a_clear_message() {
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let (line, (code, reason)) = failed_untouched(&Error::Io(full), "1.1.0");
+        assert_eq!(code, FailureCode::DiskFull);
+        assert_eq!(reason, DISK_FULL_REASON);
+        assert!(line.contains("out of disk space"), "{line}");
+        assert!(line.contains("Nothing was changed."), "{line}");
+        #[cfg(unix)]
+        let code = libc::ENOSPC;
+        #[cfg(windows)]
+        let code = 112;
+        let recorded = std::io::Error::from_raw_os_error(code).to_string();
+        for diagnostic in [
+            recorded.clone(),
+            format!("upgrade still requires recovery: {recorded}"),
+        ] {
+            let (line, (code, reason)) =
+                failed_before_handover("1.1.0", &release(), &detail(&diagnostic));
+            assert_eq!(code, FailureCode::DiskFull, "{diagnostic}");
+            assert_eq!(reason, DISK_FULL_REASON);
+            assert!(
+                line.starts_with("Could not upgrade to 1.1.0: this computer is out of disk space."),
+                "{line}"
+            );
+            for text in [&line, &reason] {
+                assert!(!text.to_lowercase().contains("installer"), "{text}");
+                assert!(!text.contains(code.as_str()), "{text}");
+            }
+        }
+        let (_, (code, _)) = failed_untouched(&invalid(recorded), "1.1.0");
+        assert_eq!(code, FailureCode::DiskFull);
+    }
 }
 
 #[cfg(test)]
@@ -2835,6 +2933,77 @@ mod already_installed_tests {
             ),
             "K was not asked"
         );
+    }
+
+    /// The package the Computer service prefetched becomes K's complete
+    /// partial file and the receipt says so; without one, or with a cache
+    /// that cannot be used, the candidate comes from the network and the
+    /// upgrade is not failed.
+    #[test]
+    fn a_prefetched_package_is_handed_to_k_and_recorded() {
+        let (_dir, cfg) = machine("1.0.0");
+        let server = Server::start();
+        let package = b"prefetched computer package";
+        let mut plan = plan(&server, Kind::Upgrade, Some("1.0.0"), "1.1.0");
+        plan.manifest.release.sha256 = sha256(package);
+        plan.manifest.release.size = package.len() as u64;
+        let part = k_carrier::artifact::partial_path(
+            &cfg.k_state.join("incoming"),
+            &plan.manifest.release.url,
+        );
+
+        let _lock = UpgradeLock::acquire(&cfg.k_state).unwrap();
+        use_prefetched(&cfg, &mut plan);
+        assert_eq!(plan.detail[prefetch::SOURCE_KEY], prefetch::FROM_NETWORK);
+        assert!(!part.exists());
+
+        let cached = prefetch::root(&cfg)
+            .join("1.1.0")
+            .join(&plan.manifest.release.sha256);
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, package).unwrap();
+        use_prefetched(&cfg, &mut plan);
+        assert_eq!(plan.detail[prefetch::SOURCE_KEY], prefetch::FROM_PREFETCH);
+        assert_eq!(fs::read(&part).unwrap(), package);
+        assert!(!plan.detail.contains_key("prefetchError"));
+
+        plan.manifest.version = "../1.1.0".into();
+        use_prefetched(&cfg, &mut plan);
+        assert_eq!(plan.detail[prefetch::SOURCE_KEY], prefetch::FROM_NETWORK);
+        assert!(plan.detail.contains_key("prefetchError"));
+        drop(server);
+    }
+
+    /// A support file the Computer service prefetched (the bare file, no
+    /// record) is used without a download when it matches the manifest, and
+    /// replaced by a download when it does not.
+    #[tokio::test]
+    async fn a_prefetched_support_file_is_reused_only_when_it_matches() {
+        let (_dir, cfg) = machine("1.0.0");
+        let server = Server::start();
+        let plan = plan(&server, Kind::Upgrade, Some("1.0.0"), "1.1.0");
+        let dir = cfg.sidecar_dir("1.1.0").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(crate::config::SIDECAR_NAME), SIDECAR).unwrap();
+        let phases = report::PhaseLog::default();
+        let ends = artifact::download_deadline();
+        let found = artifact::acquire_sidecar(&cfg, &plan.manifest, ends, &phases)
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(server.connections(), 0, "no download");
+        assert!(artifact::saved_sidecar(&cfg, "1.1.0").unwrap().is_some());
+
+        fs::remove_file(dir.join("identity.json")).unwrap();
+        fs::write(dir.join(crate::config::SIDECAR_NAME), b"torn").unwrap();
+        // One attempt: no retry fits in a second.
+        let ends = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = artifact::acquire_sidecar(&cfg, &plan.manifest, ends, &phases).await;
+        assert!(result.is_err(), "the test server refuses the download");
+        assert!(server.connections() > 0, "a bad file is downloaded again");
+        let mut detail = BTreeMap::new();
+        phases.drain_into(&mut detail);
+        assert!(detail.contains_key(report::SIDECAR_DOWNLOAD_KEY));
     }
 
     #[tokio::test]

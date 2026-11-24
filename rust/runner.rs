@@ -68,7 +68,9 @@ pub fn create(
     let controller = controller(&cfg)?;
     let mut runner = Runner::new(FileStore::new(&cfg.k_state), Arc::new(controller), source)?;
     if let Some(release) = release {
-        runner.downloader = crate::artifact::release_downloader(release)?;
+        let mut downloader = crate::artifact::release_downloader(release)?;
+        downloader.report = Some(phases.transfer_sink(crate::report::CANDIDATE_DOWNLOAD_KEY));
+        runner.downloader = downloader;
         runner.host_budget_ms = UPGRADE_HOST_BUDGET_MS;
     }
     runner.policy = Policy::Confirm;

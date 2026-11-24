@@ -11,6 +11,7 @@ pub mod host;
 pub mod host_supervisor;
 pub mod launch_policy;
 pub mod operation;
+pub mod prefetch;
 pub mod presence;
 pub mod process;
 mod proxy;

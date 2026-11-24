@@ -54,6 +54,25 @@ fn chain_cause(error: &(dyn std::error::Error + 'static)) -> Option<Cause> {
     None
 }
 
+/// The words of a `disk_full` failure (`FailureCode::DiskFull`).
+pub const DISK_FULL_REASON: &str =
+    "This computer is out of disk space. Free up some space, then try again. Nothing was changed.";
+
+/// The text of an error K recorded (`io::Error`'s display, which ends in
+/// `(os error N)`) says the disk or the user's quota is full: ENOSPC or
+/// EDQUOT, or on Windows ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL /
+/// ERROR_DISK_QUOTA_EXCEEDED. K keeps
+/// only the text of an error that ended its operation.
+pub fn disk_full_text(text: &str) -> bool {
+    #[cfg(unix)]
+    let codes = [libc::ENOSPC, libc::EDQUOT];
+    #[cfg(windows)]
+    let codes = [112, 39, 1295];
+    codes
+        .iter()
+        .any(|code| text.contains(&format!("(os error {code})")))
+}
+
 /// Classify an error by walking its source chain for an I/O error. K's `Io`
 /// variant is transparent (its `source()` skips the I/O error itself), so it
 /// is inspected directly.
@@ -553,7 +572,7 @@ pub fn answer(error: &Error, cfg: Option<&Config>, blocked: Option<&Blocked>) ->
         (Cause::DiskFull, _) => Answer {
             message: "Raft Computer can't write its files: the disk is full.".into(),
             next_step: "Free up disk space, then run the same install command again.".into(),
-            code: FailureCode::UnexpectedError,
+            code: FailureCode::DiskFull,
             retry_helps: false,
         },
         (Cause::Unclassified, _) => Answer {
@@ -721,7 +740,30 @@ mod tests {
             answer.next_step,
             "Free up disk space, then run the same install command again."
         );
+        assert_eq!(answer.code, FailureCode::DiskFull);
         assert!(!answer.retry_helps);
+    }
+
+    #[test]
+    fn recorded_disk_full_text_is_recognised() {
+        #[cfg(unix)]
+        let codes = [libc::ENOSPC, libc::EDQUOT];
+        #[cfg(windows)]
+        let codes = [112, 39, 1295];
+        for code in codes {
+            let text = format!(
+                "upgrade still requires recovery: {}",
+                io::Error::from_raw_os_error(code)
+            );
+            assert!(disk_full_text(&text), "{text}");
+        }
+        for text in [
+            "DOWNLOAD_FAILED: idle timeout",
+            "permission denied (os error 13)",
+            "SHA256_MISMATCH",
+        ] {
+            assert!(!disk_full_text(text), "{text}");
+        }
     }
 
     #[test]

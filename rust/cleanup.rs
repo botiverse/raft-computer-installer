@@ -85,11 +85,18 @@ pub async fn run(cfg: &Config) -> Result<()> {
             let Some(version) = name.to_str() else {
                 continue;
             };
-            if version != stable && crate::version::exact(version).is_ok() {
+            // A newer version's support file prefetched for the next upgrade
+            // is kept with its package (crate::prefetch); one left by a
+            // failed attempt is not.
+            let prefetched = crate::version::compare(version, stable)
+                .is_ok_and(|order| order.is_gt())
+                && exists(&crate::prefetch::root(cfg).join(version))?;
+            if version != stable && crate::version::exact(version).is_ok() && !prefetched {
                 remove_dir(&entry.path())?;
             }
         }
     }
+    crate::prefetch::remove_stale(cfg, stable)?;
     fs::remove_file(pending)?;
     sync_dir(&cfg.installer_dir)
 }

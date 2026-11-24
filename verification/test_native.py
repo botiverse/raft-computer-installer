@@ -38,7 +38,7 @@ def process_alive(pid):
 
 FAILURE_CODES = {
     "caller_not_computer", "candidate_check_failed", "candidate_check_timed_out",
-    "candidate_start_failed", "downgrade_not_allowed", "download_stalled", "earlier_recovery_pending", "escape_failed",
+    "candidate_start_failed", "disk_full", "downgrade_not_allowed", "download_stalled", "earlier_recovery_pending", "escape_failed",
     "install_failed", "installation_declined", "installation_dir_not_writable", "installation_held", "installation_path_mismatch",
     "interrupted_before_start", "legacy_failure", "operation_busy",
     "recovery_unresolved", "release_resolution_failed", "repair_not_needed",

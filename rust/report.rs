@@ -2,6 +2,7 @@
 //! completed request returns the stored result; live observation is `status`.
 use crate::{Result, config::Config, presence::Presence, version};
 use k_carrier::{
+    artifact::{TransferReport, TransferSink},
     error::invalid,
     storage::{now_ms, write_json},
 };
@@ -69,8 +70,34 @@ pub fn add_phase(detail: &mut BTreeMap<String, String>, phase: &str, elapsed: Du
     }
 }
 
-/// Phase timings collected where `detail` is not at hand (inside K's runner
-/// hooks, inside artifact preparation), merged into it afterwards.
+/// `detail.candidateDownload` / `detail.sidecarDownload`: the last network
+/// transfer of Raft Computer's package and of its support file in this run,
+/// as one line, e.g. `cf-ray 8f1c2a3b4d5e6f70-SJC, HTTP 200, 1048576 bytes
+/// received, 30012 ms`, or `no response, 0 bytes received, 30001 ms` when no
+/// response arrived (`no cf-ray` when the response had none). The status
+/// and cf-ray are the final response's, after any redirects (the object
+/// store's for a release URL that redirects there); the bytes are that
+/// response's body, a resumed prefix not counted. Present only when a
+/// request was sent; on a failed download it is the failed attempt.
+pub const CANDIDATE_DOWNLOAD_KEY: &str = "candidateDownload";
+pub const SIDECAR_DOWNLOAD_KEY: &str = "sidecarDownload";
+
+/// The one-line form of a transfer report (`CANDIDATE_DOWNLOAD_KEY`).
+pub fn transfer_line(report: &TransferReport) -> String {
+    let response = match (report.status, &report.cf_ray) {
+        (None, _) => "no response".to_owned(),
+        (Some(status), Some(ray)) => format!("cf-ray {ray}, HTTP {status}"),
+        (Some(status), None) => format!("no cf-ray, HTTP {status}"),
+    };
+    format!(
+        "{response}, {} bytes received, {} ms",
+        report.bytes_received, report.elapsed_ms
+    )
+}
+
+/// Phase timings and download transfer reports collected where `detail` is
+/// not at hand (inside K's runner hooks, inside artifact preparation),
+/// merged into it afterwards.
 #[derive(Clone, Default)]
 pub struct PhaseLog(Arc<Mutex<PhaseState>>);
 
@@ -78,6 +105,7 @@ pub struct PhaseLog(Arc<Mutex<PhaseState>>);
 struct PhaseState {
     done: Vec<(&'static str, Duration)>,
     open: BTreeMap<&'static str, Instant>,
+    transfers: BTreeMap<&'static str, TransferReport>,
 }
 
 impl PhaseLog {
@@ -114,8 +142,21 @@ impl PhaseLog {
                 .sum()
         })
     }
-    /// Ends every open phase and moves all timings into `detail`.
+    /// A sink for a downloader that keeps its last transfer under `key`
+    /// (`CANDIDATE_DOWNLOAD_KEY` or `SIDECAR_DOWNLOAD_KEY`).
+    pub fn transfer_sink(&self, key: &'static str) -> TransferSink {
+        let log = self.clone();
+        Arc::new(move |report: &TransferReport| {
+            log.with(|state| state.transfers.insert(key, report.clone()));
+        })
+    }
+    /// Ends every open phase and moves all timings and transfer reports into
+    /// `detail`.
     pub fn drain_into(&self, detail: &mut BTreeMap<String, String>) {
+        let transfers = self.with(|state| std::mem::take(&mut state.transfers));
+        for (key, report) in transfers {
+            detail.insert(key.into(), transfer_line(&report));
+        }
         let done = self.with(|state| {
             let open = std::mem::take(&mut state.open);
             let mut done = std::mem::take(&mut state.done);
@@ -151,6 +192,7 @@ pub enum FailureCode {
     CandidateCheckFailed,
     CandidateCheckTimedOut,
     CandidateStartFailed,
+    DiskFull,
     DowngradeNotAllowed,
     DownloadStalled,
     EarlierRecoveryPending,
@@ -173,11 +215,12 @@ pub enum FailureCode {
 }
 
 impl FailureCode {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::CallerNotComputer,
         Self::CandidateCheckFailed,
         Self::CandidateCheckTimedOut,
         Self::CandidateStartFailed,
+        Self::DiskFull,
         Self::DowngradeNotAllowed,
         Self::DownloadStalled,
         Self::EarlierRecoveryPending,
@@ -205,6 +248,7 @@ impl FailureCode {
             Self::CandidateCheckFailed => "candidate_check_failed",
             Self::CandidateCheckTimedOut => "candidate_check_timed_out",
             Self::CandidateStartFailed => "candidate_start_failed",
+            Self::DiskFull => "disk_full",
             Self::DowngradeNotAllowed => "downgrade_not_allowed",
             Self::DownloadStalled => "download_stalled",
             Self::EarlierRecoveryPending => "earlier_recovery_pending",
@@ -475,21 +519,59 @@ mod failure_code_tests {
     use super::*;
 
     #[test]
+    fn a_transfer_reads_as_one_line() {
+        let mut report = TransferReport {
+            cf_ray: Some("8f1c2a3b4d5e6f70-SJC".into()),
+            status: Some(200),
+            bytes_received: 1_048_576,
+            elapsed_ms: 30_012,
+        };
+        assert_eq!(
+            transfer_line(&report),
+            "cf-ray 8f1c2a3b4d5e6f70-SJC, HTTP 200, 1048576 bytes received, 30012 ms"
+        );
+        report.cf_ray = None;
+        assert_eq!(
+            transfer_line(&report),
+            "no cf-ray, HTTP 200, 1048576 bytes received, 30012 ms"
+        );
+        report.status = None;
+        report.bytes_received = 0;
+        assert_eq!(
+            transfer_line(&report),
+            "no response, 0 bytes received, 30012 ms"
+        );
+        // The log keeps the last transfer per download and drains once.
+        let log = PhaseLog::default();
+        let sink = log.transfer_sink(CANDIDATE_DOWNLOAD_KEY);
+        sink(&TransferReport::default());
+        sink(&report);
+        let mut detail = BTreeMap::new();
+        log.drain_into(&mut detail);
+        assert_eq!(detail[CANDIDATE_DOWNLOAD_KEY], transfer_line(&report));
+        assert_eq!(detail.len(), 1);
+        let mut again = BTreeMap::new();
+        log.drain_into(&mut again);
+        assert!(again.is_empty());
+    }
+
+    #[test]
     fn fixed_failure_codes_round_trip_to_the_public_strings() {
         let values: Vec<String> = FailureCode::ALL
             .into_iter()
             .map(|code| serde_json::to_string(&code).unwrap())
             .collect();
-        assert_eq!(values.len(), 23);
+        assert_eq!(values.len(), 24);
         assert_eq!(values[0], "\"caller_not_computer\"");
         assert_eq!(values[1], "\"candidate_check_failed\"");
         assert_eq!(values[2], "\"candidate_check_timed_out\"");
-        assert_eq!(values[5], "\"download_stalled\"");
-        assert_eq!(values[6], "\"earlier_recovery_pending\"");
-        assert_eq!(values[7], "\"escape_failed\"");
-        assert_eq!(values[20], "\"result_unreadable\"");
-        assert_eq!(values[21], "\"running_as_root\"");
-        assert_eq!(values[22], "\"unexpected_error\"");
+        assert_eq!(values[4], "\"disk_full\"");
+        assert_eq!(values[6], "\"download_stalled\"");
+        assert_eq!(values[7], "\"earlier_recovery_pending\"");
+        assert_eq!(values[8], "\"escape_failed\"");
+        assert_eq!(values[21], "\"result_unreadable\"");
+        assert_eq!(values[22], "\"running_as_root\"");
+        assert_eq!(values[23], "\"unexpected_error\"");
         for code in FailureCode::ALL {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),
